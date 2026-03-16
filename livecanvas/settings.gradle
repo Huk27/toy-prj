@@ -1,0 +1,3 @@
+rootProject.name = 'livecanvas'
+include 'api'
+include 'core'

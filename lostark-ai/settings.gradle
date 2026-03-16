@@ -1,0 +1,4 @@
+rootProject.name = 'lostark-ai'
+
+include 'core'
+include 'api'

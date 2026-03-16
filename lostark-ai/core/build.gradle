@@ -1,0 +1,11 @@
+plugins {
+    id 'java-library'
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-webflux:3.5.6'
+}
+
+jar {
+    enabled = true
+}

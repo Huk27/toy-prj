@@ -1,0 +1,8 @@
+spring:
+  application:
+    name: lostark-ai
+
+app:
+  ai:
+    default-api-key: ${GOOGLE_API_KEY:}
+    chat-model: gemini-2.0-flash

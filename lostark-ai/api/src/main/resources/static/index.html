@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lost Ark AI Chat</title>
+  <style>
+    :root {
+      --bg: #f4efe6;
+      --panel: rgba(255, 252, 247, 0.9);
+      --line: #d8cbb6;
+      --text: #1f1a14;
+      --muted: #6b6256;
+      --accent: #a84b2f;
+      --accent-dark: #7b2e18;
+      --user: #efe3d0;
+      --assistant: #fffaf2;
+      --error: #fff1ec;
+      --shadow: 0 24px 60px rgba(72, 52, 24, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Pretendard", "Noto Sans KR", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(168, 75, 47, 0.18), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(191, 150, 78, 0.18), transparent 26%),
+        linear-gradient(160deg, #f8f3eb 0%, #efe6d9 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .shell {
+      width: min(960px, 100%);
+      background: var(--panel);
+      backdrop-filter: blur(18px);
+      border: 1px solid rgba(255, 255, 255, 0.55);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .hero {
+      padding: 28px 28px 18px;
+      border-bottom: 1px solid rgba(216, 203, 182, 0.65);
+      background: linear-gradient(135deg, rgba(168, 75, 47, 0.1), rgba(255, 255, 255, 0));
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(28px, 4vw, 44px);
+      line-height: 1.05;
+      letter-spacing: -0.04em;
+    }
+
+    .subtitle {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.6;
+      max-width: 700px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      min-height: 680px;
+    }
+
+    .sidebar {
+      padding: 24px;
+      border-right: 1px solid rgba(216, 203, 182, 0.65);
+      background: rgba(249, 243, 233, 0.6);
+    }
+
+    .chat-panel {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .section-title {
+      margin: 0 0 12px;
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .field {
+      margin-bottom: 18px;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    input,
+    textarea,
+    button {
+      font: inherit;
+    }
+
+    input,
+    textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.88);
+      border-radius: 16px;
+      padding: 14px 16px;
+      color: var(--text);
+      outline: none;
+      transition: border-color 0.2s ease, transform 0.2s ease;
+    }
+
+    input:focus,
+    textarea:focus {
+      border-color: var(--accent);
+      transform: translateY(-1px);
+    }
+
+    textarea {
+      min-height: 120px;
+      resize: vertical;
+    }
+
+    button {
+      border: 0;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-dark));
+      color: #fff;
+      padding: 14px 22px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.18s ease, opacity 0.18s ease;
+    }
+
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: wait;
+    }
+
+    .helper {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .tips {
+      margin-top: 28px;
+      padding: 18px;
+      background: rgba(255, 255, 255, 0.64);
+      border: 1px solid rgba(216, 203, 182, 0.7);
+      border-radius: 18px;
+    }
+
+    .tips p {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .tips ul {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .messages {
+      flex: 1;
+      overflow: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      background:
+        linear-gradient(rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.2)),
+        repeating-linear-gradient(
+          180deg,
+          rgba(216, 203, 182, 0.08) 0,
+          rgba(216, 203, 182, 0.08) 1px,
+          transparent 1px,
+          transparent 32px
+        );
+    }
+
+    .message {
+      max-width: 78%;
+      padding: 16px 18px;
+      border-radius: 20px;
+      line-height: 1.65;
+      white-space: pre-wrap;
+      animation: rise 0.24s ease;
+      border: 1px solid rgba(216, 203, 182, 0.7);
+    }
+
+    .message.user {
+      align-self: flex-end;
+      background: var(--user);
+      border-bottom-right-radius: 8px;
+    }
+
+    .message.assistant {
+      background: var(--assistant);
+      border-bottom-left-radius: 8px;
+    }
+
+    .message.error {
+      background: var(--error);
+      color: #8b2f22;
+    }
+
+    .composer {
+      padding: 20px 24px 24px;
+      border-top: 1px solid rgba(216, 203, 182, 0.65);
+      background: rgba(255, 250, 242, 0.88);
+    }
+
+    .composer textarea {
+      min-height: 98px;
+      margin-bottom: 14px;
+    }
+
+    .composer-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .status {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @keyframes rise {
+      from {
+        opacity: 0;
+        transform: translateY(8px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (max-width: 860px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        border-right: 0;
+        border-bottom: 1px solid rgba(216, 203, 182, 0.65);
+      }
+
+      .message {
+        max-width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <p class="eyebrow">Lost Ark AI</p>
+      <h1>간단한 테스트 채팅 화면</h1>
+      <p class="subtitle">
+        브라우저에서 바로 질문을 보내고 응답을 확인할 수 있습니다.
+        API key는 브라우저 로컬 스토리지에만 저장되며 서버에는 요청할 때만 함께 전송됩니다.
+      </p>
+    </section>
+
+    <section class="grid">
+      <aside class="sidebar">
+        <h2 class="section-title">Connection</h2>
+        <div class="field">
+          <label for="apiKey">Gemini API key</label>
+          <input id="apiKey" type="password" placeholder="AIza..." autocomplete="off">
+          <p class="helper">입력하지 않으면 서버에 설정된 기본 API key를 사용합니다.</p>
+        </div>
+
+        <div class="tips">
+          <p>테스트 팁</p>
+          <ul>
+            <li>응답 실패 시 메시지 영역에 quota 또는 인증 오류가 그대로 표시됩니다.</li>
+            <li>현재 화면은 간단한 JSON 채팅 테스트용입니다.</li>
+            <li>루트 경로 `/` 에서 바로 열립니다.</li>
+          </ul>
+        </div>
+      </aside>
+
+      <section class="chat-panel">
+        <div class="messages" id="messages">
+          <div class="message assistant">질문을 입력하면 여기에서 응답을 확인할 수 있습니다.</div>
+        </div>
+
+        <form class="composer" id="chatForm">
+          <label for="message">질문</label>
+          <textarea id="message" placeholder="예: 요즘 로스트아크 경제 이슈 알려줘"></textarea>
+          <div class="composer-row">
+            <span class="status" id="status">대기 중</span>
+            <button id="sendButton" type="submit">보내기</button>
+          </div>
+        </form>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const form = document.getElementById("chatForm");
+    const apiKeyInput = document.getElementById("apiKey");
+    const messageInput = document.getElementById("message");
+    const messages = document.getElementById("messages");
+    const status = document.getElementById("status");
+    const sendButton = document.getElementById("sendButton");
+    const storageKey = "lostark-ai.api-key";
+
+    apiKeyInput.value = localStorage.getItem(storageKey) || "";
+
+    apiKeyInput.addEventListener("input", () => {
+      localStorage.setItem(storageKey, apiKeyInput.value.trim());
+    });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      const message = messageInput.value.trim();
+      const apiKey = apiKeyInput.value.trim();
+      if (!message) {
+        messageInput.focus();
+        return;
+      }
+
+      appendMessage("user", message);
+      messageInput.value = "";
+      setBusy(true, "응답 생성 중");
+
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ message, apiKey })
+        });
+
+        const payload = await response.json();
+        appendMessage(response.ok ? "assistant" : "assistant error", payload.message || "응답을 받지 못했습니다.");
+      } catch (error) {
+        appendMessage("assistant error", "네트워크 오류가 발생했습니다. 서버 상태를 확인해 주세요.");
+      } finally {
+        setBusy(false, "대기 중");
+      }
+    });
+
+    function appendMessage(role, text) {
+      const element = document.createElement("div");
+      element.className = "message " + role;
+      element.textContent = text;
+      messages.appendChild(element);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function setBusy(isBusy, text) {
+      sendButton.disabled = isBusy;
+      status.textContent = text;
+    }
+  </script>
+</body>
+</html>

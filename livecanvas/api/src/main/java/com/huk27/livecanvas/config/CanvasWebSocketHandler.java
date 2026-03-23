@@ -1,10 +1,12 @@
 package com.huk27.livecanvas.config;
 
+import com.huk27.livecanvas.message.ChannelMessage;
 import com.huk27.livecanvas.message.ClientMessage;
+import com.huk27.livecanvas.message.StrokePayload;
+import com.huk27.livecanvas.session.CanvasSessionRegistry;
+import com.huk27.livecanvas.session.CanvasChannelRegistry;
 import com.huk27.livecanvas.session.ClientSession;
 import com.huk27.livecanvas.session.ClientSessionExtractor;
-import com.huk27.livecanvas.session.CanvasSessionRegistry;
-import org.springframework.context.annotation.Configuration;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.socket.WebSocketHandler;
 import org.springframework.web.reactive.socket.WebSocketMessage;
@@ -19,15 +21,18 @@ import java.util.Map;
 @Component
 public class CanvasWebSocketHandler implements WebSocketHandler {
     private final ObjectMapper objectMapper;
+    private final CanvasChannelRegistry canvasChannelRegistry;
     private final CanvasSessionRegistry canvasSessionRegistry;
     private final ClientSessionExtractor clientSessionExtractor;
 
     public CanvasWebSocketHandler(
             ObjectMapper objectMapper,
+            CanvasChannelRegistry canvasChannelRegistry,
             CanvasSessionRegistry canvasSessionRegistry,
             ClientSessionExtractor clientSessionExtractor
     ) {
         this.objectMapper = objectMapper;
+        this.canvasChannelRegistry = canvasChannelRegistry;
         this.canvasSessionRegistry = canvasSessionRegistry;
         this.clientSessionExtractor = clientSessionExtractor;
     }
@@ -41,6 +46,7 @@ public class CanvasWebSocketHandler implements WebSocketHandler {
     public Mono<Void> handle(WebSocketSession session) {
         ClientSession clientSession = clientSessionExtractor.extract(session);
         canvasSessionRegistry.add(clientSession);
+
         ClientMessage welcomeMessage = new ClientMessage(
                 "WELCOME",
                 objectMapper.valueToTree(Map.of(
@@ -50,25 +56,38 @@ public class CanvasWebSocketHandler implements WebSocketHandler {
                 ))
         );
 
-        Flux<WebSocketMessage> handlerFlux = session.receive()
-                .map(message -> {
+        Mono<Void> inbound = session.receive()
+                .flatMap(message -> {
                     try {
                         ClientMessage clientMessage = objectMapper.readValue(message.getPayloadAsText(), ClientMessage.class);
-                        clientMessage = switch (clientMessage.type()) {
-                            case "STROKE" -> new ClientMessage("STROKE_ACK", clientMessage.payload());
-                            default -> clientMessage;
-                        };
-
-                        return session.textMessage(toJsonStr(clientMessage));
+                        if ("STROKE".equals(clientMessage.type())) {
+                            StrokePayload strokePayload = objectMapper.treeToValue(clientMessage.payload(), StrokePayload.class);
+                            ClientMessage validatedMessage = new ClientMessage(
+                                    clientMessage.type(),
+                                    objectMapper.valueToTree(strokePayload)
+                            );
+                            canvasChannelRegistry.emit(
+                                    clientSession.channelId(),
+                                    new ChannelMessage(clientSession.sessionId(), toJsonStr(validatedMessage))
+                            );
+                        }
+                        return Mono.empty();
                     } catch (Exception e) {
-                        return session.textMessage(toJsonStr(e));
+                        return Mono.empty();
                     }
-                });
+                })
+                .then();
 
-        Flux<WebSocketMessage> outbound =
-                Flux.just(session.textMessage(toJsonStr(welcomeMessage))).concatWith(handlerFlux);
+        Flux<WebSocketMessage> outbound = Flux.just(toJsonStr(welcomeMessage))
+                .concatWith(
+                        canvasChannelRegistry.flux(clientSession.channelId())
+                                .filter(channelMessage -> !channelMessage.senderSessionId().equals(clientSession.sessionId()))
+                                .map(ChannelMessage::payloadJson)
+                )
+                .map(session::textMessage);
 
         return session.send(outbound)
+                .and(inbound)
                 .doFinally(signalType -> canvasSessionRegistry.remove(clientSession.sessionId()));
     }
 

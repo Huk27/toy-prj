@@ -13,6 +13,7 @@ import org.springframework.web.reactive.socket.WebSocketMessage;
 import org.springframework.web.reactive.socket.WebSocketSession;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 import tools.jackson.databind.ObjectMapper;
 
 import java.util.List;
@@ -46,6 +47,7 @@ public class CanvasWebSocketHandler implements WebSocketHandler {
     public Mono<Void> handle(WebSocketSession session) {
         ClientSession clientSession = clientSessionExtractor.extract(session);
         canvasSessionRegistry.add(clientSession);
+        Sinks.Many<String> personalOutboundSink = Sinks.many().unicast().onBackpressureBuffer();
 
         ClientMessage welcomeMessage = new ClientMessage(
                 "WELCOME",
@@ -73,12 +75,14 @@ public class CanvasWebSocketHandler implements WebSocketHandler {
                         }
                         return Mono.empty();
                     } catch (Exception e) {
+                        personalOutboundSink.tryEmitNext(toJsonStr(errorMessage(e)));
                         return Mono.empty();
                     }
                 })
                 .then();
 
         Flux<WebSocketMessage> outbound = Flux.just(toJsonStr(welcomeMessage))
+                .concatWith(personalOutboundSink.asFlux())
                 .concatWith(
                         canvasChannelRegistry.flux(clientSession.channelId())
                                 .filter(channelMessage -> !channelMessage.senderSessionId().equals(clientSession.sessionId()))
@@ -97,5 +101,14 @@ public class CanvasWebSocketHandler implements WebSocketHandler {
         } catch (Exception e) {
             throw new RuntimeException("failed to serialize message", e);
         }
+    }
+
+    private ClientMessage errorMessage(Exception e) {
+        return new ClientMessage(
+                "ERROR",
+                objectMapper.valueToTree(Map.of(
+                        "message", e.getMessage() == null ? "invalid request" : e.getMessage()
+                ))
+        );
     }
 }

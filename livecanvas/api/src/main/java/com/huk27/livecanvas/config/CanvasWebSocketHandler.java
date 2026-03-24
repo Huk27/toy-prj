@@ -2,7 +2,8 @@ package com.huk27.livecanvas.config;
 
 import com.huk27.livecanvas.message.ChannelMessage;
 import com.huk27.livecanvas.message.ClientMessage;
-import com.huk27.livecanvas.message.StrokePayload;
+import com.huk27.livecanvas.message.ClientMessageCodec;
+import com.huk27.livecanvas.message.ClientMessageDispatcher;
 import com.huk27.livecanvas.session.CanvasSessionRegistry;
 import com.huk27.livecanvas.session.CanvasChannelRegistry;
 import com.huk27.livecanvas.session.ClientSession;
@@ -14,25 +15,26 @@ import org.springframework.web.reactive.socket.WebSocketSession;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
-import tools.jackson.databind.ObjectMapper;
 
 import java.util.List;
-import java.util.Map;
 
 @Component
 public class CanvasWebSocketHandler implements WebSocketHandler {
-    private final ObjectMapper objectMapper;
+    private final ClientMessageCodec clientMessageCodec;
+    private final ClientMessageDispatcher clientMessageDispatcher;
     private final CanvasChannelRegistry canvasChannelRegistry;
     private final CanvasSessionRegistry canvasSessionRegistry;
     private final ClientSessionExtractor clientSessionExtractor;
 
     public CanvasWebSocketHandler(
-            ObjectMapper objectMapper,
+            ClientMessageCodec clientMessageCodec,
+            ClientMessageDispatcher clientMessageDispatcher,
             CanvasChannelRegistry canvasChannelRegistry,
             CanvasSessionRegistry canvasSessionRegistry,
             ClientSessionExtractor clientSessionExtractor
     ) {
-        this.objectMapper = objectMapper;
+        this.clientMessageCodec = clientMessageCodec;
+        this.clientMessageDispatcher = clientMessageDispatcher;
         this.canvasChannelRegistry = canvasChannelRegistry;
         this.canvasSessionRegistry = canvasSessionRegistry;
         this.clientSessionExtractor = clientSessionExtractor;
@@ -49,66 +51,40 @@ public class CanvasWebSocketHandler implements WebSocketHandler {
         canvasSessionRegistry.add(clientSession);
         Sinks.Many<String> personalOutboundSink = Sinks.many().unicast().onBackpressureBuffer();
 
-        ClientMessage welcomeMessage = new ClientMessage(
-                "WELCOME",
-                objectMapper.valueToTree(Map.of(
-                        "userId", clientSession.userId(),
-                        "sessionId", clientSession.sessionId(),
-                        "channelId", clientSession.channelId()
-                ))
+        ClientMessage welcomeMessage = clientMessageCodec.welcomeMessage(
+                clientSession.userId(),
+                clientSession.sessionId(),
+                clientSession.channelId()
         );
 
         Mono<Void> inbound = session.receive()
                 .flatMap(message -> {
                     try {
-                        ClientMessage clientMessage = objectMapper.readValue(message.getPayloadAsText(), ClientMessage.class);
-                        if ("STROKE".equals(clientMessage.type())) {
-                            StrokePayload strokePayload = objectMapper.treeToValue(clientMessage.payload(), StrokePayload.class);
-                            ClientMessage validatedMessage = new ClientMessage(
-                                    clientMessage.type(),
-                                    objectMapper.valueToTree(strokePayload)
-                            );
-                            canvasChannelRegistry.emit(
-                                    clientSession.channelId(),
-                                    new ChannelMessage(clientSession.sessionId(), toJsonStr(validatedMessage))
-                            );
-                        }
+                        ClientMessage clientMessage = clientMessageCodec.readClientMessage(message.getPayloadAsText());
+                        clientMessageDispatcher.dispatch(clientSession, clientMessage);
                         return Mono.empty();
                     } catch (Exception e) {
-                        personalOutboundSink.tryEmitNext(toJsonStr(errorMessage(e)));
+                        personalOutboundSink.tryEmitNext(
+                                clientMessageCodec.toJson(clientMessageCodec.errorMessage(e.getMessage()))
+                        );
                         return Mono.empty();
                     }
                 })
                 .then();
 
-        Flux<WebSocketMessage> outbound = Flux.just(toJsonStr(welcomeMessage))
-                .concatWith(personalOutboundSink.asFlux())
-                .concatWith(
+        Flux<String> outboundMessages = personalOutboundSink.asFlux()
+                .mergeWith(
                         canvasChannelRegistry.flux(clientSession.channelId())
                                 .filter(channelMessage -> !channelMessage.senderSessionId().equals(clientSession.sessionId()))
                                 .map(ChannelMessage::payloadJson)
-                )
+                );
+
+        Flux<WebSocketMessage> outbound = Flux.just(clientMessageCodec.toJson(welcomeMessage))
+                .concatWith(outboundMessages)
                 .map(session::textMessage);
 
         return session.send(outbound)
                 .and(inbound)
                 .doFinally(signalType -> canvasSessionRegistry.remove(clientSession.sessionId()));
-    }
-
-    private String toJsonStr(Object obj) {
-        try {
-            return objectMapper.writeValueAsString(obj);
-        } catch (Exception e) {
-            throw new RuntimeException("failed to serialize message", e);
-        }
-    }
-
-    private ClientMessage errorMessage(Exception e) {
-        return new ClientMessage(
-                "ERROR",
-                objectMapper.valueToTree(Map.of(
-                        "message", e.getMessage() == null ? "invalid request" : e.getMessage()
-                ))
-        );
     }
 }

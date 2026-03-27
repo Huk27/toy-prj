@@ -3,20 +3,27 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Lost Ark AI Chat</title>
+  <title>LOA Pulse</title>
   <style>
     :root {
-      --bg: #f4efe6;
-      --panel: rgba(255, 252, 247, 0.9);
-      --line: #d8cbb6;
-      --text: #1f1a14;
-      --muted: #6b6256;
-      --accent: #a84b2f;
-      --accent-dark: #7b2e18;
-      --user: #efe3d0;
-      --assistant: #fffaf2;
-      --error: #fff1ec;
-      --shadow: 0 24px 60px rgba(72, 52, 24, 0.12);
+      --ink: #f7f3ea;
+      --paper: rgba(20, 24, 31, 0.78);
+      --paper-strong: rgba(12, 16, 22, 0.88);
+      --line: rgba(255, 255, 255, 0.1);
+      --line-strong: rgba(255, 255, 255, 0.18);
+      --muted: #9ca7b8;
+      --gold: #f6bf62;
+      --gold-deep: #d18229;
+      --rise: #ff8a4c;
+      --calm: #7db2ff;
+      --bg-1: #07111e;
+      --bg-2: #111b2d;
+      --bg-3: #2f1e16;
+      --chip: rgba(255, 255, 255, 0.06);
+      --shadow: 0 30px 80px rgba(0, 0, 0, 0.35);
+      --radius-xl: 30px;
+      --radius-lg: 22px;
+      --radius-md: 16px;
     }
 
     * {
@@ -26,373 +33,1012 @@
     body {
       margin: 0;
       min-height: 100vh;
-      font-family: "Pretendard", "Noto Sans KR", sans-serif;
-      color: var(--text);
+      font-family: "Pretendard Variable", "SUIT", "Noto Sans KR", sans-serif;
+      color: var(--ink);
       background:
-        radial-gradient(circle at top left, rgba(168, 75, 47, 0.18), transparent 28%),
-        radial-gradient(circle at bottom right, rgba(191, 150, 78, 0.18), transparent 26%),
-        linear-gradient(160deg, #f8f3eb 0%, #efe6d9 100%);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
+        radial-gradient(circle at 10% 10%, rgba(246, 191, 98, 0.14), transparent 28%),
+        radial-gradient(circle at 90% 18%, rgba(125, 178, 255, 0.16), transparent 24%),
+        radial-gradient(circle at 50% 100%, rgba(255, 138, 76, 0.12), transparent 30%),
+        linear-gradient(145deg, var(--bg-1) 0%, var(--bg-2) 55%, var(--bg-3) 100%);
+      padding: 28px;
     }
 
-    .shell {
-      width: min(960px, 100%);
-      background: var(--panel);
-      backdrop-filter: blur(18px);
-      border: 1px solid rgba(255, 255, 255, 0.55);
-      border-radius: 28px;
-      box-shadow: var(--shadow);
-      overflow: hidden;
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    .page {
+      width: min(1440px, 100%);
+      margin: 0 auto;
+      display: grid;
+      gap: 22px;
     }
 
     .hero {
-      padding: 28px 28px 18px;
-      border-bottom: 1px solid rgba(216, 203, 182, 0.65);
-      background: linear-gradient(135deg, rgba(168, 75, 47, 0.1), rgba(255, 255, 255, 0));
+      position: relative;
+      overflow: hidden;
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-xl);
+      background:
+        linear-gradient(135deg, rgba(246, 191, 98, 0.12), transparent 30%),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.03)),
+        var(--paper);
+      box-shadow: var(--shadow);
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: auto -120px -140px auto;
+      width: 320px;
+      height: 320px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(246, 191, 98, 0.28), transparent 68%);
+      pointer-events: none;
+    }
+
+    .topbar,
+    .hero-main,
+    .content,
+    .bottom {
+      display: grid;
+      gap: 22px;
+    }
+
+    .topbar {
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .brand-mark {
+      width: 40px;
+      height: 40px;
+      border-radius: 14px;
+      background:
+        linear-gradient(145deg, rgba(246, 191, 98, 1), rgba(209, 130, 41, 1));
+      color: #11141a;
+      display: grid;
+      place-items: center;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
+    }
+
+    .filters {
+      display: inline-flex;
+      gap: 10px;
+      justify-self: center;
+      flex-wrap: wrap;
+    }
+
+    .chip {
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: var(--chip);
+      border: 1px solid transparent;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .chip.active {
+      background: rgba(246, 191, 98, 0.14);
+      border-color: rgba(246, 191, 98, 0.36);
+      color: var(--ink);
+    }
+
+    .status-badge {
+      justify-self: end;
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(14, 19, 25, 0.64);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #44d17a;
+      box-shadow: 0 0 0 6px rgba(68, 209, 122, 0.12);
+    }
+
+    .hero-main {
+      grid-template-columns: 1.3fr 0.9fr;
+      align-items: end;
     }
 
     .eyebrow {
-      margin: 0 0 10px;
-      color: var(--accent);
+      margin: 0 0 12px;
+      color: var(--gold);
       font-size: 12px;
-      font-weight: 700;
       letter-spacing: 0.18em;
       text-transform: uppercase;
+      font-weight: 800;
     }
 
     h1 {
       margin: 0;
-      font-size: clamp(28px, 4vw, 44px);
-      line-height: 1.05;
-      letter-spacing: -0.04em;
+      max-width: 760px;
+      font-size: clamp(34px, 6vw, 68px);
+      line-height: 0.97;
+      letter-spacing: -0.05em;
     }
 
     .subtitle {
-      margin: 10px 0 0;
+      margin: 18px 0 0;
+      max-width: 720px;
+      font-size: 16px;
+      line-height: 1.7;
       color: var(--muted);
-      font-size: 15px;
-      line-height: 1.6;
-      max-width: 700px;
     }
 
-    .grid {
+    .hero-summary {
       display: grid;
-      grid-template-columns: 320px 1fr;
-      min-height: 680px;
+      gap: 14px;
     }
 
-    .sidebar {
-      padding: 24px;
-      border-right: 1px solid rgba(216, 203, 182, 0.65);
-      background: rgba(249, 243, 233, 0.6);
+    .summary-card,
+    .panel,
+    .list-card,
+    .timeline-card,
+    .headline-card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.03)),
+        var(--paper-strong);
+      box-shadow: var(--shadow);
     }
 
-    .chat-panel {
-      display: flex;
-      flex-direction: column;
-      min-height: 0;
+    .summary-card {
+      padding: 18px 20px;
     }
 
-    .section-title {
-      margin: 0 0 12px;
-      font-size: 13px;
-      font-weight: 800;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
+    .summary-label {
       color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      font-weight: 800;
     }
 
-    .field {
+    .summary-keyword {
+      margin-top: 8px;
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .summary-keyword strong {
+      font-size: 30px;
+      letter-spacing: -0.04em;
+    }
+
+    .summary-keyword span {
+      color: var(--rise);
+      font-weight: 800;
+      font-size: 14px;
+    }
+
+    .summary-copy {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .content {
+      grid-template-columns: 1.35fr 0.9fr;
+    }
+
+    .panel {
+      padding: 22px;
+    }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
       margin-bottom: 18px;
     }
 
-    label {
-      display: block;
-      margin-bottom: 8px;
-      font-size: 14px;
-      font-weight: 700;
+    .panel-title {
+      margin: 0;
+      font-size: 20px;
+      letter-spacing: -0.03em;
     }
 
-    input,
-    textarea,
-    button {
-      font: inherit;
-    }
-
-    input,
-    textarea {
-      width: 100%;
-      border: 1px solid var(--line);
-      background: rgba(255, 255, 255, 0.88);
-      border-radius: 16px;
-      padding: 14px 16px;
-      color: var(--text);
-      outline: none;
-      transition: border-color 0.2s ease, transform 0.2s ease;
-    }
-
-    input:focus,
-    textarea:focus {
-      border-color: var(--accent);
-      transform: translateY(-1px);
-    }
-
-    textarea {
-      min-height: 120px;
-      resize: vertical;
-    }
-
-    button {
-      border: 0;
-      border-radius: 999px;
-      background: linear-gradient(135deg, var(--accent), var(--accent-dark));
-      color: #fff;
-      padding: 14px 22px;
-      font-weight: 700;
-      cursor: pointer;
-      transition: transform 0.18s ease, opacity 0.18s ease;
-    }
-
-    button:hover:not(:disabled) {
-      transform: translateY(-1px);
-    }
-
-    button:disabled {
-      opacity: 0.6;
-      cursor: wait;
-    }
-
-    .helper {
-      margin: 8px 0 0;
+    .panel-desc {
       color: var(--muted);
       font-size: 13px;
-      line-height: 1.5;
     }
 
-    .tips {
-      margin-top: 28px;
-      padding: 18px;
-      background: rgba(255, 255, 255, 0.64);
-      border: 1px solid rgba(216, 203, 182, 0.7);
-      border-radius: 18px;
+    .metric-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
     }
 
-    .tips p {
-      margin: 0 0 10px;
-      font-size: 14px;
+    .metric-card {
+      padding: 16px;
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--line);
+    }
+
+    .metric-card span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-weight: 800;
+    }
+
+    .metric-card strong {
+      display: block;
+      margin-top: 10px;
+      font-size: 28px;
+      letter-spacing: -0.04em;
+    }
+
+    .metric-card em {
+      display: block;
+      margin-top: 8px;
+      font-style: normal;
+      color: var(--rise);
+      font-size: 13px;
       font-weight: 700;
     }
 
-    .tips ul {
+    .keyword-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .keyword-card {
+      padding: 16px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--line);
+      transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+      cursor: pointer;
+    }
+
+    .keyword-card:hover,
+    .keyword-card.is-selected {
+      transform: translateY(-2px);
+      border-color: rgba(246, 191, 98, 0.32);
+      background: rgba(246, 191, 98, 0.08);
+    }
+
+    .keyword-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .keyword-rank {
+      color: var(--gold);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    .keyword-name {
+      margin-top: 8px;
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+    }
+
+    .keyword-meta {
+      margin-top: 10px;
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .keyword-score {
+      color: var(--rise);
+      font-weight: 800;
+    }
+
+    .side-stack {
+      display: grid;
+      gap: 22px;
+    }
+
+    .list-card,
+    .timeline-card,
+    .headline-card {
+      padding: 22px;
+    }
+
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .section-head h2,
+    .section-head h3 {
       margin: 0;
-      padding-left: 18px;
+      font-size: 20px;
+      letter-spacing: -0.03em;
+    }
+
+    .tiny {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-weight: 800;
+    }
+
+    .rank-list,
+    .headline-list,
+    .issue-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 12px;
+    }
+
+    .rank-item,
+    .headline-item,
+    .issue-item {
+      display: grid;
+      gap: 8px;
+      padding: 14px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .rank-item:last-child,
+    .headline-item:last-child,
+    .issue-item:last-child {
+      border-bottom: 0;
+      padding-bottom: 0;
+    }
+
+    .rank-main,
+    .headline-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .rank-main strong,
+    .headline-title {
+      font-size: 16px;
+      letter-spacing: -0.02em;
+    }
+
+    .rank-badge {
+      min-width: 34px;
+      height: 34px;
+      border-radius: 12px;
+      display: grid;
+      place-items: center;
+      background: rgba(246, 191, 98, 0.12);
+      color: var(--gold);
+      font-weight: 800;
+    }
+
+    .rank-stats,
+    .headline-meta,
+    .issue-copy {
       color: var(--muted);
       font-size: 13px;
       line-height: 1.6;
     }
 
-    .messages {
-      flex: 1;
-      overflow: auto;
-      padding: 24px;
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
-      background:
-        linear-gradient(rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.2)),
-        repeating-linear-gradient(
-          180deg,
-          rgba(216, 203, 182, 0.08) 0,
-          rgba(216, 203, 182, 0.08) 1px,
-          transparent 1px,
-          transparent 32px
-        );
-    }
-
-    .message {
-      max-width: 78%;
-      padding: 16px 18px;
-      border-radius: 20px;
-      line-height: 1.65;
-      white-space: pre-wrap;
-      animation: rise 0.24s ease;
-      border: 1px solid rgba(216, 203, 182, 0.7);
-    }
-
-    .message.user {
-      align-self: flex-end;
-      background: var(--user);
-      border-bottom-right-radius: 8px;
-    }
-
-    .message.assistant {
-      background: var(--assistant);
-      border-bottom-left-radius: 8px;
-    }
-
-    .message.error {
-      background: var(--error);
-      color: #8b2f22;
-    }
-
-    .composer {
-      padding: 20px 24px 24px;
-      border-top: 1px solid rgba(216, 203, 182, 0.65);
-      background: rgba(255, 250, 242, 0.88);
-    }
-
-    .composer textarea {
-      min-height: 98px;
-      margin-bottom: 14px;
-    }
-
-    .composer-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
+    .timeline {
+      display: grid;
       gap: 16px;
     }
 
-    .status {
+    .timeline-row {
+      display: grid;
+      grid-template-columns: 96px 1fr auto;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .timeline-label {
+      color: var(--ink);
+      font-weight: 700;
+    }
+
+    .bar-track {
+      overflow: hidden;
+      border-radius: 999px;
+      height: 12px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, rgba(125, 178, 255, 0.95), rgba(246, 191, 98, 0.95));
+    }
+
+    .timeline-value {
       color: var(--muted);
       font-size: 13px;
+      font-weight: 700;
     }
 
-    @keyframes rise {
-      from {
-        opacity: 0;
-        transform: translateY(8px);
-      }
-      to {
-        opacity: 1;
-        transform: translateY(0);
+    .bottom {
+      grid-template-columns: 0.85fr 1.15fr;
+    }
+
+    .headline-item.is-featured {
+      padding: 16px;
+      border: 1px solid rgba(246, 191, 98, 0.2);
+      border-radius: 18px;
+      background: rgba(246, 191, 98, 0.06);
+    }
+
+    .headline-source {
+      color: var(--gold);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+    }
+
+    .headline-meta {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    .issue-item strong {
+      font-size: 18px;
+      letter-spacing: -0.03em;
+    }
+
+    .footnote {
+      padding: 0 6px 8px;
+      color: rgba(255, 255, 255, 0.55);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    @media (max-width: 1180px) {
+      .hero-main,
+      .content,
+      .bottom {
+        grid-template-columns: 1fr;
       }
     }
 
-    @media (max-width: 860px) {
-      .grid {
+    @media (max-width: 900px) {
+      body {
+        padding: 16px;
+      }
+
+      .topbar {
+        grid-template-columns: 1fr;
+        justify-items: start;
+      }
+
+      .filters,
+      .status-badge {
+        justify-self: start;
+      }
+
+      .metric-row,
+      .keyword-grid {
         grid-template-columns: 1fr;
       }
 
-      .sidebar {
-        border-right: 0;
-        border-bottom: 1px solid rgba(216, 203, 182, 0.65);
-      }
-
-      .message {
-        max-width: 100%;
+      .timeline-row {
+        grid-template-columns: 1fr;
       }
     }
   </style>
 </head>
 <body>
-  <main class="shell">
+  <main class="page">
     <section class="hero">
-      <p class="eyebrow">Lost Ark AI</p>
-      <h1>간단한 테스트 채팅 화면</h1>
-      <p class="subtitle">
-        브라우저에서 바로 질문을 보내고 응답을 확인할 수 있습니다.
-        API key는 브라우저 로컬 스토리지에만 저장되며 서버에는 요청할 때만 함께 전송됩니다.
-      </p>
+      <div class="topbar">
+        <div class="brand">
+          <div class="brand-mark">L</div>
+          <span>LOA Pulse</span>
+        </div>
+
+        <div class="filters">
+          <span class="chip active">전체 커뮤니티</span>
+          <span class="chip">인벤</span>
+          <span class="chip">로아갤</span>
+          <span class="chip">최근 1시간</span>
+          <span class="chip">최근 24시간</span>
+        </div>
+
+        <div class="status-badge">
+          <span class="status-dot"></span>
+          <span>5분 전 수집 완료 · 댓글 포함 18,492건 분석</span>
+        </div>
+      </div>
+
+      <div class="hero-main">
+        <div>
+          <p class="eyebrow">Lost Ark Community Trend Radar</p>
+          <h1>오늘 로아 커뮤니티를 흔드는 키워드를 바로 보여주는 화면</h1>
+          <p class="subtitle">
+            인벤과 로아갤 게시글, 댓글 흐름을 한 번에 모아 지금 가장 많이 언급되는 키워드와 갑자기 치솟는 이슈를 추적합니다.
+            워드클라우드 대신 실제로 읽을 만한 대표 글과 카테고리별 흐름을 같이 보여주는 구성이 핵심입니다.
+          </p>
+        </div>
+
+        <div class="hero-summary">
+          <article class="summary-card">
+            <div class="summary-label">지금 가장 뜨거운 키워드</div>
+            <div class="summary-keyword">
+              <strong>상재 완화</strong>
+              <span>+182%</span>
+            </div>
+            <div class="summary-copy">
+              패치 기대감과 비용 절감 계산 글이 동시에 올라오면서 제목/댓글 양쪽에서 급증했습니다.
+            </div>
+          </article>
+
+          <article class="summary-card">
+            <div class="summary-label">논쟁이 큰 이슈</div>
+            <div class="summary-keyword">
+              <strong>브레이커</strong>
+              <span>댓글 폭증</span>
+            </div>
+            <div class="summary-copy">
+              직업 밸런스와 레이드 체감 성능 이야기가 길게 이어지는 중입니다.
+            </div>
+          </article>
+        </div>
+      </div>
     </section>
 
-    <section class="grid">
-      <aside class="sidebar">
-        <h2 class="section-title">Connection</h2>
-        <div class="field">
-          <label for="apiKey">Gemini API key</label>
-          <input id="apiKey" type="password" placeholder="AIza..." autocomplete="off">
-          <p class="helper">입력하지 않으면 서버에 설정된 기본 API key를 사용합니다.</p>
-        </div>
-
-        <div class="tips">
-          <p>테스트 팁</p>
-          <ul>
-            <li>응답 실패 시 메시지 영역에 quota 또는 인증 오류가 그대로 표시됩니다.</li>
-            <li>현재 화면은 간단한 JSON 채팅 테스트용입니다.</li>
-            <li>루트 경로 `/` 에서 바로 열립니다.</li>
-          </ul>
-        </div>
-      </aside>
-
-      <section class="chat-panel">
-        <div class="messages" id="messages">
-          <div class="message assistant">질문을 입력하면 여기에서 응답을 확인할 수 있습니다.</div>
-        </div>
-
-        <form class="composer" id="chatForm">
-          <label for="message">질문</label>
-          <textarea id="message" placeholder="예: 요즘 로스트아크 경제 이슈 알려줘"></textarea>
-          <div class="composer-row">
-            <span class="status" id="status">대기 중</span>
-            <button id="sendButton" type="submit">보내기</button>
+    <section class="content">
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">실시간 키워드 맵</h2>
+            <div class="panel-desc">빈도와 상승률을 같이 보는 메인 영역</div>
           </div>
-        </form>
+          <div class="tiny">Demo Snapshot</div>
+        </div>
+
+        <div class="metric-row">
+          <article class="metric-card">
+            <span>수집 소스</span>
+            <strong>2</strong>
+            <em>인벤 · 로아갤</em>
+          </article>
+          <article class="metric-card">
+            <span>활성 키워드</span>
+            <strong>137</strong>
+            <em>최근 24시간 기준</em>
+          </article>
+          <article class="metric-card">
+            <span>급상승 감지</span>
+            <strong>18</strong>
+            <em>평균 대비 2배 이상</em>
+          </article>
+        </div>
+
+        <div class="keyword-grid" id="keywordGrid">
+          <article class="keyword-card is-selected" data-keyword="상재 완화">
+            <div class="keyword-top">
+              <span class="keyword-rank">Rank 1</span>
+              <span class="keyword-score">+182%</span>
+            </div>
+            <div class="keyword-name">상재 완화</div>
+            <div class="keyword-meta">
+              <span>언급 1,248회</span>
+              <span>경제 · 패치</span>
+            </div>
+          </article>
+
+          <article class="keyword-card" data-keyword="브레이커">
+            <div class="keyword-top">
+              <span class="keyword-rank">Rank 2</span>
+              <span class="keyword-score">+96%</span>
+            </div>
+            <div class="keyword-name">브레이커</div>
+            <div class="keyword-meta">
+              <span>언급 1,031회</span>
+              <span>직업 밸런스</span>
+            </div>
+          </article>
+
+          <article class="keyword-card" data-keyword="보석 변환">
+            <div class="keyword-top">
+              <span class="keyword-rank">Rank 3</span>
+              <span class="keyword-score">+74%</span>
+            </div>
+            <div class="keyword-name">보석 변환</div>
+            <div class="keyword-meta">
+              <span>언급 892회</span>
+              <span>경제 · 성장</span>
+            </div>
+          </article>
+
+          <article class="keyword-card" data-keyword="카제로스">
+            <div class="keyword-top">
+              <span class="keyword-rank">Rank 4</span>
+              <span class="keyword-score">+58%</span>
+            </div>
+            <div class="keyword-name">카제로스</div>
+            <div class="keyword-meta">
+              <span>언급 841회</span>
+              <span>레이드</span>
+            </div>
+          </article>
+
+          <article class="keyword-card" data-keyword="골드 시세">
+            <div class="keyword-top">
+              <span class="keyword-rank">Rank 5</span>
+              <span class="keyword-score">+43%</span>
+            </div>
+            <div class="keyword-name">골드 시세</div>
+            <div class="keyword-meta">
+              <span>언급 756회</span>
+              <span>경제</span>
+            </div>
+          </article>
+
+          <article class="keyword-card" data-keyword="서폿 부족">
+            <div class="keyword-top">
+              <span class="keyword-rank">Rank 6</span>
+              <span class="keyword-score">+39%</span>
+            </div>
+            <div class="keyword-name">서폿 부족</div>
+            <div class="keyword-meta">
+              <span>언급 611회</span>
+              <span>파티 구인</span>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <aside class="side-stack">
+        <section class="list-card">
+          <div class="section-head">
+            <h2>급상승 키워드</h2>
+            <span class="tiny">1시간 기준</span>
+          </div>
+          <ol class="rank-list">
+            <li class="rank-item">
+              <div class="rank-main">
+                <div class="rank-badge">1</div>
+                <strong>상재 완화</strong>
+                <span class="keyword-score">+182%</span>
+              </div>
+              <div class="rank-stats">패치 기대 · 재련 비용 계산 · 골드 절감 글 동시 증가</div>
+            </li>
+            <li class="rank-item">
+              <div class="rank-main">
+                <div class="rank-badge">2</div>
+                <strong>브레이커</strong>
+                <span class="keyword-score">+96%</span>
+              </div>
+              <div class="rank-stats">밸런스 체감 후기와 숙련도 논쟁이 댓글에서 크게 확산</div>
+            </li>
+            <li class="rank-item">
+              <div class="rank-main">
+                <div class="rank-badge">3</div>
+                <strong>보석 변환</strong>
+                <span class="keyword-score">+74%</span>
+              </div>
+              <div class="rank-stats">세팅 비용 비교표와 직업 갈아타기 글이 묶여서 상승</div>
+            </li>
+            <li class="rank-item">
+              <div class="rank-main">
+                <div class="rank-badge">4</div>
+                <strong>카제로스</strong>
+                <span class="keyword-score">+58%</span>
+              </div>
+              <div class="rank-stats">트라이 후기와 공대 모집 글이 동시에 반응을 끌어냄</div>
+            </li>
+          </ol>
+        </section>
+
+        <section class="timeline-card">
+          <div class="section-head">
+            <h3>카테고리 흐름</h3>
+            <span class="tiny">최근 24시간</span>
+          </div>
+          <div class="timeline">
+            <div class="timeline-row">
+              <div class="timeline-label">경제</div>
+              <div class="bar-track"><div class="bar-fill" style="width: 88%"></div></div>
+              <div class="timeline-value">5.2k 언급</div>
+            </div>
+            <div class="timeline-row">
+              <div class="timeline-label">직업 밸런스</div>
+              <div class="bar-track"><div class="bar-fill" style="width: 76%"></div></div>
+              <div class="timeline-value">4.4k 언급</div>
+            </div>
+            <div class="timeline-row">
+              <div class="timeline-label">레이드</div>
+              <div class="bar-track"><div class="bar-fill" style="width: 71%"></div></div>
+              <div class="timeline-value">4.1k 언급</div>
+            </div>
+            <div class="timeline-row">
+              <div class="timeline-label">이벤트</div>
+              <div class="bar-track"><div class="bar-fill" style="width: 52%"></div></div>
+              <div class="timeline-value">3.0k 언급</div>
+            </div>
+            <div class="timeline-row">
+              <div class="timeline-label">사건사고</div>
+              <div class="bar-track"><div class="bar-fill" style="width: 34%"></div></div>
+              <div class="timeline-value">1.9k 언급</div>
+            </div>
+          </div>
+        </section>
+      </aside>
+    </section>
+
+    <section class="bottom">
+      <section class="headline-card">
+        <div class="section-head">
+          <h2>대표 게시글</h2>
+          <span class="tiny" id="headlineKeyword">상재 완화 중심</span>
+        </div>
+        <ul class="headline-list" id="headlineList">
+          <li class="headline-item is-featured">
+            <div class="headline-top">
+              <span class="headline-source">Inven</span>
+              <span class="tiny">댓글 184 · 조회 12,441</span>
+            </div>
+            <div class="headline-title">상재 완화 오면 지금 재료 미리 사두는 게 맞냐는 계산 글</div>
+            <div class="headline-meta">
+              <span>핵심 문장: 완화 폭 예상치에 따라 손익분기점이 크게 갈린다는 반응</span>
+            </div>
+          </li>
+          <li class="headline-item">
+            <div class="headline-top">
+              <span class="headline-source">Loa Gallery</span>
+              <span class="tiny">댓글 121 · 추천 66</span>
+            </div>
+            <div class="headline-title">상재 완화 전에 골드 쓰면 바보냐는 여론이 급격히 늘어나는 중</div>
+            <div class="headline-meta">
+              <span>대표 반응: 재련보다 보석이나 악세 쪽이 낫다는 의견 다수</span>
+            </div>
+          </li>
+          <li class="headline-item">
+            <div class="headline-top">
+              <span class="headline-source">Inven</span>
+              <span class="tiny">댓글 73 · 조회 8,104</span>
+            </div>
+            <div class="headline-title">완화되면 배럭 1640 라인업이 다시 늘어날 거라는 전망</div>
+            <div class="headline-meta">
+              <span>관련 키워드: 골드 수급 · 배럭 효율 · 카제로스 준비</span>
+            </div>
+          </li>
+        </ul>
+      </section>
+
+      <section class="headline-card">
+        <div class="section-head">
+          <h2>지금 보이는 흐름 해석</h2>
+          <span class="tiny">운영자용 메모 느낌</span>
+        </div>
+        <ul class="issue-list">
+          <li class="issue-item">
+            <strong>경제 이슈는 패치 기대와 붙을 때 폭발합니다</strong>
+            <div class="issue-copy">
+              단순한 골드 시세보다 상재, 보석, 배럭 효율처럼 실제 지출 의사결정에 가까운 키워드가 더 오래 남습니다.
+            </div>
+          </li>
+          <li class="issue-item">
+            <strong>직업 이슈는 댓글에서 더 선명합니다</strong>
+            <div class="issue-copy">
+              제목만 보면 밸런스 토론 같아도, 댓글을 같이 보면 체감 딜, 레이드 취업, 유저 피로도처럼 더 구체적인 포인트가 드러납니다.
+            </div>
+          </li>
+          <li class="issue-item">
+            <strong>그래서 메인 화면은 워드클라우드보다 랭킹형이 낫습니다</strong>
+            <div class="issue-copy">
+              유저는 예쁜 그림보다 “지금 뭐가 왜 뜨는지”를 바로 읽고 싶어하기 때문에 대표 글과 상승률을 붙이는 편이 훨씬 실용적입니다.
+            </div>
+          </li>
+        </ul>
       </section>
     </section>
+
+    <div class="footnote">
+      현재 화면은 로컬 데모용 정적 샘플입니다. 다음 단계에서는 크롤링 결과를 메모리 저장소에 적재하고, 이 카드들을 실제 API 응답으로 바꾸면 됩니다.
+    </div>
   </main>
 
   <script>
-    const form = document.getElementById("chatForm");
-    const apiKeyInput = document.getElementById("apiKey");
-    const messageInput = document.getElementById("message");
-    const messages = document.getElementById("messages");
-    const status = document.getElementById("status");
-    const sendButton = document.getElementById("sendButton");
-    const storageKey = "lostark-ai.api-key";
+    const headlineKeyword = document.getElementById("headlineKeyword");
+    const headlineList = document.getElementById("headlineList");
+    const keywordCards = [...document.querySelectorAll(".keyword-card")];
 
-    apiKeyInput.value = localStorage.getItem(storageKey) || "";
+    const headlinesByKeyword = {
+      "상재 완화": [
+        {
+          source: "Inven",
+          meta: "댓글 184 · 조회 12,441",
+          title: "상재 완화 오면 지금 재료 미리 사두는 게 맞냐는 계산 글",
+          copy: "핵심 문장: 완화 폭 예상치에 따라 손익분기점이 크게 갈린다는 반응",
+          featured: true
+        },
+        {
+          source: "Loa Gallery",
+          meta: "댓글 121 · 추천 66",
+          title: "상재 완화 전에 골드 쓰면 바보냐는 여론이 급격히 늘어나는 중",
+          copy: "대표 반응: 재련보다 보석이나 악세 쪽이 낫다는 의견 다수"
+        },
+        {
+          source: "Inven",
+          meta: "댓글 73 · 조회 8,104",
+          title: "완화되면 배럭 1640 라인업이 다시 늘어날 거라는 전망",
+          copy: "관련 키워드: 골드 수급 · 배럭 효율 · 카제로스 준비"
+        }
+      ],
+      "브레이커": [
+        {
+          source: "Loa Gallery",
+          meta: "댓글 209 · 추천 93",
+          title: "브레이커가 허수보다 실전이 너무 좋다는 반응이 다시 붙는 중",
+          copy: "핵심 문장: 카운터, 무력, 체방 안정성까지 포함하면 체감이 높다는 의견",
+          featured: true
+        },
+        {
+          source: "Inven",
+          meta: "댓글 132 · 조회 9,201",
+          title: "브레이커 취업률이 왜 높은지 체감상 설명한 공대장 글",
+          copy: "대표 반응: 딜 숫자보다 안정감과 숙련 편차가 덜하다는 의견"
+        },
+        {
+          source: "Loa Gallery",
+          meta: "댓글 84 · 추천 48",
+          title: "브레이커 너프 얘기 나오는 순간마다 특정 레이드 후기 글이 따라 붙음",
+          copy: "관련 키워드: 밸런스 · 숙련도 · 취업"
+        }
+      ],
+      "보석 변환": [
+        {
+          source: "Inven",
+          meta: "댓글 117 · 조회 7,884",
+          title: "직업 갈아타려는 유저들이 보석 변환 비용표를 계속 올리는 중",
+          copy: "핵심 문장: 세팅 유지 비용보다 변환 스트레스가 더 크다는 반응",
+          featured: true
+        },
+        {
+          source: "Loa Gallery",
+          meta: "댓글 74 · 추천 39",
+          title: "보석 변환 자유도만 높아져도 직업 다양성 살아난다는 주장",
+          copy: "대표 반응: 배럭 운용 방식까지 바뀔 수 있다는 기대"
+        },
+        {
+          source: "Inven",
+          meta: "댓글 52 · 조회 4,510",
+          title: "고레벨 보석 재배치가 지금 메타에서 가장 큰 골드 블랙홀이라는 글",
+          copy: "관련 키워드: 세팅 비용 · 배럭 · 직업 변경"
+        }
+      ],
+      "카제로스": [
+        {
+          source: "Inven",
+          meta: "댓글 99 · 조회 10,122",
+          title: "카제로스 2막에서 공대가 가장 자주 터지는 구간 정리",
+          copy: "핵심 문장: 특정 패턴보다 파티 시너지 부족에서 무너진다는 분석",
+          featured: true
+        },
+        {
+          source: "Loa Gallery",
+          meta: "댓글 88 · 추천 57",
+          title: "카제로스 트라이팟이 서폿 구인 때문에 더 막힌다는 하소연",
+          copy: "대표 반응: 스펙보다 구인난과 피로도가 더 크다는 의견"
+        },
+        {
+          source: "Inven",
+          meta: "댓글 65 · 조회 6,404",
+          title: "카제로스 준비용 배럭 컷을 어디까지 보는지 의견이 갈리는 중",
+          copy: "관련 키워드: 서폿 부족 · 스펙컷 · 레이드 피로도"
+        }
+      ],
+      "골드 시세": [
+        {
+          source: "Loa Gallery",
+          meta: "댓글 102 · 추천 51",
+          title: "골드 시세가 잠깐 흔들릴 때마다 재료 가격이 더 민감하게 반응한다는 글",
+          copy: "핵심 문장: 실제 체감은 환율보다 강화 재료에서 먼저 온다는 반응",
+          featured: true
+        },
+        {
+          source: "Inven",
+          meta: "댓글 66 · 조회 5,904",
+          title: "패키지 판매 타이밍이 골드 체감가에 주는 영향 정리",
+          copy: "대표 반응: 결국 유저는 시세보다 효율표를 보고 움직인다는 의견"
+        },
+        {
+          source: "Loa Gallery",
+          meta: "댓글 34 · 추천 17",
+          title: "골드만 볼 게 아니라 보석과 재료 가격을 같이 봐야 한다는 주장",
+          copy: "관련 키워드: 상재 완화 · 보석 변환 · 패키지"
+        }
+      ],
+      "서폿 부족": [
+        {
+          source: "Inven",
+          meta: "댓글 127 · 조회 8,733",
+          title: "서폿 부족은 스펙 문제가 아니라 피로도 문제라는 공대장 후기",
+          copy: "핵심 문장: 같은 스펙이어도 파티 굴리는 체감이 확실히 다르다는 반응",
+          featured: true
+        },
+        {
+          source: "Loa Gallery",
+          meta: "댓글 93 · 추천 41",
+          title: "트라이팟에서 서폿 구인이 안 되는 이유를 지원 구조 탓으로 보는 글",
+          copy: "대표 반응: 보상 구조를 손봐야 공급이 늘어난다는 의견"
+        },
+        {
+          source: "Inven",
+          meta: "댓글 49 · 조회 5,140",
+          title: "서폿 모자라서 레이드 준비보다 대기 시간이 더 길다는 하소연",
+          copy: "관련 키워드: 카제로스 · 파티 구인 · 직업 체감"
+        }
+      ]
+    };
 
-    apiKeyInput.addEventListener("input", () => {
-      localStorage.setItem(storageKey, apiKeyInput.value.trim());
+    keywordCards.forEach((card) => {
+      card.addEventListener("click", () => {
+        keywordCards.forEach((item) => item.classList.remove("is-selected"));
+        card.classList.add("is-selected");
+        renderHeadlines(card.dataset.keyword);
+      });
     });
 
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-
-      const message = messageInput.value.trim();
-      const apiKey = apiKeyInput.value.trim();
-      if (!message) {
-        messageInput.focus();
-        return;
-      }
-
-      appendMessage("user", message);
-      messageInput.value = "";
-      setBusy(true, "응답 생성 중");
-
-      try {
-        const response = await fetch("/api/chat", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({ message, apiKey })
-        });
-
-        const payload = await response.json();
-        appendMessage(response.ok ? "assistant" : "assistant error", payload.message || "응답을 받지 못했습니다.");
-      } catch (error) {
-        appendMessage("assistant error", "네트워크 오류가 발생했습니다. 서버 상태를 확인해 주세요.");
-      } finally {
-        setBusy(false, "대기 중");
-      }
-    });
-
-    function appendMessage(role, text) {
-      const element = document.createElement("div");
-      element.className = "message " + role;
-      element.textContent = text;
-      messages.appendChild(element);
-      messages.scrollTop = messages.scrollHeight;
-    }
-
-    function setBusy(isBusy, text) {
-      sendButton.disabled = isBusy;
-      status.textContent = text;
+    function renderHeadlines(keyword) {
+      const headlines = headlinesByKeyword[keyword] || [];
+      headlineKeyword.textContent = keyword + " 중심";
+      headlineList.innerHTML = headlines.map((headline) => `
+        <li class="headline-item ${headline.featured ? "is-featured" : ""}">
+          <div class="headline-top">
+            <span class="headline-source">${headline.source}</span>
+            <span class="tiny">${headline.meta}</span>
+          </div>
+          <div class="headline-title">${headline.title}</div>
+          <div class="headline-meta">
+            <span>${headline.copy}</span>
+          </div>
+        </li>
+      `).join("");
     }
   </script>
 </body>

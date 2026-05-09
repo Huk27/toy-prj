@@ -52,6 +52,7 @@ PROFILE_STRATEGY_HTML_PATH = RAW_DATA_DIR / "profile_strategy_report.html"
 PROFILE_HOLDINGS_REPORT_PATH = RAW_DATA_DIR / "profile_holdings_report.json"
 PROFILE_BACKTEST_ROW_CACHE_PATH = RAW_DATA_DIR / "profile_backtest_row_cache.json"
 CHART_CACHE_PATH = RAW_DATA_DIR / "chart_cache.json"
+TOSS_PRODUCT_SEARCH_CACHE_PATH = RAW_DATA_DIR / "toss_product_search_cache.json"
 DAILY_PROFILE_SCAN_PATH = RAW_DATA_DIR / "daily_profile_scan.json"
 DAILY_PROFILE_EVENTS_PATH = RAW_DATA_DIR / "daily_profile_events.json"
 RECENT_BUY_REPORT_PATH = RAW_DATA_DIR / "recent_buy_report.json"
@@ -68,6 +69,18 @@ HEADERS = {
     "Origin": "https://www.tossinvest.com",
     "Referer": "https://www.tossinvest.com/feed/recommended",
     "User-Agent": "Mozilla/5.0 public-research-bot/0.1",
+}
+TOSS_PRODUCT_SEARCH_URL = "https://wts-info-api.tossinvest.com/api/v3/search-all/wts-auto-complete"
+TOSS_PUBLIC_SEARCH_HEADERS = {
+    "accept": "application/json",
+    "accept-language": "ko,en;q=0.9,en-US;q=0.8",
+    "app-version": "v260507.1932",
+    "browser-tab-id": "browser-tab-public-research",
+    "content-type": "application/json",
+    "origin": "https://www.tossinvest.com",
+    "referer": "https://www.tossinvest.com/",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0",
+    "x-toss-os": "Windows",
 }
 
 SENSITIVE_HEADER_NAMES = {
@@ -262,6 +275,8 @@ COMMON_SYMBOL_ALIASES = {
     "블룸 에너지": "BE",
 }
 
+_TOSS_PRODUCT_CACHE: dict[str, Any] | None = None
+
 
 def now_kst() -> dt.datetime:
     return dt.datetime.now(dt.timezone(dt.timedelta(hours=9)))
@@ -376,16 +391,172 @@ def parse_dt(value: str | None) -> dt.datetime | None:
     return parsed.astimezone(dt.timezone.utc)
 
 
+def normalize_product_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def is_option_like_name(symbol: str | None) -> bool:
+    text = str(symbol or "")
+    return bool("$" in text and re.search(r"(콜|풋|CALL|PUT)", text, flags=re.IGNORECASE))
+
+
+def toss_product_cache_load() -> dict[str, Any]:
+    global _TOSS_PRODUCT_CACHE
+    if _TOSS_PRODUCT_CACHE is not None:
+        return _TOSS_PRODUCT_CACHE
+    try:
+        _TOSS_PRODUCT_CACHE = json.loads(TOSS_PRODUCT_SEARCH_CACHE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(_TOSS_PRODUCT_CACHE, dict):
+            _TOSS_PRODUCT_CACHE = {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        _TOSS_PRODUCT_CACHE = {}
+    return _TOSS_PRODUCT_CACHE
+
+
+def toss_product_cache_write(cache: dict[str, Any]) -> None:
+    RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    TOSS_PRODUCT_SEARCH_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def fetch_toss_product_search(query: str | None) -> list[dict[str, Any]]:
+    normalized = str(query or "").strip()
+    if len(normalized) < 2:
+        return []
+    cache = toss_product_cache_load()
+    cached = cache.get(normalized)
+    if isinstance(cached, dict) and isinstance(cached.get("items"), list):
+        return cached["items"]
+    payload = json.dumps(
+        {"query": normalized, "sections": [{"type": "PRODUCT"}]},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            TOSS_PRODUCT_SEARCH_URL,
+            data=payload,
+            headers=TOSS_PUBLIC_SEARCH_HEADERS,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        items: list[dict[str, Any]] = []
+        for section in data.get("result") or []:
+            section_data = section.get("data") or {}
+            for item in section_data.get("items") or []:
+                if isinstance(item, dict):
+                    items.append(item)
+        cache[normalized] = {"fetched_at": now_kst().isoformat(), "items": items[:50]}
+        toss_product_cache_write(cache)
+        return items
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        cache[normalized] = {"fetched_at": now_kst().isoformat(), "items": []}
+        toss_product_cache_write(cache)
+        return []
+
+
+def score_toss_product_item(item: dict[str, Any], symbol: str | None, stock_code: str | None, query: str) -> float:
+    query_norm = normalize_product_text(query)
+    symbol_norm = normalize_product_text(symbol)
+    stock_code_norm = normalize_product_text(stock_code)
+    fields = [
+        item.get("productName"),
+        item.get("keyword"),
+        item.get("symbol"),
+        item.get("productCode"),
+        item.get("companyCode"),
+        item.get("code"),
+    ]
+    normalized_fields = [normalize_product_text(value) for value in fields]
+    score = 0.0
+    if symbol_norm and symbol_norm in normalized_fields:
+        score += 100.0
+    if query_norm and query_norm in normalized_fields:
+        score += 70.0
+    if stock_code_norm and stock_code_norm in normalized_fields:
+        score += 120.0
+    if item.get("market") in {"NSQ", "NYS", "AMS"}:
+        score += 12.0
+    if item.get("market") in {"KSP", "KDQ"}:
+        score += 6.0
+    if item.get("close"):
+        score += 3.0
+    if item.get("autoComplete"):
+        score += 1.0
+    return score
+
+
+def resolve_toss_product(symbol: str | None, stock_code: str | None = None) -> dict[str, Any] | None:
+    if is_option_like_name(symbol):
+        return None
+    queries = []
+    for value in (symbol, COMMON_SYMBOL_ALIASES.get(str(symbol or "")), stock_code):
+        if value and str(value).strip() and str(value).strip() not in queries:
+            queries.append(str(value).strip())
+    best: tuple[float, dict[str, Any]] | None = None
+    for query in queries:
+        for item in fetch_toss_product_search(query):
+            score = score_toss_product_item(item, symbol, stock_code, query)
+            if score <= 0:
+                continue
+            if best is None or score > best[0]:
+                best = (score, item)
+    if not best or best[0] < 50.0:
+        return None
+    return best[1]
+
+
 def yahoo_symbols(symbol: str | None, stock_code: str | None = None) -> list[str]:
     candidates: list[str] = []
     if symbol and re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,8}", symbol):
         candidates.append(symbol)
     if symbol in COMMON_SYMBOL_ALIASES:
         candidates.append(COMMON_SYMBOL_ALIASES[symbol])
+    toss_product = resolve_toss_product(symbol, stock_code)
+    if toss_product:
+        toss_symbol = str(toss_product.get("symbol") or "").strip()
+        product_code = str(toss_product.get("productCode") or toss_product.get("code") or "").strip()
+        market = str(toss_product.get("market") or "").strip()
+        if toss_symbol and market in {"NSQ", "NYS", "AMS"} and re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,8}", toss_symbol):
+            candidates.append(toss_symbol)
+        if product_code and re.fullmatch(r"A\d{6}", product_code):
+            kr_code = product_code[1:]
+            candidates.extend([f"{kr_code}.KS", f"{kr_code}.KQ"])
+        elif toss_symbol and market in {"KSP", "KDQ"} and re.fullmatch(r"\d{6}", toss_symbol):
+            candidates.extend([f"{toss_symbol}.KS", f"{toss_symbol}.KQ"])
     if stock_code and re.fullmatch(r"A\d{6}", stock_code):
         kr_code = stock_code[1:]
         candidates.extend([f"{kr_code}.KS", f"{kr_code}.KQ"])
     return list(dict.fromkeys(candidates))
+
+
+def quote_from_toss_product(product: dict[str, Any]) -> dict[str, Any] | None:
+    close = product.get("close") or {}
+    base = product.get("base") or {}
+    price = close.get("usd")
+    currency = "USD"
+    if price is None:
+        price = close.get("krw")
+        currency = "KRW"
+    if price is None:
+        price = base.get("usd")
+        currency = "USD"
+    if price is None:
+        price = base.get("krw")
+        currency = "KRW"
+    if price is None:
+        return None
+    try:
+        return {
+            "price": float(price),
+            "currency": currency,
+            "provider": "toss_search_public",
+            "provider_symbol": product.get("symbol") or product.get("productName"),
+            "market_state": product.get("stockStatus"),
+            "product_code": product.get("productCode") or product.get("code"),
+            "market": product.get("market"),
+        }
+    except (TypeError, ValueError):
+        return None
 
 
 def fetch_public_quote(symbol: str | None, stock_code: str | None = None) -> dict[str, Any] | None:
@@ -416,6 +587,11 @@ def fetch_public_quote(symbol: str | None, stock_code: str | None = None) -> dic
                 }
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, KeyError):
             continue
+    toss_product = resolve_toss_product(symbol, stock_code)
+    if toss_product:
+        toss_quote = quote_from_toss_product(toss_product)
+        if toss_quote:
+            return toss_quote
     return None
 
 
@@ -431,7 +607,7 @@ def fetch_historical_chart(yahoo_symbol: str, start: dt.datetime, end: dt.dateti
     )
     try:
         req = urllib.request.Request(url, headers={"User-Agent": HEADERS["User-Agent"]}, method="GET")
-        with urllib.request.urlopen(req, timeout=20) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8"))
         return ((payload.get("chart") or {}).get("result") or [None])[0]
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
@@ -475,6 +651,10 @@ def cached_historical_chart_persistent(
             disk_end = None
         if disk_start and disk_end:
             if disk_start <= chart_start and disk_end >= chart_end:
+                if disk_row.get("missing"):
+                    if memory_cache is not None:
+                        memory_cache[provider_symbol] = {"start": disk_start, "end": disk_end, "chart": None}
+                    return None
                 chart = disk_row.get("chart")
                 if memory_cache is not None:
                     memory_cache[provider_symbol] = {"start": disk_start, "end": disk_end, "chart": chart}
@@ -485,11 +665,12 @@ def cached_historical_chart_persistent(
     chart = fetch_historical_chart(provider_symbol, chart_start, chart_end)
     if memory_cache is not None:
         memory_cache[provider_symbol] = {"start": chart_start, "end": chart_end, "chart": chart}
-    if disk_cache is not None and chart:
+    if disk_cache is not None:
         disk_cache[provider_symbol] = {
             "start": chart_start.isoformat(),
             "end": chart_end.isoformat(),
             "chart": chart,
+            "missing": chart is None,
             "updated_at": now_kst().isoformat(),
         }
     return chart
@@ -5908,18 +6089,33 @@ def backtest_event(
     entry_time = timestamp
     provider_symbol = None
     chart = None
+    last_chart_time: dt.datetime | None = None
     for candidate in symbols:
         chart = cached_historical_chart_persistent(candidate, chart_start, chart_end, chart_cache, disk_chart_cache)
         if entry_price is None:
             point = price_point_at_or_after(chart, timestamp)
             if point:
                 entry_time, entry_price = point
+            elif chart and chart.get("timestamp"):
+                try:
+                    last_ts = int((chart.get("timestamp") or [])[-1])
+                    last_chart_time = dt.datetime.fromtimestamp(last_ts, tz=dt.timezone.utc)
+                except (TypeError, ValueError, IndexError, OSError, OverflowError):
+                    last_chart_time = None
         if entry_price is not None:
             provider_symbol = candidate
             break
 
     if not entry_price:
-        result_row["status"] = "entry_price_missing"
+        # If the chart is present but we have no bar at/after the post timestamp,
+        # treat it as "not yet tradable" rather than a missing symbol. This
+        # commonly happens for weekend/holiday posts, and avoids inflating the
+        # entry_price_missing bucket.
+        now_utc = now_kst().astimezone(dt.timezone.utc)
+        if chart and last_chart_time and timestamp > last_chart_time and (now_utc - timestamp) < dt.timedelta(days=7):
+            result_row["status"] = "entry_not_matured"
+        else:
+            result_row["status"] = "entry_price_missing"
         return result_row
 
     result_row["entry_price"] = float(entry_price)

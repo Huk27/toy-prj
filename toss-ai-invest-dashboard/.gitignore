@@ -1,0 +1,22 @@
+# Local secrets / browser session exports
+private_session_headers.json
+session_curl.txt
+*_session_curl.txt
+*session_headers*.json
+!*session_headers.example.json
+
+# Python / IDE
+__pycache__/
+*.py[cod]
+.idea/
+
+# Large scraped app bundles and internal caches
+tossinvest-js/
+public_model_data/_internal/
+public_model_data/*.json
+!public_model_data/toss_ai_invest_data.json
+public_model_data/*.html
+!public_model_data/toss_ai_invest_dashboard.html
+
+# Misc local logs
+debug.log

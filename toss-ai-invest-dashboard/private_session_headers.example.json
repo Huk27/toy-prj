@@ -1,0 +1,14 @@
+{
+  "headers": {
+    "accept": "application/json",
+    "accept-language": "ko,en;q=0.9,en-US;q=0.8",
+    "app-version": "replace-with-current-browser-value",
+    "browser-tab-id": "replace-with-current-browser-value",
+    "content-type": "application/json",
+    "cookie": "paste-browser-cookie-header-here",
+    "origin": "https://www.tossinvest.com",
+    "referer": "https://www.tossinvest.com/community/profile/1642973?tab=TRADE_HISTORY",
+    "user-agent": "paste-current-browser-user-agent-here",
+    "x-xsrf-token": "paste-current-xsrf-token-here"
+  }
+}

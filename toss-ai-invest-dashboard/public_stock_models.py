@@ -4527,6 +4527,187 @@ def render_operation_reports(operation_reports: dict[str, Any]) -> str:
     )
 
 
+def normalize_symbol_key(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").lower())
+
+
+def index_by_symbol(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    indexed = {}
+    for row in rows:
+        for key in (row.get("symbol"), row.get("name"), row.get("stock_code")):
+            normalized = normalize_symbol_key(key)
+            if normalized and normalized not in indexed:
+                indexed[normalized] = row
+    return indexed
+
+
+def final_report_entry_plan(row: dict[str, Any], symbol_row: dict[str, Any] | None, accumulation_row: dict[str, Any] | None) -> str:
+    action = row.get("action")
+    chase = row.get("chase_decision")
+    buyers = int(row.get("buyer_count") or 0)
+    reliable = int(row.get("reliable_buyer_count") or 0)
+    gap = row.get("price_move_since_buy")
+    has_symbol_validation = bool(symbol_row and symbol_row.get("decision") in {"관심", "관망"})
+    has_accumulation = bool(accumulation_row and accumulation_row.get("decision") == "축적 관심")
+    if action == "매수 후보" and chase in {"진입가능", "소액진입", "눌림후보"}:
+        return "월요일 1차 후보. 장초반 추가 매수와 가격괴리 재확인 후 소액 진입 검토."
+    if buyers >= 3 and reliable >= 3 and chase == "눌림후보":
+        return "감시 우선. 이미 눌린 상태면 장초반 반등 확인 후 소액 후보."
+    if buyers >= 2 and reliable >= 2 and (has_symbol_validation or has_accumulation):
+        return "보조 근거 있음. 장초반 같은 종목 추가 매수가 붙으면 후보로 승격."
+    if gap is not None and float(gap) > 0.03:
+        return "추격 금지에 가깝다. 장초반 급등하면 버리고 눌림만 대기."
+    if buyers <= 1:
+        return "단독 매수라 바로 매수 근거 부족. 월요일 재스캔에서 반복 매수 여부 확인."
+    return "관망. 월요일 실시간 스캔에서 신뢰 유저 수가 늘어나는지 확인."
+
+
+def render_intraday_service_final_report(data: dict[str, Any]) -> str:
+    recent_buy = data.get("recent_buy") or {}
+    recommendations = recent_buy.get("recommendations") or []
+    symbol_rankings = data.get("symbol_trade_rankings") or []
+    accumulations = data.get("holding_accumulation_rankings") or []
+    symbol_index = index_by_symbol(symbol_rankings)
+    accumulation_index = index_by_symbol(accumulations)
+    buy_candidates = [
+        row for row in recommendations
+        if row.get("action") == "매수 후보" and row.get("chase_decision") in {"진입가능", "소액진입", "눌림후보"}
+    ]
+    watch_candidates = [
+        row for row in recommendations
+        if row not in buy_candidates and row.get("action") != "제외"
+    ][:12]
+    if buy_candidates:
+        headline = f"현재 규칙상 1차 매수 검토 후보 {len(buy_candidates)}개가 있습니다."
+        headline_class = "decision-good"
+    elif watch_candidates:
+        headline = "즉시 매수 후보는 없고, 월요일 장초반 재스캔으로 승격 여부를 볼 감시 후보만 있습니다."
+        headline_class = "decision-warn"
+    else:
+        headline = "최근매수 후보가 없습니다. 장중 스캔부터 다시 실행해야 합니다."
+        headline_class = "decision-bad"
+
+    focus_rows = (buy_candidates + watch_candidates)[:15]
+    rendered = []
+    for index, row in enumerate(focus_rows, start=1):
+        symbol = row.get("symbol")
+        symbol_row = symbol_index.get(normalize_symbol_key(symbol))
+        accumulation_row = accumulation_index.get(normalize_symbol_key(symbol))
+        buyer_profiles = row.get("buyer_profiles") or []
+        buyers = " ".join(
+            "<a class='chip' href='{url}' target='_blank' rel='noopener'>{name} {score}</a>".format(
+                url=html.escape(str(profile.get("profile_url") or "#")),
+                name=html.escape(str(profile.get("author") or profile.get("profile_id") or "-")),
+                score=html.escape(str(profile.get("user_reliability") or "-")),
+            )
+            for profile in buyer_profiles[:4]
+        ) or "<span class='muted'>-</span>"
+        validation = []
+        if symbol_row:
+            validation.append(
+                f"종목검증 {html.escape(str(symbol_row.get('decision') or '-'))} "
+                f"{html.escape(str(symbol_row.get('score') or '-'))}점, "
+                f"승률 {html.escape(pct(symbol_row.get('win_rate')))}"
+            )
+        else:
+            validation.append("종목검증 데이터 없음")
+        if accumulation_row:
+            validation.append(
+                f"수익권보유 {html.escape(str(accumulation_row.get('holder_count') or 0))}명, "
+                f"수익권 {html.escape(str(accumulation_row.get('positive_holder_count') or 0))}명"
+            )
+        else:
+            validation.append("수익권보유 근거 없음")
+        plan = final_report_entry_plan(row, symbol_row, accumulation_row)
+        action = str(row.get("action") or "관망")
+        action_class = "decision-good" if action == "매수 후보" else "decision-bad" if action == "제외" else "decision-warn"
+        rendered.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td><strong>{html.escape(str(symbol or '-'))}</strong><span class='muted block'>최근 {html.escape(format_trade_time(row.get('latest_buy_at')))}</span></td>"
+            f"<td><span class='decision {action_class}'>{html.escape(action)}</span><span class='muted block'>추격 {html.escape(str(row.get('chase_decision') or '-'))}</span></td>"
+            f"<td><strong>{html.escape(str(row.get('score') or '-'))}</strong><span class='muted block'>신뢰 {html.escape(str(row.get('avg_user_reliability') or '-'))}</span></td>"
+            f"<td>{html.escape(str(row.get('buyer_count') or 0))}명<span class='muted block'>신뢰유저 {html.escape(str(row.get('reliable_buyer_count') or 0))}명</span>{buyers}</td>"
+            f"<td class='{return_class(row.get('price_move_since_buy'))}'>{html.escape(pct(row.get('price_move_since_buy')))}"
+            f"<span class='muted block'>현재 {html.escape(format_money(row.get('current_price'), row.get('current_price_currency') or 'USD'))} / 평균 {html.escape(format_money(row.get('average_buy_price'), row.get('current_price_currency') or 'USD'))}</span></td>"
+            f"<td>{'<br>'.join(validation)}</td>"
+            f"<td><strong>{html.escape(plan)}</strong><span class='muted block'>{html.escape(str(row.get('chase_rule') or row.get('action_reason') or ''))}</span></td>"
+            "</tr>"
+        )
+    rows_html = "".join(rendered) or "<tr><td colspan='8' class='muted'>현재 리포트 후보 없음</td></tr>"
+    return (
+        "<div class='final-report'>"
+        "<div class='status-band'>"
+        f"<strong>장중 종목추천 서비스</strong><span class='decision {headline_class}'>{html.escape(headline)}</span>"
+        f"<span>최근매수 창 {html.escape(str(recent_buy.get('window_hours') or '-'))}시간</span>"
+        f"<span>후보 {html.escape(str(recent_buy.get('recommendation_count') or 0))}개</span>"
+        "</div>"
+        "<p class='note'>이 리포트는 오늘볼것, AI브리핑, 종목분석, 수익권보유를 합쳐서 월요일 장초반에 무엇을 확인할지 보여줍니다. 여기서 바로 주문하지 말고 장초반 재스캔으로 같은 종목에 추가 매수가 붙는지 확인합니다.</p>"
+        "<div class='panel'><table class='rank-table'><thead><tr><th>#</th><th>종목</th><th>판정</th><th>점수</th><th>매수 유저</th><th>가격괴리</th><th>보조 근거</th><th>월요일 액션</th></tr></thead>"
+        f"<tbody>{rows_html}</tbody></table></div>"
+        "</div>"
+    )
+
+
+def render_user_reliability_final_report(data: dict[str, Any]) -> str:
+    users = data.get("final_user_rankings") or []
+    rows = []
+    for index, user in enumerate(users[:12], start=1):
+        rows.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td><a href='https://www.tossinvest.com/community/profile/{html.escape(str(user.get('profile_id') or ''))}' target='_blank' rel='noopener'>{html.escape(str(user.get('author') or '-'))}</a>"
+            f"<span class='muted block'>{html.escape(', '.join(str(tag) for tag in user.get('persona_tags') or []))}</span></td>"
+            f"<td><strong>{html.escape(str(user.get('final_reliability_score') or '-'))}</strong><span class='muted block'>단타 {html.escape(str(user.get('short_term_score') or '-'))}</span></td>"
+            f"<td>{html.escape(str(user.get('tested_returns') or 0))}<span class='muted block'>승률 {html.escape(pct(user.get('overall_win_rate')))}</span></td>"
+            f"<td class='{return_class(user.get('overall_avg_return'))}'>{html.escape(pct(user.get('overall_avg_return')))}</td>"
+            f"<td>{html.escape(format_trade_time(user.get('latest_trade_at')))}</td>"
+            f"<td>{html.escape(str(user.get('ai_review') or '-'))}</td>"
+            "</tr>"
+        )
+    return (
+        "<div class='status-band'><strong>전체유저 신뢰도 평가 서비스</strong>"
+        f"<span>최종 유저 {html.escape(str(len(users)))}명</span>"
+        "<span>월요일 스캔 대상은 이 순위와 단타 점수를 함께 봐서 고릅니다.</span></div>"
+        "<div class='panel'><table><thead><tr><th>#</th><th>유저</th><th>신뢰도</th><th>검증</th><th>평균수익</th><th>최근거래</th><th>AI 판단</th></tr></thead>"
+        f"<tbody>{''.join(rows) or '<tr><td colspan=\"7\" class=\"muted\">유저 신뢰도 데이터 없음</td></tr>'}</tbody></table></div>"
+    )
+
+
+def render_pool_final_report(data: dict[str, Any]) -> str:
+    summary = data.get("summary") or {}
+    pipeline = data.get("pipeline") or {}
+    candidate = pipeline.get("candidate_discovery") or {}
+    daily = pipeline.get("daily_market_scan") or {}
+    return (
+        "<div class='status-band'><strong>신규유저 찾기 서비스</strong>"
+        f"<span>후보 유저 {html.escape(str(summary.get('candidate_count') or 0))}명</span>"
+        f"<span>거래 접근 가능 {html.escape(str(summary.get('accessible_profile_count') or 0))}명</span>"
+        f"<span>월요일 스캔 대상 {html.escape(str(summary.get('scan_target_count') or 0))}명</span></div>"
+        "<div class='panel'><table><thead><tr><th>항목</th><th>현재 상태</th><th>의미</th></tr></thead><tbody>"
+        f"<tr><td>후보 확장</td><td>{html.escape(str(candidate.get('candidate_count') or summary.get('candidate_count') or 0))}명</td><td>공개 피드/종목 커뮤니티에서 추가 수집한 전체 후보풀</td></tr>"
+        f"<tr><td>접근 가능</td><td>{html.escape(str(summary.get('accessible_profile_count') or 0))}명</td><td>거래 탭 조회가 가능해 신뢰도 계산 후보가 된 유저</td></tr>"
+        f"<tr><td>장중 감시</td><td>{html.escape(str(daily.get('target_profile_count') or summary.get('scan_target_count') or 0))}명</td><td>월요일 장중 최신 매수 확인에 사용할 우선순위 유저</td></tr>"
+        "</tbody></table></div>"
+    )
+
+
+def render_final_service_reports(data: dict[str, Any]) -> str:
+    operation_reports = data.get("operation_reports") or {}
+    return (
+        "<div class='section-stack'>"
+        f"{render_intraday_service_final_report(data)}"
+        f"{render_user_reliability_final_report(data)}"
+        f"{render_pool_final_report(data)}"
+        "<div>"
+        "<h2 class='section-title'>실행 로그</h2>"
+        "<p class='section-subtitle'>아래는 보조 기록입니다. 실제 판단은 위 서비스별 최종 리포트에서 합니다.</p>"
+        f"<div class='panel'>{render_operation_reports(operation_reports)}</div>"
+        "</div>"
+        "</div>"
+    )
+
+
 def unified_dashboard_report() -> dict[str, Any]:
     data = build_unified_invest_data()
     summary = data["summary"]
@@ -4664,7 +4845,7 @@ def unified_dashboard_report() -> dict[str, Any]:
     <div class="stat"><span>Daily 신규 이벤트</span><strong>{summary.get('daily_new_event_count', 0):,}</strong></div>
     <div class="stat"><span>Daily 신규 매수</span><strong>{summary.get('daily_new_buy_count', 0):,}</strong></div>
     <div class="stat"><span>Holdings 확인</span><strong>{summary.get('daily_holding_profile_count', 0):,}</strong></div>
-    <div class="stat"><span>운영 리포트</span><strong>{summary.get('operation_report_count', 0):,}</strong></div>
+    <div class="stat"><span>최종 리포트</span><strong>{summary.get('operation_report_count', 0):,}</strong></div>
   </section>
 
   <section class="workspace-tabs">
@@ -4674,7 +4855,7 @@ def unified_dashboard_report() -> dict[str, Any]:
       <button type="button" class="tab-button" data-tab-target="symbols">종목 분석</button>
       <button type="button" class="tab-button" data-tab-target="accumulation">수익권 보유</button>
       <button type="button" class="tab-button" data-tab-target="users">유저 랭킹</button>
-      <button type="button" class="tab-button" data-tab-target="ops">운영 리포트</button>
+      <button type="button" class="tab-button" data-tab-target="ops">최종 리포트</button>
       <button type="button" class="tab-button" data-tab-target="risk">리스크</button>
       <button type="button" class="tab-button" data-tab-target="system">시스템</button>
     </nav>
@@ -4754,9 +4935,9 @@ def unified_dashboard_report() -> dict[str, Any]:
 
     <section id="tab-ops" class="tab-panel">
       <div>
-        <h2 class="section-title">운영 리포트</h2>
-        <p class="section-subtitle">매일 실행한 장중 스캔, 최근매수 갱신, 유저 신뢰도 업데이트, 유저풀 확장 결과를 액션별 최종 요약으로 누적합니다.</p>
-        <div class="panel">{render_operation_reports(operation_reports)}</div>
+        <h2 class="section-title">서비스별 최종 리포트</h2>
+        <p class="section-subtitle">장중 종목추천, 전체유저 신뢰도 평가, 신규유저 찾기 결과를 실제 판단 가능한 형태로 묶어 보여줍니다.</p>
+        {render_final_service_reports(data)}
       </div>
     </section>
 

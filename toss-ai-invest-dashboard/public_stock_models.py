@@ -61,6 +61,7 @@ RECENT_BUY_PERFORMANCE_PATH = RAW_DATA_DIR / "recent_buy_performance.json"
 UNIFIED_DATA_PATH = DATA_DIR / "toss_ai_invest_data.json"
 UNIFIED_HTML_PATH = DATA_DIR / "toss_ai_invest_dashboard.html"
 AI_DECISION_BRIEF_PATH = DATA_DIR / "ai_decision_brief.md"
+OPERATION_REPORTS_PATH = RAW_DATA_DIR / "operation_reports.json"
 
 HEADERS = {
     "Accept": "application/json",
@@ -2802,6 +2803,152 @@ def write_artifact(internal_path: Path, public_path: Path, payload: Any) -> None
         public_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def current_operation_name(args: argparse.Namespace) -> str:
+    ordered_flags = [
+        ("daily_profile_scan", "장중 거래 스캔"),
+        ("recent_buy_report", "최근 매수 추천 갱신"),
+        ("unified_dashboard", "통합 대시보드 갱신"),
+        ("ai_brief", "AI 브리핑 갱신"),
+        ("discover_profiles", "신규 유저풀 확장"),
+        ("profile_history_report", "거래 접근/히스토리 수집"),
+        ("deep_profile_history_report", "유저 거래 깊이조회"),
+        ("profile_holdings_report", "Holdings 리스크 수집"),
+        ("profile_strategy_report", "유저 신뢰도 재계산"),
+        ("profile_html_report", "유저 리포트 HTML 갱신"),
+        ("market_prep", "시장 준비 배치"),
+        ("strategy_report", "공개 전략 리포트"),
+        ("user_report", "공개 유저 리포트"),
+        ("backfill_history", "과거 데이터 백필"),
+        ("evaluate_only", "추천 성과 검증"),
+    ]
+    for flag, label in ordered_flags:
+        if getattr(args, flag, False):
+            return label
+    return "공개 추천 모델 실행"
+
+
+def operation_params_for_report(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "pages": args.pages,
+        "profile_limit": args.profile_limit,
+        "profile_pages": args.profile_pages,
+        "profile_delay": args.profile_delay,
+        "daily_profile_limit": args.daily_profile_limit,
+        "recent_hours": args.recent_hours,
+        "capital": args.capital,
+        "min_samples": args.min_samples,
+        "horizons": args.horizons,
+        "stock_community_top": args.stock_community_top,
+        "stock_community_pages": args.stock_community_pages,
+        "skip_daily_holdings": args.skip_daily_holdings,
+        "session_headers_supplied": bool(args.session_headers_file or args.session_curl_file),
+    }
+
+
+def operation_metrics_from_output(output: dict[str, Any]) -> dict[str, Any]:
+    summary = output.get("summary") or {}
+    metrics = {
+        "candidate_count": output.get("candidate_count") or output.get("discovery_candidate_count") or summary.get("candidate_count"),
+        "stock_community_comment_count": output.get("stock_community_comment_count"),
+        "scanned_profile_count": output.get("scanned_profile_count") or summary.get("daily_scanned_profile_count"),
+        "new_event_count": output.get("new_event_count") or summary.get("daily_new_event_count"),
+        "new_buy_count": output.get("new_buy_count") or summary.get("daily_new_buy_count"),
+        "holding_profile_count": output.get("holding_profile_count") or summary.get("daily_holding_profile_count"),
+        "recommendation_count": output.get("recommendation_count") or summary.get("recent_buy_recommendation_count"),
+        "buy_candidate_count": output.get("buy_candidate_count"),
+        "watch_candidate_count": output.get("watch_candidate_count"),
+        "event_count": output.get("event_count") or summary.get("profile_trade_event_count"),
+        "tested_event_count": output.get("tested_count") or summary.get("strategy_tested_event_count"),
+        "final_ranked_user_count": summary.get("final_ranked_user_count"),
+        "symbol_trade_ranked_count": summary.get("symbol_trade_ranked_count"),
+    }
+    return {key: value for key, value in metrics.items() if value not in (None, "")}
+
+
+def operation_paths_from_output(output: dict[str, Any]) -> dict[str, str]:
+    paths = {}
+    for key in ("path", "html_path", "data_path", "brief_path", "log_path"):
+        value = output.get(key)
+        if value:
+            paths[key] = str(value)
+    dashboard = output.get("dashboard") or {}
+    for key in ("html_path", "data_path"):
+        value = dashboard.get(key)
+        if value:
+            paths[f"dashboard_{key}"] = str(value)
+    return paths
+
+
+def operation_decision_summary(action: str, output: dict[str, Any]) -> str:
+    metrics = operation_metrics_from_output(output)
+    if action == "장중 거래 스캔":
+        return (
+            f"{metrics.get('scanned_profile_count', 0)}명 조회, "
+            f"신규 이벤트 {metrics.get('new_event_count', 0)}건, "
+            f"신규 매수 {metrics.get('new_buy_count', 0)}건."
+        )
+    if action == "최근 매수 추천 갱신":
+        return f"최근매수 후보 {metrics.get('recommendation_count', 0)}개를 갱신."
+    if action == "신규 유저풀 확장":
+        return (
+            f"후보 유저 {metrics.get('candidate_count', 0)}명, "
+            f"종목 커뮤니티 댓글 {metrics.get('stock_community_comment_count', 0)}건 반영."
+        )
+    if action == "유저 신뢰도 재계산":
+        return (
+            f"검증 이벤트 {metrics.get('tested_event_count', 0)}건 기준으로 "
+            "유저 신뢰도 순위를 재계산."
+        )
+    if action == "Holdings 리스크 수집":
+        return f"Holdings 확인 유저 {metrics.get('holding_profile_count', 0)}명."
+    if action == "통합 대시보드 갱신":
+        return (
+            f"최종 유저 {metrics.get('final_ranked_user_count', 0)}명, "
+            f"종목 랭킹 {metrics.get('symbol_trade_ranked_count', 0)}개, "
+            f"최근매수 후보 {metrics.get('recommendation_count', 0)}개를 HTML에 반영."
+        )
+    if action == "AI 브리핑 갱신":
+        return (
+            f"매수 후보 {metrics.get('buy_candidate_count', 0)}개, "
+            f"관망 후보 {metrics.get('watch_candidate_count', 0)}개 요약."
+        )
+    return f"{output.get('mode') or '작업'} 완료."
+
+
+def load_operation_reports(limit: int | None = None) -> list[dict[str, Any]]:
+    doc = read_json_file(OPERATION_REPORTS_PATH, {"reports": []}) or {"reports": []}
+    reports = doc.get("reports") if isinstance(doc, dict) else []
+    reports = reports or []
+    return reports[-limit:] if limit else reports
+
+
+def append_operation_report(args: argparse.Namespace, output: dict[str, Any], status: str = "completed") -> dict[str, Any]:
+    action = current_operation_name(args)
+    reports = load_operation_reports()
+    report = {
+        "id": f"op-{now_kst().strftime('%Y%m%d-%H%M%S')}-{len(reports) + 1:04d}",
+        "generated_at": now_kst().isoformat(),
+        "action": action,
+        "status": status,
+        "mode": output.get("mode"),
+        "market_status": market_session_status(),
+        "params": operation_params_for_report(args),
+        "metrics": operation_metrics_from_output(output),
+        "summary": operation_decision_summary(action, output),
+        "paths": operation_paths_from_output(output),
+        "next_action": output.get("next_market_open_action") or (output.get("market_status") or {}).get("recommendation"),
+    }
+    reports.append(report)
+    max_reports = 200
+    payload = {
+        "generated_at": now_kst().isoformat(),
+        "report_count": len(reports[-max_reports:]),
+        "reports": reports[-max_reports:],
+    }
+    OPERATION_REPORTS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report
+
+
 def market_session_status(now: dt.datetime | None = None) -> dict[str, Any]:
     current = now or now_kst()
     weekday = current.weekday()
@@ -3115,6 +3262,7 @@ def build_unified_invest_data() -> dict[str, Any]:
     public_user = read_json_file(USER_REPORT_PATH, {})
     backtest = read_json_file(BACKTEST_PATH, {})
     performance = read_json_file(PERF_PATH, {})
+    operation_reports = read_json_file(OPERATION_REPORTS_PATH, {"reports": []})
 
     profile_rows = history.get("profiles") or []
     accessible_profiles = [row for row in profile_rows if (row.get("event_count") or 0) > 0]
@@ -3185,6 +3333,7 @@ def build_unified_invest_data() -> dict[str, Any]:
             "recent_buy_window_hours": recent_buy.get("window_hours"),
             "recent_buy_recommendation_count": recent_buy.get("recommendation_count", 0),
             "recent_buy_performance_observation_count": recent_buy_performance.get("observation_count", 0),
+            "operation_report_count": (operation_reports or {}).get("report_count", len((operation_reports or {}).get("reports") or [])),
         },
         "market_status": market_status,
         "pipeline": pipeline,
@@ -3200,6 +3349,7 @@ def build_unified_invest_data() -> dict[str, Any]:
         "daily_profile_events": daily_events,
         "recent_buy": recent_buy,
         "recent_buy_performance": recent_buy_performance,
+        "operation_reports": operation_reports,
         "public_strategy": public_strategy,
         "public_user_report": public_user,
         "historical_backtest": backtest,
@@ -3215,6 +3365,7 @@ def build_unified_invest_data() -> dict[str, Any]:
                 DAILY_PROFILE_EVENTS_PATH,
                 RECENT_BUY_REPORT_PATH,
                 RECENT_BUY_PERFORMANCE_PATH,
+                OPERATION_REPORTS_PATH,
                 STRATEGY_REPORT_PATH,
                 USER_REPORT_PATH,
                 BACKTEST_PATH,
@@ -4325,6 +4476,57 @@ def render_holding_risk_board(data: dict[str, Any]) -> str:
     )
 
 
+def render_operation_reports(operation_reports: dict[str, Any]) -> str:
+    reports = list((operation_reports or {}).get("reports") or [])
+    if not reports:
+        return "<p class='empty'>아직 기록된 운영 리포트가 없습니다. 장중 스캔, 신뢰도 업데이트, 유저풀 확장 등을 실행하면 여기에 최종 요약만 누적됩니다.</p>"
+    reports = list(reversed(reports[-80:]))
+    rows = []
+    for report in reports:
+        metrics = report.get("metrics") or {}
+        metric_bits = []
+        labels = {
+            "candidate_count": "후보유저",
+            "scanned_profile_count": "스캔유저",
+            "new_event_count": "신규이벤트",
+            "new_buy_count": "신규매수",
+            "recommendation_count": "추천",
+            "holding_profile_count": "Holdings",
+            "tested_event_count": "검증",
+            "final_ranked_user_count": "최종유저",
+            "symbol_trade_ranked_count": "종목",
+        }
+        for key, label in labels.items():
+            if key in metrics:
+                metric_bits.append(f"<span class='chip'>{label} {html.escape(str(metrics[key]))}</span>")
+        paths = report.get("paths") or {}
+        path_bits = []
+        for key, value in paths.items():
+            name = Path(str(value)).name
+            path_bits.append(f"<span class='chip'>{html.escape(key)}: {html.escape(name)}</span>")
+        params = report.get("params") or {}
+        param_bits = []
+        for key in ("daily_profile_limit", "recent_hours", "profile_limit", "profile_pages", "profile_delay", "stock_community_top", "session_headers_supplied"):
+            if key in params:
+                param_bits.append(f"{key}={params[key]}")
+        market = report.get("market_status") or {}
+        rows.append(
+            "<tr>"
+            f"<td><strong>{html.escape(format_trade_time(report.get('generated_at')))}</strong><span class='muted block'>{html.escape(str(report.get('id') or '-'))}</span></td>"
+            f"<td><strong>{html.escape(str(report.get('action') or '-'))}</strong><span class='muted block'>{html.escape(str(report.get('mode') or '-'))}</span></td>"
+            f"<td><span class='decision decision-good'>{html.escape(str(report.get('status') or '-'))}</span><span class='muted block'>{html.escape(str(market.get('label') or '-'))}</span></td>"
+            f"<td>{''.join(metric_bits) or '<span class=\"muted\">-</span>'}</td>"
+            f"<td>{html.escape(str(report.get('summary') or '-'))}<span class='muted block'>{html.escape(', '.join(param_bits))}</span></td>"
+            f"<td>{''.join(path_bits) or '<span class=\"muted\">-</span>'}<span class='muted block'>{html.escape(str(report.get('next_action') or ''))}</span></td>"
+            "</tr>"
+        )
+    return (
+        "<div class='table-shell'><table class='rank-table'>"
+        "<thead><tr><th>시각</th><th>액션</th><th>상태</th><th>핵심 지표</th><th>최종 요약</th><th>결과물/다음 행동</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
 def unified_dashboard_report() -> dict[str, Any]:
     data = build_unified_invest_data()
     summary = data["summary"]
@@ -4335,6 +4537,7 @@ def unified_dashboard_report() -> dict[str, Any]:
     symbol_trade_rankings = data.get("symbol_trade_rankings") or []
     holding_accumulation_rankings = data.get("holding_accumulation_rankings") or []
     daily_scan = data.get("daily_profile_scan") or {}
+    operation_reports = data.get("operation_reports") or {}
     planned_scan_targets = {"profiles": data.get("planned_scan_targets") or [], "scanned_profile_count": summary.get("scan_target_count", 0)}
     generated_at = html.escape(data["generated_at"])
     html_text = f"""<!doctype html>
@@ -4461,6 +4664,7 @@ def unified_dashboard_report() -> dict[str, Any]:
     <div class="stat"><span>Daily 신규 이벤트</span><strong>{summary.get('daily_new_event_count', 0):,}</strong></div>
     <div class="stat"><span>Daily 신규 매수</span><strong>{summary.get('daily_new_buy_count', 0):,}</strong></div>
     <div class="stat"><span>Holdings 확인</span><strong>{summary.get('daily_holding_profile_count', 0):,}</strong></div>
+    <div class="stat"><span>운영 리포트</span><strong>{summary.get('operation_report_count', 0):,}</strong></div>
   </section>
 
   <section class="workspace-tabs">
@@ -4470,6 +4674,7 @@ def unified_dashboard_report() -> dict[str, Any]:
       <button type="button" class="tab-button" data-tab-target="symbols">종목 분석</button>
       <button type="button" class="tab-button" data-tab-target="accumulation">수익권 보유</button>
       <button type="button" class="tab-button" data-tab-target="users">유저 랭킹</button>
+      <button type="button" class="tab-button" data-tab-target="ops">운영 리포트</button>
       <button type="button" class="tab-button" data-tab-target="risk">리스크</button>
       <button type="button" class="tab-button" data-tab-target="system">시스템</button>
     </nav>
@@ -4544,6 +4749,14 @@ def unified_dashboard_report() -> dict[str, Any]:
         <h2 class="section-title">Holdings 리스크 점검</h2>
         <p class="section-subtitle">물린 종목, 집중 보유, 레버리지/인버스 보유 여부를 보고 유저 신뢰도에 반영합니다.</p>
         <div class="panel">{render_holding_risk_board(data)}</div>
+      </div>
+    </section>
+
+    <section id="tab-ops" class="tab-panel">
+      <div>
+        <h2 class="section-title">운영 리포트</h2>
+        <p class="section-subtitle">매일 실행한 장중 스캔, 최근매수 갱신, 유저 신뢰도 업데이트, 유저풀 확장 결과를 액션별 최종 요약으로 누적합니다.</p>
+        <div class="panel">{render_operation_reports(operation_reports)}</div>
       </div>
     </section>
 
@@ -5836,6 +6049,9 @@ def main() -> None:
     except ValueError as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2))
         raise SystemExit(2) from exc
+    append_operation_report(args, output)
+    if args.unified_dashboard:
+        output = unified_dashboard_report()
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
 

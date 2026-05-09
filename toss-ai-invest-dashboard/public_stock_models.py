@@ -60,6 +60,7 @@ RECENT_BUY_LOG_PATH = RAW_DATA_DIR / "recent_buy_recommendations_log.jsonl"
 RECENT_BUY_PERFORMANCE_PATH = RAW_DATA_DIR / "recent_buy_performance.json"
 UNIFIED_DATA_PATH = DATA_DIR / "toss_ai_invest_data.json"
 UNIFIED_HTML_PATH = DATA_DIR / "toss_ai_invest_dashboard.html"
+AI_DECISION_BRIEF_PATH = DATA_DIR / "ai_decision_brief.md"
 
 HEADERS = {
     "Accept": "application/json",
@@ -2422,6 +2423,67 @@ def price_gap_label(move_pct: float | None) -> str:
     return "추격금지"
 
 
+def chase_entry_plan(
+    score: float | None,
+    price_move_pct: float | None,
+    reliable_count: int,
+    buyer_count: int,
+    risk_tags: list[str] | None = None,
+) -> dict[str, Any]:
+    score_value = float(score or 0.0)
+    move = price_move_pct
+    tags = risk_tags or []
+    volatile = any(tag in tags for tag in ("바이오", "변동성주의")) or buyer_count <= 1
+    if move is None:
+        return {
+            "decision": "가격확인",
+            "max_chase_gap_pct": None,
+            "position_scale": 0.0,
+            "rule": "현재가를 확인하지 못해 진입 판단 보류",
+        }
+    if move < -0.03 and score_value >= 60 and reliable_count >= 1:
+        return {
+            "decision": "눌림후보",
+            "max_chase_gap_pct": 0.0,
+            "position_scale": 0.5,
+            "rule": "상위 유저 매수가보다 낮아졌지만 하락 이유 확인 필요",
+        }
+    if move <= 0.015 and score_value >= 70 and reliable_count >= 2:
+        return {
+            "decision": "진입가능",
+            "max_chase_gap_pct": 1.5,
+            "position_scale": 1.0,
+            "rule": "평균 매수가와 괴리가 작고 신뢰 유저 참여가 충분함",
+        }
+    if move <= 0.03 and score_value >= 75 and reliable_count >= 2:
+        return {
+            "decision": "소액진입",
+            "max_chase_gap_pct": 3.0,
+            "position_scale": 0.5 if not volatile else 0.3,
+            "rule": "약간 올라왔으므로 1차 비중만 허용",
+        }
+    if move <= 0.05 and score_value >= 82 and reliable_count >= 3 and not volatile:
+        return {
+            "decision": "강한근거만소액",
+            "max_chase_gap_pct": 5.0,
+            "position_scale": 0.25,
+            "rule": "5% 근처 추격은 매우 강한 신호일 때만 소액",
+        }
+    if move <= 0.06:
+        return {
+            "decision": "관망",
+            "max_chase_gap_pct": 3.0,
+            "position_scale": 0.0,
+            "rule": "유저 매수가보다 많이 올라 기대수익/손절폭이 나빠짐",
+        }
+    return {
+        "decision": "추격금지",
+        "max_chase_gap_pct": 3.0,
+        "position_scale": 0.0,
+        "rule": "평균 매수가 대비 6% 이상 상승해 따라가기 부적합",
+    }
+
+
 def classify_action(score: float | None, price_move_pct: float | None, reliable_count: int, buyer_count: int) -> tuple[str, str]:
     score_value = float(score or 0.0)
     if price_move_pct is not None and price_move_pct >= 0.06:
@@ -2557,11 +2619,16 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
         action, action_reason = classify_action(final_score, price_move_pct, reliable_buyer_count, buyer_profile_count)
         gap_label = price_gap_label(price_move_pct)
         risk_tags = symbol_risk_tags(symbol, latest_event.get("stock_name") or symbol, latest_event.get("stock_code"))
+        chase_plan = chase_entry_plan(final_score, price_move_pct, reliable_buyer_count, buyer_profile_count, risk_tags)
         recommendations.append({
             "symbol": symbol,
             "score": final_score,
             "action": action,
             "action_reason": action_reason,
+            "chase_decision": chase_plan["decision"],
+            "chase_rule": chase_plan["rule"],
+            "max_chase_gap_pct": chase_plan["max_chase_gap_pct"],
+            "position_scale": chase_plan["position_scale"],
             "price_gap_label": gap_label,
             "risk_tags": risk_tags,
             "raw_score": round(raw_score, 1),
@@ -2605,7 +2672,12 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
             "quote_market_state": quote.get("market_state") if quote else None,
             "latest_buy_at": latest.isoformat() if latest else None,
             "is_leveraged": is_leveraged,
-            "suggested_position_krw_on_10m": round(capital * (0.08 if is_leveraged else 0.15) * min(1.0, final_score / 100)),
+            "suggested_position_krw_on_10m": round(
+                capital
+                * (0.08 if is_leveraged else 0.15)
+                * min(1.0, final_score / 100)
+                * float(chase_plan["position_scale"] or 0.0)
+            ),
             "events": sorted(events, key=lambda row: parse_dt(row.get("acted_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)[:20],
         })
     recommendations.sort(key=lambda row: (row["score"], row["avg_user_reliability"], row["amount_krw"]), reverse=True)
@@ -2847,6 +2919,8 @@ def append_recent_buy_log(report: dict[str, Any]) -> None:
                 "entry_currency": rec.get("current_price_currency"),
                 "average_buy_price": rec.get("average_buy_price"),
                 "price_move_since_buy": rec.get("price_move_since_buy"),
+                "chase_decision": rec.get("chase_decision"),
+                "position_scale": rec.get("position_scale"),
                 "suggested_position_krw_on_10m": rec.get("suggested_position_krw_on_10m"),
                 "buyers": rec.get("buyer_profiles") or rec.get("buyers") or [],
             }, ensure_ascii=False) + "\n")
@@ -2924,7 +2998,111 @@ def evaluate_recent_buy_recommendations() -> dict[str, Any]:
     return output
 
 
+def ai_brief_recent_buy_comment(item: dict[str, Any]) -> str:
+    symbol = item.get("symbol") or "-"
+    action = item.get("action") or "-"
+    chase = item.get("chase_decision") or "-"
+    score = item.get("score")
+    gap = pct(item.get("price_move_since_buy"))
+    buyers = item.get("buyer_count") or 0
+    reliable = item.get("reliable_buyer_count") or 0
+    reason = item.get("chase_rule") or item.get("action_reason") or ""
+    return f"{symbol}: {action}/{chase}, 점수 {score}, 매수가 대비 {gap}, 매수유저 {buyers}명(신뢰 {reliable}명). {reason}"
+
+
+def build_ai_decision_brief(data: dict[str, Any]) -> dict[str, Any]:
+    recent = (data.get("recent_buy") or {}).get("recommendations") or []
+    accumulation = data.get("holding_accumulation_rankings") or []
+    users = data.get("final_user_rankings") or []
+    market = data.get("market_status") or {}
+    buy_candidates = [
+        row for row in recent
+        if row.get("action") == "매수 후보" and row.get("chase_decision") in {"진입가능", "눌림후보", "소액진입"}
+    ][:5]
+    watch_candidates = [
+        row for row in recent
+        if row.get("action") == "관망" or row.get("chase_decision") in {"관망", "강한근거만소액", "가격확인"}
+    ][:8]
+    chase_blocked = [
+        row for row in recent
+        if row.get("chase_decision") == "추격금지" or row.get("action") == "제외"
+    ][:8]
+    accumulation_focus = [
+        row for row in accumulation
+        if row.get("decision") == "축적 관심"
+    ][:8]
+    top_users = [
+        row for row in users
+        if (row.get("short_term_score") or 0) > 0
+    ][:10]
+    checklist = [
+        "최근매수 후보는 반드시 현재가/평균매수가 괴리를 먼저 확인한다.",
+        "매수가 대비 +3% 초과는 기본 관망, +5% 근처는 강한 신호여도 소액만 허용한다.",
+        "레버리지/인버스 종목은 추천/진입 후보에서 제외한다.",
+        "유저 1명 단독 신호는 추격하지 않고 다음 스캔에서 추가 매수 확인을 기다린다.",
+        "수익권 보유 탭은 단타 진입보다 중기 관심 종목 후보로만 본다.",
+    ]
+    markdown_lines = [
+        "# AI 투자 의사결정 브리프",
+        "",
+        f"- 생성: {data.get('generated_at')}",
+        f"- 시장 상태: {market.get('label') or '-'}",
+        f"- 최근매수 후보: {len(recent)}개",
+        f"- 수익권 보유 종목: {len(accumulation)}개",
+        "",
+        "## 오늘 바로 볼 후보",
+    ]
+    if buy_candidates:
+        markdown_lines.extend(f"- {ai_brief_recent_buy_comment(row)}" for row in buy_candidates)
+    else:
+        markdown_lines.append("- 현재 규칙상 바로 진입 후보는 없음. 최근매수 스캔을 장중에 다시 실행.")
+    markdown_lines.extend(["", "## 추격매수 주의/보류"])
+    if watch_candidates or chase_blocked:
+        markdown_lines.extend(f"- {ai_brief_recent_buy_comment(row)}" for row in (watch_candidates + chase_blocked)[:10])
+    else:
+        markdown_lines.append("- 현재 추격매수 판단 대상 없음.")
+    markdown_lines.extend(["", "## 수익권 보유/축적 관심"])
+    if accumulation_focus:
+        for row in accumulation_focus:
+            markdown_lines.append(
+                f"- {row.get('symbol')}: 보유 {row.get('holder_count')}명, 수익권 {row.get('positive_holder_count')}명, 평균 미실현 {pct(row.get('avg_unrealized_return'))}, 판정 {row.get('decision')}"
+            )
+    else:
+        markdown_lines.append("- holdings 기반 축적 관심 종목 부족.")
+    markdown_lines.extend(["", "## 우선 감시 유저"])
+    markdown_lines.extend(
+        f"- {row.get('author')}: 단타 {row.get('short_term_score')}, 최종 {row.get('final_reliability_score')}, {row.get('ai_review')}"
+        for row in top_users[:8]
+    )
+    markdown_lines.extend(["", "## Claude Code 판단 체크리스트"])
+    markdown_lines.extend(f"- {item}" for item in checklist)
+    markdown = "\n".join(markdown_lines) + "\n"
+    AI_DECISION_BRIEF_PATH.write_text(markdown, encoding="utf-8")
+    return {
+        "generated_at": data.get("generated_at"),
+        "brief_path": str(AI_DECISION_BRIEF_PATH),
+        "buy_candidates": buy_candidates,
+        "watch_candidates": watch_candidates,
+        "chase_blocked": chase_blocked,
+        "accumulation_focus": accumulation_focus,
+        "top_users": top_users,
+        "checklist": checklist,
+    }
+
+
 def build_unified_invest_data() -> dict[str, Any]:
+    if (
+        UNIFIED_DATA_PATH.exists()
+        and not PROFILE_HISTORY_REPORT_PATH.exists()
+        and not PROFILE_STRATEGY_REPORT_PATH.exists()
+        and not DAILY_PROFILE_SCAN_PATH.exists()
+    ):
+        existing = read_json_file(UNIFIED_DATA_PATH, {})
+        summary = existing.get("summary") or {}
+        if summary.get("profile_trade_event_count") or summary.get("final_ranked_user_count"):
+            existing["ai_decision_brief"] = build_ai_decision_brief(existing)
+            UNIFIED_DATA_PATH.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+            return existing
     candidates = read_json_file(PROFILE_CANDIDATES_PATH, {})
     history = read_json_file(PROFILE_HISTORY_REPORT_PATH, {})
     strategy = read_json_file(PROFILE_STRATEGY_REPORT_PATH, {})
@@ -3045,6 +3223,7 @@ def build_unified_invest_data() -> dict[str, Any]:
             if path.exists()
         ],
     }
+    unified["ai_decision_brief"] = build_ai_decision_brief(unified)
     UNIFIED_DATA_PATH.write_text(json.dumps(unified, ensure_ascii=False, indent=2), encoding="utf-8")
     return unified
 
@@ -3073,6 +3252,8 @@ def render_unified_recent_buys(recent_buy: dict[str, Any]) -> str:
             f"<td>{index}</td>"
             f"<td><strong>{html.escape(str(item.get('symbol') or '-'))}</strong><span class='muted'>{tags}</span></td>"
             f"<td><span class='decision {action_class}'>{html.escape(action)}</span><span class='muted'>{html.escape(str(item.get('action_reason') or ''))}</span></td>"
+            f"<td><strong>{html.escape(str(item.get('chase_decision') or '-'))}</strong><span class='muted'>{html.escape(str(item.get('chase_rule') or ''))}</span>"
+            f"<span class='muted'>허용괴리 {html.escape(str(item.get('max_chase_gap_pct') if item.get('max_chase_gap_pct') is not None else '-'))}% · 비중 {html.escape(str(item.get('position_scale') if item.get('position_scale') is not None else '-'))}</span></td>"
             f"<td>{html.escape(str(item.get('score') or '-'))}<span class='muted'>raw {html.escape(str(item.get('raw_score') or '-'))}</span></td>"
             f"<td>{html.escape(str(item.get('buyer_count') or 0))}명"
             f"<span class='muted'>{html.escape(str(item.get('buyer_participation_pct') or 0))}% / {html.escape(str(item.get('eligible_profile_count') or '-'))}명</span></td>"
@@ -3088,7 +3269,7 @@ def render_unified_recent_buys(recent_buy: dict[str, Any]) -> str:
     if not rows:
         return "<p class='empty'>현재 설정한 최근 시간창 안에서는 매수 후보가 없습니다. 8시간/12시간 창으로 넓혀 확인하세요.</p>"
     header = (
-        "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>점수</th><th>매수 유저</th><th>평균 신뢰도</th>"
+        "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>추격매수</th><th>점수</th><th>매수 유저</th><th>평균 신뢰도</th>"
         "<th>매수 금액</th><th>1000만원 기준 1차</th><th>최근 매수</th><th>현재가/매수가</th><th>유저 링크</th></tr></thead>"
     )
     return f"{header}<tbody>{''.join(rows)}</tbody></table>"
@@ -3242,6 +3423,60 @@ def render_pipeline_overview(data: dict[str, Any]) -> str:
     return (
         "<table><thead><tr><th>단계</th><th>현재 수량</th><th>역할</th></tr></thead>"
         f"<tbody>{''.join(rendered)}</tbody></table>"
+    )
+
+
+def render_ai_decision_brief(data: dict[str, Any]) -> str:
+    brief = data.get("ai_decision_brief") or {}
+    buy_candidates = brief.get("buy_candidates") or []
+    watch_candidates = brief.get("watch_candidates") or []
+    blocked = brief.get("chase_blocked") or []
+    accumulation = brief.get("accumulation_focus") or []
+    checklist = brief.get("checklist") or []
+
+    def recent_cards(rows: list[dict[str, Any]], empty: str) -> str:
+        if not rows:
+            return f"<p class='empty'>{html.escape(empty)}</p>"
+        cards = []
+        for row in rows[:8]:
+            cards.append(
+                "<div class='ai-card'>"
+                f"<strong>{html.escape(str(row.get('symbol') or '-'))}</strong>"
+                f"<span>{html.escape(str(row.get('action') or '-'))} · {html.escape(str(row.get('chase_decision') or '-'))} · {html.escape(str(row.get('score') or '-'))}점</span>"
+                f"<span class='{return_class(row.get('price_move_since_buy'))}'>매수가 대비 {html.escape(pct(row.get('price_move_since_buy')))}</span>"
+                f"<p>{html.escape(str(row.get('chase_rule') or row.get('action_reason') or ''))}</p>"
+                "</div>"
+            )
+        return f"<div class='ai-card-grid'>{''.join(cards)}</div>"
+
+    accumulation_rows = []
+    for row in accumulation[:8]:
+        accumulation_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('symbol') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('decision') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('holder_count') or 0))}명</td>"
+            f"<td>{html.escape(str(row.get('positive_holder_count') or 0))}명</td>"
+            f"<td class='{return_class(row.get('avg_unrealized_return'))}'>{html.escape(pct(row.get('avg_unrealized_return')))}</td>"
+            "</tr>"
+        )
+    checklist_items = "".join(f"<li>{html.escape(str(item))}</li>" for item in checklist)
+    markdown_path = brief.get("brief_path")
+    return (
+        "<div class='ai-brief'>"
+        "<h3>AI 판단 브리핑</h3>"
+        "<p class='note'>파이썬이 만든 점수표를 그대로 따라 사지 않고, Claude Code가 아래 증거를 읽고 최종 판단을 설명하도록 만든 브리프입니다.</p>"
+        "<h4>바로 볼 후보</h4>"
+        f"{recent_cards(buy_candidates, '현재 규칙상 바로 진입 후보는 없습니다. 장중 스캔을 다시 실행하세요.')}"
+        "<h4>추격매수 주의</h4>"
+        f"{recent_cards((watch_candidates + blocked)[:8], '현재 추격매수 판단 대상이 없습니다.')}"
+        "<h4>수익권 보유/축적 관심</h4>"
+        "<div class='panel inner-panel'><table><thead><tr><th>종목</th><th>판정</th><th>보유 유저</th><th>수익권 유저</th><th>평균 미실현</th></tr></thead>"
+        f"<tbody>{''.join(accumulation_rows) or '<tr><td colspan=\"5\" class=\"muted\">축적 관심 종목 없음</td></tr>'}</tbody></table></div>"
+        "<h4>Claude Code 체크리스트</h4>"
+        f"<ul class='brief-list'>{checklist_items}</ul>"
+        f"<p class='note'>Markdown 브리프: {html.escape(str(markdown_path or AI_DECISION_BRIEF_PATH))}</p>"
+        "</div>"
     )
 
 
@@ -3906,7 +4141,7 @@ document.querySelectorAll('[data-tab-target]').forEach(button => {{
   button.addEventListener('click', () => activateDashboardTab(button.dataset.tabTarget));
 }});
 const initialTab = (location.hash || '').replace('#', '');
-if (['today', 'symbols', 'accumulation', 'users', 'risk', 'system'].includes(initialTab)) {{
+if (['today', 'brief', 'symbols', 'accumulation', 'users', 'risk', 'system'].includes(initialTab)) {{
   activateDashboardTab(initialTab);
 }}
 document.addEventListener('click', event => {{
@@ -4141,6 +4376,15 @@ def unified_dashboard_report() -> dict[str, Any]:
     .todo {{ background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px; box-shadow:0 1px 2px rgba(15,23,42,.04); }}
     .todo strong, .todo span {{ display:block; }}
     .todo span {{ color:var(--muted); margin-top:6px; line-height:1.45; }}
+    .ai-brief h3 {{ margin:0 0 8px; font-size:18px; }}
+    .ai-brief h4 {{ margin:18px 0 10px; font-size:15px; }}
+    .ai-card-grid {{ display:grid; grid-template-columns:repeat(4, minmax(190px, 1fr)); gap:10px; }}
+    .ai-card {{ border:1px solid var(--line); border-radius:10px; background:#fff; padding:12px; }}
+    .ai-card strong, .ai-card span {{ display:block; }}
+    .ai-card span {{ color:var(--muted); font-size:12px; margin-top:4px; }}
+    .ai-card p {{ margin:8px 0 0; color:#334155; font-size:13px; line-height:1.45; }}
+    .brief-list {{ margin:8px 0 0; padding-left:20px; color:#334155; line-height:1.7; }}
+    .inner-panel {{ margin-top:0; }}
     table {{ width:100%; border-collapse:collapse; }}
     th, td {{ border-bottom:1px solid var(--line2); padding:10px 12px; text-align:left; vertical-align:top; font-size:13px; line-height:1.45; }}
     th {{ background:#f1f5f9; color:#334155; position:sticky; top:0; z-index:1; font-size:12px; font-weight:800; }}
@@ -4191,7 +4435,7 @@ def unified_dashboard_report() -> dict[str, Any]:
     .detail-section {{ margin-top:16px; }}
     .detail-section h4 {{ margin:0 0 8px; font-size:15px; }}
     .ai-box {{ margin:0 0 8px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#f8fafc; font-weight:700; }}
-    @media (max-width: 1000px) {{ main {{ padding:14px; }} .grid, .todo-grid, .action-grid {{ grid-template-columns:repeat(2, minmax(130px, 1fr)); }} .panel {{ overflow-x:auto; }} th, td {{ white-space:nowrap; }} input[type="search"] {{ min-width:180px; }} }}
+    @media (max-width: 1000px) {{ main {{ padding:14px; }} .grid, .todo-grid, .action-grid, .ai-card-grid {{ grid-template-columns:repeat(2, minmax(130px, 1fr)); }} .panel {{ overflow-x:auto; }} th, td {{ white-space:nowrap; }} input[type="search"] {{ min-width:180px; }} }}
     @media (max-width: 700px) {{ .detail-grid {{ grid-template-columns:repeat(2, minmax(130px, 1fr)); }} .dialog-body {{ padding:14px; }} .table-toolbar select:last-child {{ margin-left:0; }} .pager {{ justify-content:center; }} .tab-nav {{ position:static; }} .tab-button {{ flex:1 1 46%; }} }}
   </style>
 </head>
@@ -4222,6 +4466,7 @@ def unified_dashboard_report() -> dict[str, Any]:
   <section class="workspace-tabs">
     <nav class="tab-nav" aria-label="대시보드 메뉴">
       <button type="button" class="tab-button active" data-tab-target="today">오늘 볼 것</button>
+      <button type="button" class="tab-button" data-tab-target="brief">AI 브리핑</button>
       <button type="button" class="tab-button" data-tab-target="symbols">종목 분석</button>
       <button type="button" class="tab-button" data-tab-target="accumulation">수익권 보유</button>
       <button type="button" class="tab-button" data-tab-target="users">유저 랭킹</button>
@@ -4252,6 +4497,10 @@ def unified_dashboard_report() -> dict[str, Any]:
           <div class="panel">{render_recent_buy_performance(recent_buy_performance)}</div>
         </div>
       </div>
+    </section>
+
+    <section id="tab-brief" class="tab-panel">
+      <div class="panel" style="padding:16px">{render_ai_decision_brief(data)}</div>
     </section>
 
     <section id="tab-symbols" class="tab-panel">
@@ -5458,6 +5707,7 @@ def main() -> None:
     parser.add_argument("--daily-profile-scan", action="store_true", help="opt-in daily read-only scan for selected profile updates")
     parser.add_argument("--recent-buy-report", action="store_true", help="write recent 0-4h top-user buy recommendation report")
     parser.add_argument("--unified-dashboard", action="store_true", help="write one consolidated HTML dashboard and one consolidated JSON data file")
+    parser.add_argument("--ai-brief", action="store_true", help="write Claude/AI decision brief markdown from the latest dashboard data")
     parser.add_argument("--market-prep", action="store_true", help="closed-market prep: expand user pool, recompute reliability, and update dashboard")
     parser.add_argument("--author", help="optional author nickname substring for --user-report")
     parser.add_argument("--min-samples", type=int, default=2, help="minimum tested returns for user report")
@@ -5555,6 +5805,17 @@ def main() -> None:
             output = recent_buy_html_report(hours=args.recent_hours, capital=args.capital)
         elif args.unified_dashboard:
             output = unified_dashboard_report()
+        elif args.ai_brief:
+            data = build_unified_invest_data()
+            brief = data.get("ai_decision_brief") or build_ai_decision_brief(data)
+            output = {
+                "mode": "ai-decision-brief",
+                "generated_at": brief.get("generated_at"),
+                "brief_path": brief.get("brief_path"),
+                "buy_candidate_count": len(brief.get("buy_candidates") or []),
+                "watch_candidate_count": len(brief.get("watch_candidates") or []),
+                "accumulation_focus_count": len(brief.get("accumulation_focus") or []),
+            }
         elif args.market_prep:
             stock_community_codes = [code.strip() for code in args.stock_community_codes.split(",") if code.strip()]
             output = market_prep_report(

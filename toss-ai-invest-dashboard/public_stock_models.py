@@ -2922,6 +2922,167 @@ def load_operation_reports(limit: int | None = None) -> list[dict[str, Any]]:
     return reports[-limit:] if limit else reports
 
 
+def compact_recent_buy_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    buyers = []
+    for profile in (row.get("buyer_profiles") or [])[:6]:
+        buyers.append({
+            "author": profile.get("author"),
+            "profile_id": profile.get("profile_id"),
+            "profile_url": profile.get("profile_url"),
+            "user_reliability": profile.get("user_reliability"),
+        })
+    return {
+        "symbol": row.get("symbol"),
+        "score": row.get("score"),
+        "action": row.get("action"),
+        "chase_decision": row.get("chase_decision"),
+        "chase_rule": row.get("chase_rule") or row.get("action_reason"),
+        "buyer_count": row.get("buyer_count"),
+        "reliable_buyer_count": row.get("reliable_buyer_count"),
+        "avg_user_reliability": row.get("avg_user_reliability"),
+        "latest_buy_at": row.get("latest_buy_at"),
+        "price_move_since_buy": row.get("price_move_since_buy"),
+        "price_move_since_buy_pct": row.get("price_move_since_buy_pct"),
+        "average_buy_price": row.get("average_buy_price"),
+        "current_price": row.get("current_price"),
+        "current_price_currency": row.get("current_price_currency"),
+        "suggested_position_krw_on_10m": row.get("suggested_position_krw_on_10m"),
+        "amount_krw": row.get("amount_krw"),
+        "buyers": buyers,
+    }
+
+
+def compact_user_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "author": row.get("author"),
+        "profile_id": row.get("profile_id"),
+        "profile_url": f"https://www.tossinvest.com/community/profile/{row.get('profile_id')}" if row.get("profile_id") else None,
+        "final_reliability_score": row.get("final_reliability_score") or row.get("reliability_score"),
+        "short_term_score": row.get("short_term_score"),
+        "tested_returns": row.get("tested_returns"),
+        "overall_avg_return": row.get("overall_avg_return"),
+        "overall_win_rate": row.get("overall_win_rate"),
+        "latest_trade_at": row.get("latest_trade_at"),
+        "ai_review": row.get("ai_review"),
+        "persona_tags": row.get("persona_tags") or [],
+    }
+
+
+def compact_candidate_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "author": row.get("nickname") or row.get("author"),
+        "profile_id": row.get("profile_id"),
+        "profile_url": f"https://www.tossinvest.com/community/profile/{row.get('profile_id')}" if row.get("profile_id") else None,
+        "source": row.get("source") or row.get("selection_source"),
+        "score": row.get("score") or row.get("selection_score"),
+        "reason": row.get("reason") or row.get("selection_reason"),
+    }
+
+
+def build_operation_snapshot(action: str, output: dict[str, Any]) -> dict[str, Any]:
+    if action == "최근 매수 추천 갱신":
+        recommendations = output.get("recommendations") or (read_json_file(RECENT_BUY_REPORT_PATH, {}) or {}).get("recommendations") or []
+        actionable = [
+            row for row in recommendations
+            if row.get("action") == "매수 후보" and row.get("chase_decision") in {"진입가능", "소액진입", "눌림후보"}
+        ]
+        watch = [row for row in recommendations if row not in actionable and row.get("action") != "제외"]
+        return {
+            "type": "intraday_recommendation",
+            "title": "장중 종목추천 리포트",
+            "window_hours": output.get("window_hours"),
+            "recommendation_count": output.get("recommendation_count"),
+            "headline": (
+                f"매수 검토 후보 {len(actionable)}개, 감시 후보 {len(watch)}개"
+                if actionable else
+                f"즉시 매수 후보 없음, 감시 후보 {len(watch)}개"
+            ),
+            "actionable": [compact_recent_buy_snapshot(row) for row in actionable[:12]],
+            "watch": [compact_recent_buy_snapshot(row) for row in watch[:20]],
+            "excluded": [compact_recent_buy_snapshot(row) for row in recommendations if row.get("action") == "제외"][:10],
+        }
+    if action == "장중 거래 스캔":
+        new_buys = output.get("new_buys") or []
+        return {
+            "type": "daily_scan",
+            "title": "상위 유저 장중 거래 스캔 리포트",
+            "headline": f"신규 매수 {len(new_buys)}건 감지",
+            "new_buys": [
+                {
+                    "author": row.get("author"),
+                    "profile_id": row.get("profile_id"),
+                    "symbol": row.get("symbol") or row.get("stock_name"),
+                    "side": row.get("side"),
+                    "amount_krw": row.get("amount_krw"),
+                    "avg_krw": row.get("avg_krw"),
+                    "acted_at": row.get("acted_at"),
+                }
+                for row in new_buys[:30]
+            ],
+        }
+    if action == "유저 신뢰도 재계산":
+        strategy = output if output.get("authors") or output.get("top_authors") else read_json_file(PROFILE_STRATEGY_REPORT_PATH, {})
+        users = build_final_user_rankings(strategy) if strategy else []
+        return {
+            "type": "user_reliability",
+            "title": "전체유저 신뢰도 평가 리포트",
+            "headline": f"상위 신뢰 유저 {len(users)}명 정렬",
+            "users": [compact_user_snapshot(row) for row in users[:30]],
+        }
+    if action == "신규 유저풀 확장":
+        candidates = output.get("candidates") or (read_json_file(PROFILE_CANDIDATES_PATH, {}) or {}).get("candidates") or []
+        return {
+            "type": "user_pool",
+            "title": "신규유저 찾기 리포트",
+            "headline": f"후보 유저 {len(candidates)}명 확보",
+            "candidates": [compact_candidate_snapshot(row) for row in candidates[:40]],
+        }
+    if action == "통합 대시보드 갱신":
+        data = read_json_file(UNIFIED_DATA_PATH, {}) or {}
+        recent = (data.get("recent_buy") or {}).get("recommendations") or []
+        users = data.get("final_user_rankings") or []
+        accum = data.get("holding_accumulation_rankings") or []
+        return {
+            "type": "dashboard_snapshot",
+            "title": "통합 대시보드 최종 리포트",
+            "headline": f"최근매수 {len(recent)}개, 최종 유저 {len(users)}명, 수익권 보유 {len(accum)}개",
+            "recent": [compact_recent_buy_snapshot(row) for row in recent[:12]],
+            "users": [compact_user_snapshot(row) for row in users[:12]],
+            "accumulation": [
+                {
+                    "symbol": row.get("symbol"),
+                    "decision": row.get("decision"),
+                    "score": row.get("score"),
+                    "holder_count": row.get("holder_count"),
+                    "positive_holder_count": row.get("positive_holder_count"),
+                    "avg_unrealized_return": row.get("avg_unrealized_return"),
+                }
+                for row in accum[:12]
+            ],
+        }
+    if action == "Holdings 리스크 수집":
+        profiles = output.get("profiles") or (read_json_file(PROFILE_HOLDINGS_REPORT_PATH, {}) or {}).get("profiles") or []
+        return {
+            "type": "holdings",
+            "title": "Holdings 리스크 수집 리포트",
+            "headline": f"Holdings {len(profiles)}명 확인",
+            "profiles": [
+                {
+                    "profile_id": row.get("profile_id"),
+                    "nickname": row.get("nickname"),
+                    "holding_count": len(row.get("holdings") or []),
+                    "top_holdings": compact_holdings(row.get("holdings") or [])[:5],
+                }
+                for row in profiles[:30]
+            ],
+        }
+    return {
+        "type": "summary",
+        "title": action,
+        "headline": operation_decision_summary(action, output),
+    }
+
+
 def append_operation_report(args: argparse.Namespace, output: dict[str, Any], status: str = "completed") -> dict[str, Any]:
     action = current_operation_name(args)
     reports = load_operation_reports()
@@ -2937,6 +3098,7 @@ def append_operation_report(args: argparse.Namespace, output: dict[str, Any], st
         "summary": operation_decision_summary(action, output),
         "paths": operation_paths_from_output(output),
         "next_action": output.get("next_market_open_action") or (output.get("market_status") or {}).get("recommendation"),
+        "snapshot": build_operation_snapshot(action, output),
     }
     reports.append(report)
     max_reports = 200
@@ -4692,10 +4854,171 @@ def render_pool_final_report(data: dict[str, Any]) -> str:
     )
 
 
+def render_snapshot_recent_rows(rows: list[dict[str, Any]]) -> str:
+    rendered = []
+    for index, row in enumerate(rows, start=1):
+        buyers = " ".join(
+            "<a class='chip' href='{url}' target='_blank' rel='noopener'>{name} {score}</a>".format(
+                url=html.escape(str(buyer.get("profile_url") or "#")),
+                name=html.escape(str(buyer.get("author") or buyer.get("profile_id") or "-")),
+                score=html.escape(str(buyer.get("user_reliability") or "-")),
+            )
+            for buyer in row.get("buyers") or []
+        ) or "<span class='muted'>-</span>"
+        rendered.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td><strong>{html.escape(str(row.get('symbol') or '-'))}</strong><span class='muted block'>{html.escape(format_trade_time(row.get('latest_buy_at')))}</span></td>"
+            f"<td>{html.escape(str(row.get('action') or '-'))}<span class='muted block'>추격 {html.escape(str(row.get('chase_decision') or '-'))}</span></td>"
+            f"<td><strong>{html.escape(str(row.get('score') or '-'))}</strong><span class='muted block'>신뢰 {html.escape(str(row.get('avg_user_reliability') or '-'))}</span></td>"
+            f"<td>{html.escape(str(row.get('buyer_count') or 0))}명<span class='muted block'>신뢰 {html.escape(str(row.get('reliable_buyer_count') or 0))}명</span>{buyers}</td>"
+            f"<td class='{return_class(row.get('price_move_since_buy'))}'>{html.escape(pct(row.get('price_move_since_buy')))}"
+            f"<span class='muted block'>현재 {html.escape(format_money(row.get('current_price'), row.get('current_price_currency') or 'USD'))} / 평균 {html.escape(format_money(row.get('average_buy_price'), row.get('current_price_currency') or 'USD'))}</span></td>"
+            f"<td>{html.escape(str(row.get('chase_rule') or '-'))}</td>"
+            "</tr>"
+        )
+    if not rendered:
+        return "<p class='empty'>해당 구분의 후보가 없습니다.</p>"
+    return (
+        "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>점수</th><th>매수 유저</th><th>가격괴리</th><th>판단 근거</th></tr></thead>"
+        f"<tbody>{''.join(rendered)}</tbody></table>"
+    )
+
+
+def render_snapshot_user_rows(rows: list[dict[str, Any]]) -> str:
+    rendered = []
+    for index, row in enumerate(rows, start=1):
+        rendered.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td><a href='{html.escape(str(row.get('profile_url') or '#'))}' target='_blank' rel='noopener'>{html.escape(str(row.get('author') or '-'))}</a>"
+            f"<span class='muted block'>{html.escape(', '.join(str(tag) for tag in row.get('persona_tags') or []))}</span></td>"
+            f"<td><strong>{html.escape(str(row.get('final_reliability_score') or '-'))}</strong><span class='muted block'>단타 {html.escape(str(row.get('short_term_score') or '-'))}</span></td>"
+            f"<td>{html.escape(str(row.get('tested_returns') or 0))}<span class='muted block'>승률 {html.escape(pct(row.get('overall_win_rate')))}</span></td>"
+            f"<td class='{return_class(row.get('overall_avg_return'))}'>{html.escape(pct(row.get('overall_avg_return')))}</td>"
+            f"<td>{html.escape(format_trade_time(row.get('latest_trade_at')))}</td>"
+            f"<td>{html.escape(str(row.get('ai_review') or '-'))}</td>"
+            "</tr>"
+        )
+    if not rendered:
+        return "<p class='empty'>유저 스냅샷이 없습니다.</p>"
+    return (
+        "<table><thead><tr><th>#</th><th>유저</th><th>신뢰도</th><th>검증</th><th>평균수익</th><th>최근거래</th><th>AI 판단</th></tr></thead>"
+        f"<tbody>{''.join(rendered)}</tbody></table>"
+    )
+
+
+def render_operation_snapshot(snapshot: dict[str, Any]) -> str:
+    snapshot_type = snapshot.get("type")
+    if snapshot_type == "intraday_recommendation":
+        return (
+            f"<p class='note'>{html.escape(str(snapshot.get('headline') or ''))} · 최근매수 창 {html.escape(str(snapshot.get('window_hours') or '-'))}시간</p>"
+            "<h4>매수 검토 후보</h4>"
+            f"{render_snapshot_recent_rows(snapshot.get('actionable') or [])}"
+            "<h4>감시 후보</h4>"
+            f"{render_snapshot_recent_rows(snapshot.get('watch') or [])}"
+            "<h4>제외 후보</h4>"
+            f"{render_snapshot_recent_rows(snapshot.get('excluded') or [])}"
+        )
+    if snapshot_type == "daily_scan":
+        rows = []
+        for row in snapshot.get("new_buys") or []:
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(format_trade_time(row.get('acted_at')))}</td>"
+                f"<td><a href='https://www.tossinvest.com/community/profile/{html.escape(str(row.get('profile_id') or ''))}' target='_blank' rel='noopener'>{html.escape(str(row.get('author') or '-'))}</a></td>"
+                f"<td>{html.escape(str(row.get('symbol') or '-'))}</td>"
+                f"<td>{html.escape(format_money(row.get('avg_krw'), 'KRW'))}</td>"
+                f"<td>{html.escape(format_money(row.get('amount_krw'), 'KRW'))}</td>"
+                "</tr>"
+            )
+        return (
+            f"<p class='note'>{html.escape(str(snapshot.get('headline') or ''))}</p>"
+            "<table><thead><tr><th>시간</th><th>유저</th><th>종목</th><th>평단</th><th>금액</th></tr></thead>"
+            f"<tbody>{''.join(rows) or '<tr><td colspan=\"5\" class=\"muted\">신규 매수 없음</td></tr>'}</tbody></table>"
+        )
+    if snapshot_type == "user_reliability":
+        return f"<p class='note'>{html.escape(str(snapshot.get('headline') or ''))}</p>{render_snapshot_user_rows(snapshot.get('users') or [])}"
+    if snapshot_type == "user_pool":
+        rows = []
+        for index, row in enumerate(snapshot.get("candidates") or [], start=1):
+            rows.append(
+                "<tr>"
+                f"<td>{index}</td>"
+                f"<td><a href='{html.escape(str(row.get('profile_url') or '#'))}' target='_blank' rel='noopener'>{html.escape(str(row.get('author') or row.get('profile_id') or '-'))}</a></td>"
+                f"<td>{html.escape(str(row.get('source') or '-'))}</td>"
+                f"<td>{html.escape(str(row.get('score') or '-'))}</td>"
+                f"<td>{html.escape(str(row.get('reason') or '-'))}</td>"
+                "</tr>"
+            )
+        return (
+            f"<p class='note'>{html.escape(str(snapshot.get('headline') or ''))}</p>"
+            "<table><thead><tr><th>#</th><th>유저</th><th>출처</th><th>점수</th><th>이유</th></tr></thead>"
+            f"<tbody>{''.join(rows) or '<tr><td colspan=\"5\" class=\"muted\">후보 없음</td></tr>'}</tbody></table>"
+        )
+    if snapshot_type == "dashboard_snapshot":
+        accum_rows = []
+        for row in snapshot.get("accumulation") or []:
+            accum_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(row.get('symbol') or '-'))}</td>"
+                f"<td>{html.escape(str(row.get('decision') or '-'))}</td>"
+                f"<td>{html.escape(str(row.get('holder_count') or 0))}명</td>"
+                f"<td>{html.escape(str(row.get('positive_holder_count') or 0))}명</td>"
+                f"<td class='{return_class(row.get('avg_unrealized_return'))}'>{html.escape(pct(row.get('avg_unrealized_return')))}</td>"
+                "</tr>"
+            )
+        return (
+            f"<p class='note'>{html.escape(str(snapshot.get('headline') or ''))}</p>"
+            "<h4>최근매수 후보</h4>"
+            f"{render_snapshot_recent_rows(snapshot.get('recent') or [])}"
+            "<h4>상위 신뢰 유저</h4>"
+            f"{render_snapshot_user_rows(snapshot.get('users') or [])}"
+            "<h4>수익권 보유</h4>"
+            "<table><thead><tr><th>종목</th><th>판정</th><th>보유유저</th><th>수익권</th><th>평균 미실현</th></tr></thead>"
+            f"<tbody>{''.join(accum_rows) or '<tr><td colspan=\"5\" class=\"muted\">수익권 보유 스냅샷 없음</td></tr>'}</tbody></table>"
+        )
+    return f"<p class='note'>{html.escape(str(snapshot.get('headline') or '보관된 상세 스냅샷이 없습니다.'))}</p>"
+
+
+def render_report_archive(operation_reports: dict[str, Any]) -> str:
+    reports = list((operation_reports or {}).get("reports") or [])
+    if not reports:
+        return "<p class='empty'>아직 보관된 최종 리포트가 없습니다. 액션을 실행하면 게시물처럼 이곳에 쌓입니다.</p>"
+    items = []
+    for report in reversed(reports[-80:]):
+        snapshot = report.get("snapshot") or {}
+        title = snapshot.get("title") or report.get("action") or "리포트"
+        timestamp = format_trade_time(report.get("generated_at"))
+        headline = snapshot.get("headline") or report.get("summary") or ""
+        metrics = report.get("metrics") or {}
+        chips = " ".join(
+            f"<span class='chip'>{html.escape(str(key))} {html.escape(str(value))}</span>"
+            for key, value in metrics.items()
+            if key in {"recommendation_count", "scanned_profile_count", "new_buy_count", "candidate_count", "tested_event_count", "final_ranked_user_count"}
+        )
+        items.append(
+            "<details class='report-post'>"
+            f"<summary><strong>{html.escape(str(title))}</strong><span>{html.escape(timestamp)}</span><em>{html.escape(str(headline))}</em>{chips}</summary>"
+            f"<div class='report-body'>{render_operation_snapshot(snapshot)}</div>"
+            "</details>"
+        )
+    return "<div class='report-archive'>" + "".join(items) + "</div>"
+
+
 def render_final_service_reports(data: dict[str, Any]) -> str:
     operation_reports = data.get("operation_reports") or {}
     return (
         "<div class='section-stack'>"
+        "<div>"
+        "<h2 class='section-title'>리포트 보관함</h2>"
+        "<p class='section-subtitle'>각 액션 결과를 게시물처럼 보관합니다. 클릭하면 그 시점의 종목추천/유저평가/유저풀 리포트를 다시 볼 수 있습니다.</p>"
+        f"{render_report_archive(operation_reports)}"
+        "</div>"
+        "<div>"
+        "<h2 class='section-title'>현재 종합 리포트</h2>"
+        "<p class='section-subtitle'>아래는 최신 데이터로 다시 계산한 현재 화면입니다. 다음 실행 때 바뀔 수 있으므로 보관본은 위 리포트 보관함을 기준으로 봅니다.</p>"
+        "</div>"
         f"{render_intraday_service_final_report(data)}"
         f"{render_user_reliability_final_report(data)}"
         f"{render_pool_final_report(data)}"
@@ -4819,8 +5142,16 @@ def unified_dashboard_report() -> dict[str, Any]:
     .detail-section {{ margin-top:16px; }}
     .detail-section h4 {{ margin:0 0 8px; font-size:15px; }}
     .ai-box {{ margin:0 0 8px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#f8fafc; font-weight:700; }}
+    .report-archive {{ display:grid; gap:10px; }}
+    .report-post {{ border:1px solid var(--line); border-radius:10px; background:#fff; overflow:hidden; box-shadow:0 1px 2px rgba(15,23,42,.04); }}
+    .report-post summary {{ cursor:pointer; display:grid; grid-template-columns:220px 120px 1fr auto; gap:10px; align-items:center; padding:13px 14px; background:#f8fafc; list-style:none; }}
+    .report-post summary::-webkit-details-marker {{ display:none; }}
+    .report-post summary span {{ color:var(--muted); font-size:12px; }}
+    .report-post summary em {{ color:#334155; font-style:normal; font-size:13px; line-height:1.4; }}
+    .report-body {{ padding:14px; border-top:1px solid var(--line); display:grid; gap:12px; }}
+    .report-body h4 {{ margin:8px 0 0; font-size:14px; }}
     @media (max-width: 1000px) {{ main {{ padding:14px; }} .grid, .todo-grid, .action-grid, .ai-card-grid {{ grid-template-columns:repeat(2, minmax(130px, 1fr)); }} .panel {{ overflow-x:auto; }} th, td {{ white-space:nowrap; }} input[type="search"] {{ min-width:180px; }} }}
-    @media (max-width: 700px) {{ .detail-grid {{ grid-template-columns:repeat(2, minmax(130px, 1fr)); }} .dialog-body {{ padding:14px; }} .table-toolbar select:last-child {{ margin-left:0; }} .pager {{ justify-content:center; }} .tab-nav {{ position:static; }} .tab-button {{ flex:1 1 46%; }} }}
+    @media (max-width: 700px) {{ .detail-grid {{ grid-template-columns:repeat(2, minmax(130px, 1fr)); }} .dialog-body {{ padding:14px; }} .table-toolbar select:last-child {{ margin-left:0; }} .pager {{ justify-content:center; }} .tab-nav {{ position:static; }} .tab-button {{ flex:1 1 46%; }} .report-post summary {{ grid-template-columns:1fr; }} }}
   </style>
 </head>
 <body>

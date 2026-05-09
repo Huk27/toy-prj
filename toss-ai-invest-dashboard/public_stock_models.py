@@ -239,6 +239,11 @@ COMMON_SYMBOL_ALIASES = {
     "아이온큐": "IONQ",
     "인텔": "INTC",
     "마이크론 테크놀로지": "MU",
+    "퀄컴": "QCOM",
+    "플래닛 랩스": "PL",
+    "어플라이드 머티리얼즈": "AMAT",
+    "브로드컴": "AVGO",
+    "로빈후드": "HOOD",
     "버크셔 해서웨이 B": "BRK-B",
     "플러그 파워": "PLUG",
     "아우스터": "OUST",
@@ -2485,6 +2490,63 @@ def chase_entry_plan(
     }
 
 
+def exit_price_plan(
+    average_buy_price: float | None,
+    current_price: float | None,
+    currency: str | None,
+    score: float | None,
+    reliable_count: int,
+    buyer_count: int,
+    price_move_pct: float | None,
+    chase_decision: str | None,
+    risk_tags: list[str] | None = None,
+) -> dict[str, Any]:
+    if average_buy_price is None or average_buy_price <= 0:
+        return {
+            "target_price": None,
+            "stop_price": None,
+            "target_return_pct": None,
+            "stop_return_pct": None,
+            "current_to_target_pct": None,
+            "currency": currency,
+            "rule": "평균 매수가가 없어 목표가 계산 보류",
+        }
+    score_value = float(score or 0.0)
+    tags = risk_tags or []
+    volatile = any(tag in tags for tag in ("바이오", "변동성주의")) or buyer_count <= 1
+    if score_value >= 78 and reliable_count >= 3 and buyer_count >= 3:
+        target_pct = 0.055
+        stop_pct = -0.025
+        rule = "신뢰 유저가 여러 명이라 1차 목표를 높게 보되 손절폭은 제한"
+    elif score_value >= 65 and reliable_count >= 2:
+        target_pct = 0.04
+        stop_pct = -0.022
+        rule = "중간 강도 신호라 4% 안팎 1차 익절 기준"
+    else:
+        target_pct = 0.025 if volatile else 0.03
+        stop_pct = -0.018 if volatile else -0.02
+        rule = "근거가 약해 짧은 익절/손절 기준"
+    if chase_decision in {"추격금지", "가격확인"}:
+        target_pct = min(target_pct, 0.025)
+        rule = f"{rule}; {chase_decision} 상태라 목표가보다 진입 보류가 우선"
+    if price_move_pct is not None and price_move_pct >= target_pct * 0.8:
+        rule = f"{rule}; 이미 1차 목표가 근처라 신규 진입 매력 낮음"
+    target_price = average_buy_price * (1 + target_pct)
+    stop_price = average_buy_price * (1 + stop_pct)
+    current_to_target_pct = None
+    if current_price is not None and current_price > 0:
+        current_to_target_pct = (target_price / float(current_price)) - 1.0
+    return {
+        "target_price": round(target_price, 4),
+        "stop_price": round(stop_price, 4),
+        "target_return_pct": round(target_pct * 100, 2),
+        "stop_return_pct": round(stop_pct * 100, 2),
+        "current_to_target_pct": round(current_to_target_pct * 100, 2) if current_to_target_pct is not None else None,
+        "currency": currency,
+        "rule": rule,
+    }
+
+
 def classify_action(score: float | None, price_move_pct: float | None, reliable_count: int, buyer_count: int) -> tuple[str, str]:
     score_value = float(score or 0.0)
     if price_move_pct is not None and price_move_pct >= 0.06:
@@ -2621,6 +2683,17 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
         gap_label = price_gap_label(price_move_pct)
         risk_tags = symbol_risk_tags(symbol, latest_event.get("stock_name") or symbol, latest_event.get("stock_code"))
         chase_plan = chase_entry_plan(final_score, price_move_pct, reliable_buyer_count, buyer_profile_count, risk_tags)
+        exit_plan = exit_price_plan(
+            average_buy_price,
+            float(current_price) if current_price is not None else None,
+            current_currency,
+            final_score,
+            reliable_buyer_count,
+            buyer_profile_count,
+            price_move_pct,
+            chase_plan["decision"],
+            risk_tags,
+        )
         recommendations.append({
             "symbol": symbol,
             "score": final_score,
@@ -2630,6 +2703,12 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
             "chase_rule": chase_plan["rule"],
             "max_chase_gap_pct": chase_plan["max_chase_gap_pct"],
             "position_scale": chase_plan["position_scale"],
+            "exit_plan": exit_plan,
+            "target_sell_price": exit_plan["target_price"],
+            "stop_loss_price": exit_plan["stop_price"],
+            "target_return_pct": exit_plan["target_return_pct"],
+            "stop_return_pct": exit_plan["stop_return_pct"],
+            "current_to_target_pct": exit_plan["current_to_target_pct"],
             "price_gap_label": gap_label,
             "risk_tags": risk_tags,
             "raw_score": round(raw_score, 1),
@@ -2948,6 +3027,12 @@ def compact_recent_buy_snapshot(row: dict[str, Any]) -> dict[str, Any]:
         "current_price_currency": row.get("current_price_currency"),
         "suggested_position_krw_on_10m": row.get("suggested_position_krw_on_10m"),
         "amount_krw": row.get("amount_krw"),
+        "exit_plan": row.get("exit_plan"),
+        "target_sell_price": row.get("target_sell_price"),
+        "stop_loss_price": row.get("stop_loss_price"),
+        "target_return_pct": row.get("target_return_pct"),
+        "stop_return_pct": row.get("stop_return_pct"),
+        "current_to_target_pct": row.get("current_to_target_pct"),
         "buyers": buyers,
     }
 
@@ -3560,6 +3645,7 @@ def render_unified_recent_buys(recent_buy: dict[str, Any]) -> str:
         action = str(item.get("action") or "관망")
         action_class = "decision-good" if action == "매수 후보" else "decision-bad" if action == "제외" else "decision-warn"
         tags = " ".join(f"<span class='chip'>{html.escape(str(tag))}</span>" for tag in item.get("risk_tags") or [])
+        exit_plan = item.get("exit_plan") or {}
         rows.append(
             "<tr>"
             f"<td>{index}</td>"
@@ -3576,6 +3662,7 @@ def render_unified_recent_buys(recent_buy: dict[str, Any]) -> str:
             f"<td>{html.escape(format_trade_time(item.get('latest_buy_at')))}</td>"
             f"<td class='{return_class(item.get('price_move_since_buy'))}'>{html.escape(pct(item.get('price_move_since_buy')))}"
             f"<span class='muted'>{html.escape(str(item.get('price_gap_label') or '-'))} · 현재 {html.escape(format_money(item.get('current_price'), currency))} / 평균 {html.escape(format_money(item.get('average_buy_price'), currency))}</span></td>"
+            f"<td>{html.escape(format_money(exit_plan.get('target_price'), currency))}<span class='muted'>목표 {html.escape(str(exit_plan.get('target_return_pct') if exit_plan.get('target_return_pct') is not None else '-'))}% · 손절 {html.escape(format_money(exit_plan.get('stop_price'), currency))}</span><span class='muted'>{html.escape(str(exit_plan.get('rule') or ''))}</span></td>"
             f"<td>{buyers}</td>"
             "</tr>"
         )
@@ -3583,7 +3670,7 @@ def render_unified_recent_buys(recent_buy: dict[str, Any]) -> str:
         return "<p class='empty'>현재 설정한 최근 시간창 안에서는 매수 후보가 없습니다. 8시간/12시간 창으로 넓혀 확인하세요.</p>"
     header = (
         "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>추격매수</th><th>점수</th><th>매수 유저</th><th>평균 신뢰도</th>"
-        "<th>매수 금액</th><th>1000만원 기준 1차</th><th>최근 매수</th><th>현재가/매수가</th><th>유저 링크</th></tr></thead>"
+        "<th>매수 금액</th><th>1000만원 기준 1차</th><th>최근 매수</th><th>현재가/매수가</th><th>목표/손절 참고</th><th>유저 링크</th></tr></thead>"
     )
     return f"{header}<tbody>{''.join(rows)}</tbody></table>"
 
@@ -4781,6 +4868,7 @@ def render_intraday_service_final_report(data: dict[str, Any]) -> str:
         else:
             validation.append("수익권보유 근거 없음")
         plan = final_report_entry_plan(row, symbol_row, accumulation_row)
+        exit_plan = row.get("exit_plan") or {}
         action = str(row.get("action") or "관망")
         action_class = "decision-good" if action == "매수 후보" else "decision-bad" if action == "제외" else "decision-warn"
         rendered.append(
@@ -4792,6 +4880,9 @@ def render_intraday_service_final_report(data: dict[str, Any]) -> str:
             f"<td>{html.escape(str(row.get('buyer_count') or 0))}명<span class='muted block'>신뢰유저 {html.escape(str(row.get('reliable_buyer_count') or 0))}명</span>{buyers}</td>"
             f"<td class='{return_class(row.get('price_move_since_buy'))}'>{html.escape(pct(row.get('price_move_since_buy')))}"
             f"<span class='muted block'>현재 {html.escape(format_money(row.get('current_price'), row.get('current_price_currency') or 'USD'))} / 평균 {html.escape(format_money(row.get('average_buy_price'), row.get('current_price_currency') or 'USD'))}</span></td>"
+            f"<td>{html.escape(format_money(exit_plan.get('target_price'), row.get('current_price_currency') or 'USD'))}"
+            f"<span class='muted block'>목표 {html.escape(str(exit_plan.get('target_return_pct') if exit_plan.get('target_return_pct') is not None else '-'))}% · 손절 {html.escape(format_money(exit_plan.get('stop_price'), row.get('current_price_currency') or 'USD'))}</span>"
+            f"<span class='muted block'>현재가 기준 남은 여지 {html.escape(str(exit_plan.get('current_to_target_pct') if exit_plan.get('current_to_target_pct') is not None else '-'))}%</span></td>"
             f"<td>{'<br>'.join(validation)}</td>"
             f"<td><strong>{html.escape(plan)}</strong><span class='muted block'>{html.escape(str(row.get('chase_rule') or row.get('action_reason') or ''))}</span></td>"
             "</tr>"
@@ -4805,7 +4896,7 @@ def render_intraday_service_final_report(data: dict[str, Any]) -> str:
         f"<span>후보 {html.escape(str(recent_buy.get('recommendation_count') or 0))}개</span>"
         "</div>"
         "<p class='note'>이 리포트는 오늘볼것, AI브리핑, 종목분석, 수익권보유를 합쳐서 월요일 장초반에 무엇을 확인할지 보여줍니다. 여기서 바로 주문하지 말고 장초반 재스캔으로 같은 종목에 추가 매수가 붙는지 확인합니다.</p>"
-        "<div class='panel'><table class='rank-table'><thead><tr><th>#</th><th>종목</th><th>판정</th><th>점수</th><th>매수 유저</th><th>가격괴리</th><th>보조 근거</th><th>월요일 액션</th></tr></thead>"
+        "<div class='panel'><table class='rank-table'><thead><tr><th>#</th><th>종목</th><th>판정</th><th>점수</th><th>매수 유저</th><th>가격괴리</th><th>목표/손절</th><th>보조 근거</th><th>월요일 액션</th></tr></thead>"
         f"<tbody>{rows_html}</tbody></table></div>"
         "</div>"
     )
@@ -4874,13 +4965,15 @@ def render_snapshot_recent_rows(rows: list[dict[str, Any]]) -> str:
             f"<td>{html.escape(str(row.get('buyer_count') or 0))}명<span class='muted block'>신뢰 {html.escape(str(row.get('reliable_buyer_count') or 0))}명</span>{buyers}</td>"
             f"<td class='{return_class(row.get('price_move_since_buy'))}'>{html.escape(pct(row.get('price_move_since_buy')))}"
             f"<span class='muted block'>현재 {html.escape(format_money(row.get('current_price'), row.get('current_price_currency') or 'USD'))} / 평균 {html.escape(format_money(row.get('average_buy_price'), row.get('current_price_currency') or 'USD'))}</span></td>"
+            f"<td>{html.escape(format_money((row.get('exit_plan') or {}).get('target_price') or row.get('target_sell_price'), row.get('current_price_currency') or 'USD'))}"
+            f"<span class='muted block'>목표 {html.escape(str(row.get('target_return_pct') if row.get('target_return_pct') is not None else (row.get('exit_plan') or {}).get('target_return_pct') if (row.get('exit_plan') or {}).get('target_return_pct') is not None else '-'))}% · 손절 {html.escape(format_money((row.get('exit_plan') or {}).get('stop_price') or row.get('stop_loss_price'), row.get('current_price_currency') or 'USD'))}</span></td>"
             f"<td>{html.escape(str(row.get('chase_rule') or '-'))}</td>"
             "</tr>"
         )
     if not rendered:
         return "<p class='empty'>해당 구분의 후보가 없습니다.</p>"
     return (
-        "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>점수</th><th>매수 유저</th><th>가격괴리</th><th>판단 근거</th></tr></thead>"
+        "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>점수</th><th>매수 유저</th><th>가격괴리</th><th>목표/손절</th><th>판단 근거</th></tr></thead>"
         f"<tbody>{''.join(rendered)}</tbody></table>"
     )
 

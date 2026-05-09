@@ -273,6 +273,9 @@ COMMON_SYMBOL_ALIASES = {
     "루시드 그룹": "LCID",
     "리게티 컴퓨팅": "RGTI",
     "블룸 에너지": "BE",
+    "마이크로스트래티지": "MSTR",
+    "스트래티지": "MSTR",
+    "비트팜스": "BITF",
 }
 
 _TOSS_PRODUCT_CACHE: dict[str, Any] | None = None
@@ -474,7 +477,7 @@ def score_toss_product_item(item: dict[str, Any], symbol: str | None, stock_code
         score += 70.0
     if stock_code_norm and stock_code_norm in normalized_fields:
         score += 120.0
-    if item.get("market") in {"NSQ", "NYS", "AMS"}:
+    if item.get("market") in {"NSQ", "NYS", "AMS", "AMX"}:
         score += 12.0
     if item.get("market") in {"KSP", "KDQ"}:
         score += 6.0
@@ -516,7 +519,7 @@ def yahoo_symbols(symbol: str | None, stock_code: str | None = None) -> list[str
         toss_symbol = str(toss_product.get("symbol") or "").strip()
         product_code = str(toss_product.get("productCode") or toss_product.get("code") or "").strip()
         market = str(toss_product.get("market") or "").strip()
-        if toss_symbol and market in {"NSQ", "NYS", "AMS"} and re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,8}", toss_symbol):
+        if toss_symbol and market in {"NSQ", "NYS", "AMS", "AMX"} and re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,8}", toss_symbol):
             candidates.append(toss_symbol)
         if product_code and re.fullmatch(r"A\d{6}", product_code):
             kr_code = product_code[1:]
@@ -2053,6 +2056,8 @@ def load_backtest_row_cache() -> dict[str, dict[str, Any]]:
 
 
 def row_has_usable_horizons(row: dict[str, Any], horizons: list[int]) -> bool:
+    if row.get("status") == "quote_symbol_missing" and is_option_like_name(row.get("symbol")):
+        return True
     returns = row.get("returns") or {}
     now_utc = now_kst().astimezone(dt.timezone.utc)
     entry_time = parse_dt(row.get("entry_timestamp") or row.get("timestamp"))
@@ -2095,6 +2100,15 @@ def profile_strategy_report(
         else:
             row = backtest_event(event, horizons, chart_cache=chart_cache, disk_chart_cache=disk_chart_cache)
             recomputed += 1
+            if incremental and recomputed % 100 == 0:
+                if disk_chart_cache:
+                    chart_cache_write(disk_chart_cache)
+                PROFILE_BACKTEST_ROW_CACHE_PATH.write_text(json.dumps({
+                    "updated_at": now_kst().isoformat(),
+                    "mode": "profile-backtest-row-cache",
+                    "partial": True,
+                    "rows": list(row_cache.values()),
+                }, ensure_ascii=False), encoding="utf-8")
         row["backtest_cache_key"] = key
         rows.append(row)
         row_cache[key] = row

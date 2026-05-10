@@ -42,18 +42,59 @@ python .\public_stock_models.py --unified-dashboard
 
 For Monday morning use, refresh the scan first, then review:
 
-1. `오늘 볼 것`
+1. `운영 개요`
+2. `장중 판단`
+3. `AI 브리핑`
+4. `종목 컨펌`
+5. `유저 모델`
+6. `리포트 보관함`
+
+The dashboard is organized around three layers:
+
+- Data collection: public feed, stock community, user trade history, user holdings, price data, Toss stock analytics, transaction status, and news.
+- Model and scoring: user reliability, short-term trader score, symbol backtest, recent-buy recommendation, holding accumulation, and stock confirmation.
+- User-facing services: intraday recommendation, user ranking, stock confirmation, holding accumulation, operation reports, and pipeline/data catalog.
+
+## Data Collection Process
+
+1. Candidate discovery: collect profile IDs from public feeds and stock communities.
+2. Access filter: check whether the trade tab is readable and whether the user has recent activity.
+3. Deep scan: read up to three trade-history pages for accessible profiles and collect holdings where available.
+4. Normalization: remove duplicate events, split leverage/inverse products, resolve missing Toss product codes, and match current prices.
+5. Backtest: evaluate BUY events over 1h, 4h, 8h, 1d, 3d, 5d, and 7d windows.
+6. User ranking: combine win rate, average return, sample count, recency, concentration, leverage exposure, and holding risk.
+7. Intraday scan: watch the top 200 users for fresh buys and turn them into recommendations.
+8. Stock confirmation: confirm user signals with trading amount, trading strength, foreign/institution flow, stability, dividend, and news context.
+9. Report archive: write each run as a final report so an agent can execute while the user reviews only outcomes.
+
+## Services
+
+- `운영 개요`: what the system is doing, how much data exists, and what to run next.
+- `장중 판단`: the main work surface during market hours. It shows buy/watch/exclude candidates.
+- `AI 브리핑`: AI-readable decision packets that explain why a score should or should not be trusted.
+- `종목 모델`: symbol-level backtest based on historical user trades.
+- `종목 컨펌`: user-buy signals checked against public stock analytics and transaction-status data.
+- `수익권 보유`: stocks that high-quality users still hold while profitable.
+- `유저 모델`: short-term and overall user rankings with detailed dialogs.
+- `리포트 보관함`: final reports for each action, preserved like posts.
+- `데이터·서비스`: current data catalog and service map.
+- `리스크`: holdings-based user risk review.
+- `파이프라인`: collection and scoring process state.
+
+Previous tab names mapped as follows:
+
+1. `오늘 볼 것` -> `장중 판단`
 2. `AI 브리핑`
-3. `운영 리포트`
-4. `종목 분석`
+3. `운영 리포트` -> `리포트 보관함`
+4. `종목 분석` -> `종목 모델`
 5. `수익권 보유`
-6. `유저 랭킹`
+6. `유저 랭킹` -> `유저 모델`
 
 The `AI 브리핑` tab and `public_model_data/ai_decision_brief.md` are designed for Claude Code. They summarize which signals are actionable, which ones are chase-risk, and when a stock has already moved too far above the tracked users' buy price.
 
 ## Operation Reports
 
-Every completed CLI action now appends a compact final report to `public_model_data/_internal/operation_reports.json`. The generated dashboard reads that file and shows the history in the `운영 리포트` tab.
+Every completed CLI action now appends a compact final report to `public_model_data/_internal/operation_reports.json`. The generated dashboard reads that file and shows the history in the `리포트 보관함` tab.
 
 This lets an agent run the daily workflow while you review only the final action report:
 

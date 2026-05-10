@@ -17,6 +17,7 @@ session headers, and still avoids account/order/trading endpoints.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import html
 import json
@@ -53,6 +54,8 @@ PROFILE_HOLDINGS_REPORT_PATH = RAW_DATA_DIR / "profile_holdings_report.json"
 PROFILE_BACKTEST_ROW_CACHE_PATH = RAW_DATA_DIR / "profile_backtest_row_cache.json"
 CHART_CACHE_PATH = RAW_DATA_DIR / "chart_cache.json"
 TOSS_PRODUCT_SEARCH_CACHE_PATH = RAW_DATA_DIR / "toss_product_search_cache.json"
+STOCK_CONFIRMATION_CACHE_PATH = RAW_DATA_DIR / "stock_confirmation_cache.json"
+STOCK_CONFIRMATION_CACHE_VERSION = 2
 DAILY_PROFILE_SCAN_PATH = RAW_DATA_DIR / "daily_profile_scan.json"
 DAILY_PROFILE_EVENTS_PATH = RAW_DATA_DIR / "daily_profile_events.json"
 RECENT_BUY_REPORT_PATH = RAW_DATA_DIR / "recent_buy_report.json"
@@ -71,6 +74,8 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 public-research-bot/0.1",
 }
 TOSS_PRODUCT_SEARCH_URL = "https://wts-info-api.tossinvest.com/api/v3/search-all/wts-auto-complete"
+TOSS_STOCK_INFO_BASE_URL = "https://wts-info-api.tossinvest.com"
+TOSS_STOCK_CERT_BASE_URL = "https://wts-cert-api.tossinvest.com"
 TOSS_PUBLIC_SEARCH_HEADERS = {
     "accept": "application/json",
     "accept-language": "ko,en;q=0.9,en-US;q=0.8",
@@ -81,6 +86,13 @@ TOSS_PUBLIC_SEARCH_HEADERS = {
     "referer": "https://www.tossinvest.com/",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0",
     "x-toss-os": "Windows",
+}
+TOSS_PUBLIC_JSON_HEADERS = {
+    "accept": "application/json",
+    "accept-language": "ko,en;q=0.9,en-US;q=0.8",
+    "origin": "https://www.tossinvest.com",
+    "referer": "https://www.tossinvest.com/",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0",
 }
 
 SENSITIVE_HEADER_NAMES = {
@@ -328,6 +340,33 @@ def fetch_json_with_headers(
             if attempt < retries:
                 time.sleep(1.2 * (attempt + 1))
     raise RuntimeError(f"failed to fetch authenticated read-only URL {url}: {last_error}")
+
+
+def fetch_public_toss_json(
+    url: str,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    referer: str | None = None,
+    retries: int = 1,
+) -> dict[str, Any] | None:
+    headers = dict(TOSS_PUBLIC_JSON_HEADERS)
+    if referer:
+        headers["referer"] = referer
+    body = None
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["content-type"] = "application/json"
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(0.5 * (attempt + 1))
+    return {"_error": str(last_error)}
 
 
 def headers_from_curl_file(path: str) -> dict[str, str]:
@@ -3077,6 +3116,540 @@ def write_artifact(internal_path: Path, public_path: Path, payload: Any) -> None
         public_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    last_error: Exception | None = None
+    for attempt in range(8):
+        try:
+            tmp_path.replace(path)
+            return
+        except (PermissionError, OSError) as exc:
+            last_error = exc
+            time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError(f"failed to replace JSON artifact {path}: {last_error}")
+
+
+def stock_confirmation_cache_load() -> dict[str, Any]:
+    return read_json_file(STOCK_CONFIRMATION_CACHE_PATH, {"items": {}}) or {"items": {}}
+
+
+def stock_confirmation_cache_write(cache: dict[str, Any]) -> None:
+    RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    STOCK_CONFIRMATION_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def toss_product_code_for_symbol(symbol: str | None, stock_code: str | None = None) -> tuple[str | None, dict[str, Any] | None]:
+    product = resolve_toss_product(symbol, stock_code)
+    if not product:
+        return None, None
+    product_code = str(product.get("productCode") or product.get("code") or "").strip()
+    if not product_code:
+        return None, product
+    return product_code, product
+
+
+def net_volume_sum(section: dict[str, Any] | None) -> int | None:
+    rows = (((section or {}).get("detail") or {}).get("dailyNetVolumes") or [])
+    values = [row.get("netBuyVolume") for row in rows if isinstance(row, dict) and row.get("netBuyVolume") is not None]
+    if not values:
+        return None
+    return int(sum(values))
+
+
+def header_section(header: dict[str, Any], section_type: str) -> dict[str, Any]:
+    for section in header.get("sections") or []:
+        if isinstance(section, dict) and section.get("type") == section_type:
+            return section
+    return {}
+
+
+def money_value(payload: dict[str, Any] | None) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("krw", "usd", "value"):
+        value = payload.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def build_price_review(recent_context: dict[str, Any] | None, price_snapshot: dict[str, Any]) -> dict[str, Any]:
+    review: dict[str, Any] = {
+        "source": "toss_header",
+        "current_price": price_snapshot.get("close"),
+        "currency": price_snapshot.get("currency"),
+        "high_52w": price_snapshot.get("high_52w"),
+        "low_52w": price_snapshot.get("low_52w"),
+        "status": "참고",
+        "memo": "최근매수 추천과 직접 연결된 평균 매수가가 없어 수급/뉴스 확인용으로만 봅니다.",
+    }
+    if not recent_context:
+        return review
+    avg_buy_price = recent_context.get("average_buy_price")
+    current_price = recent_context.get("current_price")
+    gap_pct = recent_context.get("price_move_since_buy_pct")
+    target_price = recent_context.get("target_sell_price")
+    stop_price = recent_context.get("stop_loss_price")
+    status = "진입검토"
+    memo = "유저 평균 매수가와 현재가 괴리가 작아 장초반 재확인 후보입니다."
+    try:
+        gap_number = float(gap_pct)
+    except (TypeError, ValueError):
+        gap_number = None
+    if gap_number is not None:
+        if gap_number >= 3.0:
+            status = "추격주의"
+            memo = "유저 평균 매수가보다 이미 3% 이상 올라 신규 진입 기대수익이 줄었습니다."
+        elif gap_number <= -2.0:
+            status = "눌림확인"
+            memo = "유저 평균 매수가보다 낮아졌습니다. 하락 이유와 손절 기준을 먼저 확인합니다."
+    return {
+        "source": "recent_buy",
+        "average_buy_price": avg_buy_price,
+        "current_price": current_price,
+        "currency": recent_context.get("current_price_currency") or price_snapshot.get("currency"),
+        "gap_pct": gap_pct,
+        "target_price": target_price,
+        "stop_price": stop_price,
+        "current_to_target_pct": recent_context.get("current_to_target_pct"),
+        "latest_buy_at": recent_context.get("latest_buy_at"),
+        "price_gap_label": recent_context.get("price_gap_label"),
+        "status": status,
+        "memo": memo,
+    }
+
+
+def stock_confirmation_score(header: dict[str, Any], details: dict[str, Any], stability: dict[str, Any], stock_news_count: int) -> tuple[float, str, list[str]]:
+    score = 50.0
+    flags: list[str] = []
+    foreign_net = net_volume_sum(details.get("FOREIGNER"))
+    institution_net = net_volume_sum(details.get("INSTITUTION"))
+    trading_strength = ((details.get("TRADING_STRENGTH") or {}).get("tradingStrength"))
+    trading_rank = ((details.get("TRADING_AMOUNT") or {}).get("ranking"))
+    if foreign_net is not None:
+        score += 8 if foreign_net > 0 else -8
+        flags.append("외국인 순매수" if foreign_net > 0 else "외국인 순매도")
+    if institution_net is not None:
+        score += 10 if institution_net > 0 else -10
+        flags.append("기관 순매수" if institution_net > 0 else "기관 순매도")
+    if trading_strength is not None:
+        strength = float(trading_strength)
+        if strength >= 115:
+            score += 10
+            flags.append("체결강도 강함")
+        elif strength >= 100:
+            score += 5
+            flags.append("매수 우위")
+        elif strength < 90:
+            score -= 7
+            flags.append("체결 약함")
+    if trading_rank is not None:
+        rank = int(trading_rank)
+        if rank <= 30:
+            score += 8
+            flags.append("거래대금 상위")
+        elif rank <= 100:
+            score += 4
+    position = stability.get("position")
+    if position == "LOW":
+        score += 4
+        flags.append("재무 안정 양호")
+    elif position == "HIGH":
+        score -= 5
+        flags.append("재무 안정 주의")
+    if stock_news_count >= 3:
+        score += 3
+        flags.append("종목뉴스 활발")
+    if foreign_net is not None and institution_net is not None and foreign_net < 0 and institution_net < 0:
+        score -= 8
+        flags.append("수급 동반 이탈")
+    score = round(max(0.0, min(100.0, score)), 1)
+    if score >= 70:
+        decision = "컨펌 강함"
+    elif score >= 55:
+        decision = "중립 확인"
+    else:
+        decision = "주의"
+    return score, decision, flags
+
+
+def fetch_stock_confirmation_item(symbol: str, stock_code: str | None = None, recent_context: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if is_option_like_name(symbol) or symbol in LEVERAGED_SYMBOLS:
+        return None
+    product_code, product = toss_product_code_for_symbol(symbol, stock_code)
+    if not product_code:
+        return None
+    referer = f"https://www.tossinvest.com/stocks/{urllib.parse.quote(product_code)}/analytics"
+    urls = {
+        "header": f"{TOSS_STOCK_INFO_BASE_URL}/api/v1/stock-infos/header/{urllib.parse.quote(product_code)}",
+        "overview": f"{TOSS_STOCK_INFO_BASE_URL}/api/v2/stock-infos/{urllib.parse.quote(product_code)}/overview",
+        "stability": f"{TOSS_STOCK_INFO_BASE_URL}/api/v2/stock-infos/stability/{urllib.parse.quote(product_code)}",
+        "dividend": f"{TOSS_STOCK_INFO_BASE_URL}/api/v1/stock-infos/dividend/{urllib.parse.quote(product_code)}/years",
+        "news": f"{TOSS_STOCK_CERT_BASE_URL}/api/v1/feed/news/posts?stockCode={urllib.parse.quote(product_code)}",
+    }
+    header = (fetch_public_toss_json(urls["header"], referer=referer) or {}).get("result") or {}
+    overview = (fetch_public_toss_json(urls["overview"], referer=referer) or {}).get("result") or {}
+    stability = (fetch_public_toss_json(urls["stability"], method="POST", payload={}, referer=referer) or {}).get("result") or {}
+    dividend = (fetch_public_toss_json(urls["dividend"], referer=referer) or {}).get("result") or {}
+    details: dict[str, Any] = {}
+    for section_type in ("TRADING_AMOUNT", "TRADING_STRENGTH", "FOREIGNER", "INSTITUTION", "MARKET_CAP_RANKING", "MARKET_CAP_PORTION"):
+        detail_url = f"{urls['header']}/detail?type={urllib.parse.quote(section_type)}"
+        detail = (fetch_public_toss_json(detail_url, referer=f"https://www.tossinvest.com/stocks/{urllib.parse.quote(product_code)}/transaction-status") or {}).get("result") or {}
+        if isinstance(detail.get("sections"), dict):
+            details[section_type] = detail["sections"]
+    news_result = (fetch_public_toss_json(urls["news"], referer=f"https://www.tossinvest.com/stocks/{urllib.parse.quote(product_code)}/news?menu=news") or {}).get("result") or {}
+    news_items = []
+    market_headlines = []
+    for section in news_result.get("sections") or []:
+        news_type = section.get("newsType")
+        for item in section.get("news") or []:
+            if isinstance(item, dict):
+                normalized_news = {
+                    "title": item.get("title"),
+                    "agency": item.get("newsAgency"),
+                    "published_at": item.get("publishedAt") or item.get("createdAt"),
+                    "url": item.get("linkUrl") or item.get("url"),
+                    "news_type": news_type,
+                }
+                if news_type in {"HEADLINE", "PERSONAL"}:
+                    market_headlines.append(normalized_news)
+                else:
+                    news_items.append(normalized_news)
+    score, decision, flags = stock_confirmation_score(header, details, stability, len(news_items))
+    price_section = header_section(header, "PRICE")
+    close = price_section.get("close") or {}
+    price_snapshot = {
+        "close": money_value(close),
+        "currency": "KRW" if isinstance(close, dict) and close.get("krw") is not None else "USD" if isinstance(close, dict) and close.get("usd") is not None else None,
+        "high": money_value(price_section.get("high")),
+        "low": money_value(price_section.get("low")),
+        "high_52w": money_value(price_section.get("high52w")),
+        "low_52w": money_value(price_section.get("low52w")),
+    }
+    company = overview.get("company") or {}
+    dividend_histories = dividend.get("histories") or []
+    latest_dividend = dividend_histories[-1] if dividend_histories else {}
+    return {
+        "symbol": symbol,
+        "product_code": product_code,
+        "product_name": (product or {}).get("productName") or company.get("name") or symbol,
+        "market": ((product or {}).get("market") or (overview.get("market") or {}).get("code")),
+        "generated_at": now_kst().isoformat(),
+        "score": score,
+        "decision": decision,
+        "flags": flags,
+        "price_snapshot": price_snapshot,
+        "price_review": build_price_review(recent_context, price_snapshot),
+        "overview": {
+            "company_name": company.get("name"),
+            "industry": ((company.get("wics") or {}).get("displayName") or (company.get("industry") or {}).get("displayName")),
+            "description": company.get("description"),
+            "market_value_krw": overview.get("marketValueKrw") or overview.get("marketValue"),
+            "shares_outstanding": overview.get("sharesOutstanding"),
+        },
+        "flow": {
+            "trading_amount_rank": (details.get("TRADING_AMOUNT") or {}).get("ranking"),
+            "trading_amount_krw": (((details.get("TRADING_AMOUNT") or {}).get("detail") or {}).get("tradingAmount") or {}).get("krw"),
+            "trading_strength": (details.get("TRADING_STRENGTH") or {}).get("tradingStrength"),
+            "foreign_5d_net_volume": net_volume_sum(details.get("FOREIGNER")),
+            "institution_5d_net_volume": net_volume_sum(details.get("INSTITUTION")),
+            "foreign_rank_buy": (details.get("FOREIGNER") or {}).get("netBuyVolumeRanking"),
+            "foreign_rank_sell": (details.get("FOREIGNER") or {}).get("netSellVolumeRanking"),
+            "institution_rank_buy": (details.get("INSTITUTION") or {}).get("netBuyVolumeRanking"),
+            "institution_rank_sell": (details.get("INSTITUTION") or {}).get("netSellVolumeRanking"),
+        },
+        "stability": stability,
+        "dividend": {
+            "selected_range": (dividend.get("selectedRange") or {}).get("displayName"),
+            "latest_cash": latest_dividend.get("cashKrw") or latest_dividend.get("cash"),
+            "latest_yield_ratio": latest_dividend.get("yieldRatio") or latest_dividend.get("ttmYieldRatio"),
+        },
+        "news": {
+            "stock_news_count": len(news_items),
+            "market_headline_count": len(market_headlines),
+            "headlines": news_items[:5],
+            "market_headlines": market_headlines[:5],
+        },
+        "links": {
+            "analytics": f"https://www.tossinvest.com/stocks/{product_code}/analytics",
+            "transaction_status": f"https://www.tossinvest.com/stocks/{product_code}/transaction-status",
+            "news": f"https://www.tossinvest.com/stocks/{product_code}/news?menu=news",
+        },
+    }
+
+
+def build_stock_confirmation_report(
+    recent_buy: dict[str, Any],
+    symbol_rankings: list[dict[str, Any]],
+    holding_accumulation_rankings: list[dict[str, Any]],
+    limit: int = 80,
+) -> dict[str, Any]:
+    cache = stock_confirmation_cache_load()
+    cache_items = cache.get("items") if isinstance(cache.get("items"), dict) else {}
+    recent_context_by_symbol = {
+        str(row.get("symbol") or "").upper(): row
+        for row in recent_buy.get("recommendations") or []
+        if row.get("symbol")
+    }
+    now = now_kst()
+    candidates: list[tuple[str, str | None, float]] = []
+    for index, row in enumerate(recent_buy.get("recommendations") or []):
+        candidates.append((str(row.get("symbol") or ""), row.get("stock_code"), 1000 - index))
+    for index, row in enumerate(symbol_rankings[:80]):
+        candidates.append((str(row.get("symbol") or ""), row.get("stock_code"), 700 - index))
+    for index, row in enumerate(holding_accumulation_rankings[:60]):
+        candidates.append((str(row.get("symbol") or ""), row.get("stock_code"), 500 - index))
+    best: dict[str, tuple[str, str | None, float]] = {}
+    for symbol, stock_code, priority in candidates:
+        if not symbol or symbol == "-" or is_option_like_name(symbol):
+            continue
+        key = symbol.upper()
+        if key in LEVERAGED_SYMBOLS:
+            continue
+        if key not in best or priority > best[key][2]:
+            best[key] = (symbol, stock_code, priority)
+    items: list[dict[str, Any]] = []
+    fetched = 0
+    cache_hits = 0
+    for key, (symbol, stock_code, _priority) in sorted(best.items(), key=lambda entry: entry[1][2], reverse=True)[:limit]:
+        cached = cache_items.get(key)
+        cached_at = parse_dt((cached or {}).get("generated_at") if isinstance(cached, dict) else None)
+        if (
+            isinstance(cached, dict)
+            and cached.get("cache_version") == STOCK_CONFIRMATION_CACHE_VERSION
+            and cached_at
+            and (now.astimezone(dt.timezone.utc) - cached_at).total_seconds() < 1800
+        ):
+            item = cached
+            cache_hits += 1
+        else:
+            item = fetch_stock_confirmation_item(symbol, stock_code, recent_context_by_symbol.get(key))
+            fetched += 1
+            if item:
+                item["cache_version"] = STOCK_CONFIRMATION_CACHE_VERSION
+                cache_items[key] = item
+        if item:
+            items.append(item)
+    items.sort(key=lambda row: (row.get("score") or 0), reverse=True)
+    output = {
+        "mode": "stock-confirmation-report",
+        "generated_at": now.isoformat(),
+        "candidate_count": len(best),
+        "confirmed_count": len(items),
+        "cache_hits": cache_hits,
+        "fetched_count": fetched,
+        "items": items,
+    }
+    cache["updated_at"] = output["generated_at"]
+    cache["items"] = cache_items
+    stock_confirmation_cache_write(cache)
+    return output
+
+
+def clamp_score(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    return max(low, min(high, value))
+
+
+def price_timing_score(price_move_pct: Any) -> tuple[float, str]:
+    if price_move_pct is None:
+        return 50.0, "현재가/평균매수가 괴리 확인 불가"
+    gap = float(price_move_pct)
+    if gap <= -0.05:
+        return 35.0, "유저 평균가보다 크게 밀려 하락 사유 확인 필요"
+    if gap <= -0.02:
+        return 55.0, "유저 평균가보다 낮아졌지만 눌림 확인 필요"
+    if gap <= 0.015:
+        return 82.0, "유저 평균가와 가까워 추격 부담 낮음"
+    if gap <= 0.03:
+        return 65.0, "소폭 상승 구간, 장초반 체결가 재확인 필요"
+    if gap <= 0.05:
+        return 42.0, "이미 3% 이상 올라 신규 진입 매력 감소"
+    return 25.0, "유저 매수가 대비 과열, 추격 금지 우선"
+
+
+def symbol_model_ai_score(symbol_row: dict[str, Any] | None) -> tuple[float, str]:
+    if not symbol_row:
+        return 50.0, "종목 모델 검증 없음"
+    score = 50.0
+    avg_return = symbol_row.get("avg_return")
+    win_rate = symbol_row.get("win_rate")
+    tested = int(symbol_row.get("tested_returns") or 0)
+    trusted = int(symbol_row.get("trusted_author_count") or 0)
+    if avg_return is not None:
+        score += max(-18.0, min(18.0, float(avg_return) * 350))
+    if win_rate is not None:
+        score += (float(win_rate) - 0.5) * 35
+    score += min(12.0, math.log1p(max(0, tested)) / math.log(250) * 12)
+    score += min(8.0, trusted / 20 * 8)
+    if symbol_row.get("decision") == "제외":
+        score -= 15
+    elif symbol_row.get("decision") == "관심":
+        score += 6
+    reason = (
+        f"종목 검증 {tested}건, 평균 {format_plain_pct((float(avg_return) * 100) if avg_return is not None else None)}, "
+        f"승률 {pct(win_rate)}"
+    )
+    return round(clamp_score(score), 1), reason
+
+
+def accumulation_ai_score(accumulation_row: dict[str, Any] | None) -> tuple[float, str]:
+    if not accumulation_row:
+        return 50.0, "수익권 보유 데이터 없음"
+    holder_count = int(accumulation_row.get("holder_count") or 0)
+    positive_ratio = float(accumulation_row.get("positive_holder_ratio") or 0.0)
+    avg_unrealized = accumulation_row.get("avg_unrealized_return")
+    score = 45.0 + min(18.0, holder_count / 20 * 18) + positive_ratio * 25
+    if avg_unrealized is not None:
+        score += max(-10.0, min(12.0, float(avg_unrealized) * 20))
+    if accumulation_row.get("decision") == "축적 관심":
+        score += 6
+    elif accumulation_row.get("decision") == "수익권 약함":
+        score -= 8
+    reason = (
+        f"수익권 보유 {accumulation_row.get('positive_holder_count') or 0}/{holder_count}명, "
+        f"평균 미실현 {pct(avg_unrealized)}"
+    )
+    return round(clamp_score(score), 1), reason
+
+
+def confirmation_ai_score(confirmation_row: dict[str, Any] | None) -> tuple[float, str]:
+    if not confirmation_row:
+        return 50.0, "공개시장 컨펌 없음"
+    flow = confirmation_row.get("flow") or {}
+    news = confirmation_row.get("news") or {}
+    base = float(confirmation_row.get("score") or 50.0)
+    score = base
+    trading_strength = flow.get("trading_strength")
+    trading_rank = flow.get("trading_amount_rank")
+    stock_news_count = int(news.get("stock_news_count") or 0)
+    if trading_strength is not None and float(trading_strength) >= 110:
+        score += 5
+    if trading_rank is not None and int(trading_rank) <= 30:
+        score += 4
+    if stock_news_count >= 3:
+        score += 3
+    if confirmation_row.get("decision") == "주의":
+        score -= 8
+    reason = (
+        f"{confirmation_row.get('decision') or '중립'}, 거래대금 {trading_rank if trading_rank is not None else '-'}위, "
+        f"거래강도 {trading_strength if trading_strength is not None else '-'}%, 뉴스 {stock_news_count}건"
+    )
+    return round(clamp_score(score), 1), reason
+
+
+def build_ai_composite_judgment(
+    row: dict[str, Any],
+    symbol_row: dict[str, Any] | None,
+    accumulation_row: dict[str, Any] | None,
+    confirmation_row: dict[str, Any] | None,
+) -> dict[str, Any]:
+    user_score = float(row.get("score") or 0.0)
+    price_score, price_reason = price_timing_score(row.get("price_move_since_buy"))
+    symbol_score, symbol_reason = symbol_model_ai_score(symbol_row)
+    accumulation_score, accumulation_reason = accumulation_ai_score(accumulation_row)
+    confirmation_score, confirmation_reason = confirmation_ai_score(confirmation_row)
+    external_score = (
+        price_score * 0.30
+        + confirmation_score * 0.30
+        + symbol_score * 0.25
+        + accumulation_score * 0.15
+    )
+    composite = user_score * 0.55 + external_score * 0.45
+    risk_notes = []
+    if row.get("chase_decision") in {"관망", "추격금지"}:
+        risk_notes.append("가격 추격주의")
+        composite -= 4
+    if confirmation_row and confirmation_row.get("decision") == "주의":
+        risk_notes.append("공개시장 컨펌 약함")
+        composite -= 3
+    if symbol_row and symbol_row.get("decision") == "제외":
+        risk_notes.append("종목 과거검증 약함")
+        composite -= 4
+    composite = round(clamp_score(composite), 1)
+    external_score = round(clamp_score(external_score), 1)
+    if composite >= 72 and row.get("action") != "제외":
+        verdict = "매수검토"
+    elif composite >= 62 and row.get("action") != "제외":
+        verdict = "관망우선"
+    elif composite >= 52:
+        verdict = "재확인"
+    else:
+        verdict = "제외우선"
+    reason_bits = [
+        f"유저신호 {user_score:.1f}점",
+        f"외부데이터 {external_score:.1f}점",
+        price_reason,
+        confirmation_reason,
+        symbol_reason,
+        accumulation_reason,
+    ]
+    if risk_notes:
+        reason_bits.append("주의: " + ", ".join(risk_notes))
+    return {
+        "user_signal_score": round(user_score, 1),
+        "external_data_score": external_score,
+        "ai_composite_score": composite,
+        "ai_verdict": verdict,
+        "ai_reason": " / ".join(reason_bits),
+        "ai_score_parts": {
+            "price_timing": round(price_score, 1),
+            "market_confirmation": round(confirmation_score, 1),
+            "symbol_model": round(symbol_score, 1),
+            "holding_accumulation": round(accumulation_score, 1),
+        },
+        "ai_inputs": {
+            "price": price_reason,
+            "market": confirmation_reason,
+            "symbol_model": symbol_reason,
+            "holding_accumulation": accumulation_reason,
+            "risk_notes": risk_notes,
+        },
+    }
+
+
+def enrich_recent_buy_with_ai_scores(
+    recent_buy: dict[str, Any],
+    symbol_rankings: list[dict[str, Any]],
+    holding_accumulation_rankings: list[dict[str, Any]],
+    stock_confirmation: dict[str, Any],
+) -> dict[str, Any]:
+    if not recent_buy:
+        return recent_buy
+    output = copy.deepcopy(recent_buy)
+    symbol_index = index_by_symbol(symbol_rankings)
+    accumulation_index = index_by_symbol(holding_accumulation_rankings)
+    confirmation_index = index_by_symbol((stock_confirmation or {}).get("items") or [])
+    for row in output.get("recommendations") or []:
+        key = normalize_symbol_key(row.get("symbol"))
+        judgment = build_ai_composite_judgment(
+            row,
+            symbol_index.get(key),
+            accumulation_index.get(key),
+            confirmation_index.get(key),
+        )
+        row.update(judgment)
+    output["ai_composite_scoring"] = {
+        "version": "external-data-blend-v1",
+        "description": "기존 유저신호 점수는 그대로 보존하고, 가격괴리/공개시장 컨펌/종목모델/수익권 보유를 별도 AI 종합점수로 계산한다.",
+        "weights": {
+            "ai_composite": {"user_signal": 55, "external_data": 45},
+            "external_data": {
+                "price_timing": 30,
+                "market_confirmation": 30,
+                "symbol_model": 25,
+                "holding_accumulation": 15,
+            },
+        },
+    }
+    return output
+
+
 def current_operation_name(args: argparse.Namespace) -> str:
     ordered_flags = [
         ("daily_profile_scan", "장중 거래 스캔"),
@@ -3208,6 +3781,12 @@ def compact_recent_buy_snapshot(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "symbol": row.get("symbol"),
         "score": row.get("score"),
+        "user_signal_score": row.get("user_signal_score"),
+        "external_data_score": row.get("external_data_score"),
+        "ai_composite_score": row.get("ai_composite_score"),
+        "ai_verdict": row.get("ai_verdict"),
+        "ai_reason": row.get("ai_reason"),
+        "ai_score_parts": row.get("ai_score_parts"),
         "action": row.get("action"),
         "chase_decision": row.get("chase_decision"),
         "chase_rule": row.get("chase_rule") or row.get("action_reason"),
@@ -3714,6 +4293,13 @@ def build_unified_invest_data() -> dict[str, Any]:
     symbol_trade_rankings = build_symbol_trade_rankings(strategy, final_user_rankings)
     scan_targets = load_daily_scan_profiles(200)
     holding_accumulation_rankings = build_holding_accumulation_rankings(holdings, final_user_rankings, scan_targets)
+    stock_confirmation = build_stock_confirmation_report(recent_buy, symbol_trade_rankings, holding_accumulation_rankings)
+    recent_buy = enrich_recent_buy_with_ai_scores(
+        recent_buy,
+        symbol_trade_rankings,
+        holding_accumulation_rankings,
+        stock_confirmation,
+    )
     daily_holdings = ((daily_scan.get("holdings") or {}).get("profiles") or [])
     market_status = market_session_status()
     deep_scan = history.get("deep_scan") or {}
@@ -3765,6 +4351,7 @@ def build_unified_invest_data() -> dict[str, Any]:
             "final_ranked_user_count": len(final_user_rankings),
             "symbol_trade_ranked_count": len(symbol_trade_rankings),
             "holding_accumulation_ranked_count": len(holding_accumulation_rankings),
+            "stock_confirmation_count": stock_confirmation.get("confirmed_count", 0),
             "top_author_count": len(top_authors),
             "scan_target_count": len(scan_targets),
             "daily_scanned_profile_count": daily_scan.get("scanned_profile_count", 0),
@@ -3785,6 +4372,7 @@ def build_unified_invest_data() -> dict[str, Any]:
         "final_user_rankings": final_user_rankings,
         "symbol_trade_rankings": symbol_trade_rankings,
         "holding_accumulation_rankings": holding_accumulation_rankings,
+        "stock_confirmation": stock_confirmation,
         "planned_scan_targets": scan_targets,
         "profile_holdings": holdings,
         "daily_profile_scan": daily_scan,
@@ -3817,14 +4405,46 @@ def build_unified_invest_data() -> dict[str, Any]:
         ],
     }
     unified["ai_decision_brief"] = build_ai_decision_brief(unified)
-    UNIFIED_DATA_PATH.write_text(json.dumps(unified, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_file(UNIFIED_DATA_PATH, unified)
     return unified
 
 
 def render_unified_recent_buys(recent_buy: dict[str, Any]) -> str:
     rows = []
-    recommendations = recent_buy.get("recommendations") or []
-    for index, item in enumerate(recommendations[:20], start=1):
+    recommendations = sorted(
+        recent_buy.get("recommendations") or [],
+        key=lambda row: (
+            {"매수 후보": 3, "관망": 2, "제외": 1}.get(str(row.get("action") or ""), 0),
+            float(row.get("ai_composite_score") or row.get("score") or 0),
+            float(row.get("score") or 0),
+        ),
+        reverse=True,
+    )
+    all_recommendations = recent_buy.get("recommendations") or []
+    ai_buy_count = len([row for row in all_recommendations if row.get("ai_verdict") == "매수검토"])
+    watch_count = len([row for row in all_recommendations if row.get("ai_verdict") in {"관망우선", "재확인"}])
+    blocked_count = len([row for row in all_recommendations if row.get("ai_verdict") == "제외우선" or row.get("action") == "제외"])
+    top_item = max(all_recommendations, key=lambda row: float(row.get("ai_composite_score") or row.get("score") or 0), default={})
+    summary_html = (
+        "<div class='analysis-summary'>"
+        "<div><span>최근 창</span>"
+        f"<strong>{html.escape(str(recent_buy.get('window_hours') or '-'))}시간</strong></div>"
+        "<div><span>전체 후보</span>"
+        f"<strong>{len(all_recommendations):,}개</strong></div>"
+        "<div><span>AI 매수검토</span>"
+        f"<strong>{ai_buy_count:,}개</strong></div>"
+        "<div><span>관망/재확인</span>"
+        f"<strong>{watch_count:,}개</strong></div>"
+        "<div><span>제외/추격금지</span>"
+        f"<strong>{blocked_count:,}개</strong></div>"
+        "<div><span>최상단 후보</span>"
+        f"<strong>{html.escape(str(top_item.get('symbol') or '-'))}</strong>"
+        f"<em>AI {html.escape(str(top_item.get('ai_composite_score') if top_item.get('ai_composite_score') is not None else '-'))} · 유저 {html.escape(str(top_item.get('score') or '-'))}</em></div>"
+        "</div>"
+    )
+    for index, item in enumerate(recommendations[:60], start=1):
+        symbol_text = str(item.get("symbol") or "-")
+        symbol_key = normalize_symbol_key(item.get("symbol") or item.get("stock_code") or symbol_text)
         buyer_profiles = item.get("buyer_profiles") or []
         if buyer_profiles:
             buyers = " ".join(
@@ -3844,11 +4464,13 @@ def render_unified_recent_buys(recent_buy: dict[str, Any]) -> str:
         rows.append(
             "<tr>"
             f"<td>{index}</td>"
-            f"<td><strong>{html.escape(str(item.get('symbol') or '-'))}</strong><span class='muted'>{tags}</span></td>"
+            f"<td><button type='button' class='symbol-link' data-symbol-detail='{html.escape(symbol_key)}'>{html.escape(symbol_text)}</button><span class='muted'>{tags}</span></td>"
             f"<td><span class='decision {action_class}'>{html.escape(action)}</span><span class='muted'>{html.escape(str(item.get('action_reason') or ''))}</span></td>"
             f"<td><strong>{html.escape(str(item.get('chase_decision') or '-'))}</strong><span class='muted'>{html.escape(str(item.get('chase_rule') or ''))}</span>"
             f"<span class='muted'>허용괴리 {html.escape(str(item.get('max_chase_gap_pct') if item.get('max_chase_gap_pct') is not None else '-'))}% · 비중 {html.escape(str(item.get('position_scale') if item.get('position_scale') is not None else '-'))}</span></td>"
-            f"<td>{html.escape(str(item.get('score') or '-'))}<span class='muted'>raw {html.escape(str(item.get('raw_score') or '-'))}</span></td>"
+            f"<td>{html.escape(str(item.get('score') or '-'))}<span class='muted'>유저신호 raw {html.escape(str(item.get('raw_score') or '-'))}</span></td>"
+            f"<td><strong>{html.escape(str(item.get('ai_composite_score') if item.get('ai_composite_score') is not None else '-'))}</strong><span class='muted'>{html.escape(str(item.get('ai_verdict') or '-'))}</span><span class='muted'>외부데이터 {html.escape(str(item.get('external_data_score') if item.get('external_data_score') is not None else '-'))}</span></td>"
+            f"<td>{html.escape(str(item.get('ai_reason') or '-'))}</td>"
             f"<td>{html.escape(str(item.get('buyer_count') or 0))}명"
             f"<span class='muted'>{html.escape(str(item.get('buyer_participation_pct') or 0))}% / {html.escape(str(item.get('eligible_profile_count') or '-'))}명</span></td>"
             f"<td>{html.escape(str(item.get('avg_user_reliability') or '-'))}</td>"
@@ -3864,15 +4486,21 @@ def render_unified_recent_buys(recent_buy: dict[str, Any]) -> str:
     if not rows:
         return "<p class='empty'>현재 설정한 최근 시간창 안에서는 매수 후보가 없습니다. 8시간/12시간 창으로 넓혀 확인하세요.</p>"
     header = (
-        "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>추격매수</th><th>점수</th><th>매수 유저</th><th>평균 신뢰도</th>"
+        "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>추격매수</th><th>유저신호</th><th>AI 종합</th><th>AI 판단 근거</th><th>매수 유저</th><th>평균 신뢰도</th>"
         "<th>매수 금액</th><th>1000만원 기준 1차</th><th>최근 매수</th><th>현재가/매수가</th><th>목표/손절 참고</th><th>유저 링크</th></tr></thead>"
     )
-    return f"{header}<tbody>{''.join(rows)}</tbody></table>"
+    return (
+        f"{summary_html}"
+        "<div class='x-scroll-proxy' data-scroll-proxy='recent-buy'><div></div></div>"
+        f"<div class='table-shell analysis-table' data-scroll-target='recent-buy'>{header}<tbody>{''.join(rows)}</tbody></table></div>"
+    )
 
 
 def render_symbol_trade_rankings(rankings: list[dict[str, Any]]) -> str:
     rows = []
     for index, item in enumerate(rankings[:100], start=1):
+        symbol_text = str(item.get("symbol") or "-")
+        symbol_key = normalize_symbol_key(item.get("symbol") or item.get("name") or symbol_text)
         users = " ".join(
             f"<span class='chip'>{html.escape(str(user.get('author') or '-'))} {html.escape(str(user.get('count') or 0))}</span>"
             for user in item.get("top_users") or []
@@ -3883,7 +4511,7 @@ def render_symbol_trade_rankings(rankings: list[dict[str, Any]]) -> str:
         rows.append(
             "<tr>"
             f"<td>{index}</td>"
-            f"<td><strong>{html.escape(str(item.get('symbol') or '-'))}</strong><span class='muted'>{html.escape(str(item.get('name') or ''))}</span><span class='muted'>{tags}</span></td>"
+            f"<td><button type='button' class='symbol-link' data-symbol-detail='{html.escape(symbol_key)}'>{html.escape(symbol_text)}</button><span class='muted'>{html.escape(str(item.get('name') or ''))}</span><span class='muted'>{tags}</span></td>"
             f"<td><span class='decision {decision_class}'>{html.escape(decision)}</span></td>"
             f"<td><strong>{html.escape(str(item.get('score') or '-'))}</strong><span class='muted'>비레버리지 기준</span></td>"
             f"<td>{html.escape(str(item.get('author_count') or 0))}명<span class='muted'>신뢰유저 {html.escape(str(item.get('trusted_author_count') or 0))}명</span></td>"
@@ -3907,6 +4535,8 @@ def render_symbol_trade_rankings(rankings: list[dict[str, Any]]) -> str:
 def render_holding_accumulation_rankings(rankings: list[dict[str, Any]]) -> str:
     rows = []
     for index, item in enumerate(rankings[:80], start=1):
+        symbol_text = str(item.get("symbol") or "-")
+        symbol_key = normalize_symbol_key(item.get("symbol") or item.get("name") or symbol_text)
         holders = " ".join(
             "<a class='chip' href='{url}' target='_blank' rel='noopener'>{name} {ret}</a>".format(
                 url=html.escape(str(holder.get("profile_url") or "#")),
@@ -3921,7 +4551,7 @@ def render_holding_accumulation_rankings(rankings: list[dict[str, Any]]) -> str:
         rows.append(
             "<tr>"
             f"<td>{index}</td>"
-            f"<td><strong>{html.escape(str(item.get('symbol') or '-'))}</strong><span class='muted'>{html.escape(str(item.get('name') or ''))}</span></td>"
+            f"<td><button type='button' class='symbol-link' data-symbol-detail='{html.escape(symbol_key)}'>{html.escape(symbol_text)}</button><span class='muted'>{html.escape(str(item.get('name') or ''))}</span></td>"
             f"<td><span class='decision {decision_class}'>{html.escape(decision)}</span></td>"
             f"<td><strong>{html.escape(str(item.get('score') or '-'))}</strong><span class='muted'>holdings 기준</span></td>"
             f"<td>{html.escape(str(item.get('holder_count') or 0))}명<span class='muted'>평균 비중 {html.escape(str(item.get('avg_weight') or 0))}%</span></td>"
@@ -3939,6 +4569,145 @@ def render_holding_accumulation_rankings(rankings: list[dict[str, Any]]) -> str:
     return (
         "<p class='note'>거래내역 추정이 아니라 holdings 스냅샷 기준입니다. 평균매수가와 현재 공개시세를 비교해, 수익권인데도 계속 들고 있는 유저가 많은 종목을 찾습니다. 비공개 매도/실시간 변동은 반영되지 않을 수 있습니다.</p>"
         "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>축적 점수</th><th>보유 유저</th><th>수익권 유저</th><th>평균 미실현</th><th>현재가</th><th>유저 평균점수</th><th>수익권 보유 유저</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def format_volume(value: Any) -> str:
+    if value is None:
+        return "-"
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return "-"
+    return f"{number:+,}"
+
+
+def format_plain_pct(value: Any) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):+.2f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def join_reason_parts(parts: list[str]) -> str:
+    return " ".join(part for part in parts if part)
+
+
+def stock_confirmation_ai_reason(item: dict[str, Any]) -> str:
+    flow = item.get("flow") or {}
+    price_review = item.get("price_review") or {}
+    news = item.get("news") or {}
+    flags = item.get("flags") or []
+    reason_parts = [
+        f"컨펌 {item.get('score', '-')}점({item.get('decision', '-')}).",
+    ]
+    status = price_review.get("status")
+    if status:
+        reason_parts.append(
+            f"가격은 {status}: 평균매수가 대비 {format_plain_pct(price_review.get('gap_pct'))}, "
+            f"현재가 기준 목표까지 {format_plain_pct(price_review.get('current_to_target_pct'))}."
+        )
+    strength = flow.get("trading_strength")
+    if strength is not None:
+        reason_parts.append(f"체결강도 {strength}%로 단기 수급을 확인.")
+    foreign_net = flow.get("foreign_5d_net_volume")
+    institution_net = flow.get("institution_5d_net_volume")
+    if foreign_net is not None or institution_net is not None:
+        reason_parts.append(
+            f"5일 수급은 외국인 {format_volume(foreign_net)}, 기관 {format_volume(institution_net)}."
+        )
+    if flags:
+        reason_parts.append("핵심 신호: " + ", ".join(str(flag) for flag in flags[:4]) + ".")
+    if news.get("stock_news_count"):
+        reason_parts.append(f"종목뉴스 {news.get('stock_news_count')}건 확인.")
+    elif news.get("market_headline_count"):
+        reason_parts.append("뉴스는 공통 헤드라인 위주라 점수 근거로 약하게만 봄.")
+    if status == "추격주의":
+        reason_parts.append("결론: 이미 오른 상태라 장초반 눌림 또는 추가 매수 확인 전까지 관망.")
+    elif item.get("decision") == "컨펌 강함" and status in {"진입검토", "눌림확인"}:
+        reason_parts.append("결론: 유저 신호와 시장 확인이 동시에 맞으면 소액 후보.")
+    elif item.get("decision") == "주의":
+        reason_parts.append("결론: 유저 신호가 있어도 공개 수급/가격 확인이 약해 우선순위 낮음.")
+    else:
+        reason_parts.append("결론: 단독 매수보다 월요일 재스캔에서 반복 매수가 붙는지 확인.")
+    return join_reason_parts(reason_parts)
+
+
+def render_stock_confirmation(stock_confirmation: dict[str, Any]) -> str:
+    items = stock_confirmation.get("items") or []
+    rows = []
+    for index, item in enumerate(items[:80], start=1):
+        symbol_text = str(item.get("symbol") or "-")
+        symbol_key = normalize_symbol_key(item.get("symbol") or item.get("product_name") or item.get("product_code") or symbol_text)
+        decision = str(item.get("decision") or "중립 확인")
+        decision_class = "decision-good" if decision == "컨펌 강함" else "decision-bad" if decision == "주의" else "decision-warn"
+        flow = item.get("flow") or {}
+        overview = item.get("overview") or {}
+        stability = item.get("stability") or {}
+        dividend = item.get("dividend") or {}
+        news = item.get("news") or {}
+        links = item.get("links") or {}
+        price_review = item.get("price_review") or {}
+        price_currency = str(price_review.get("currency") or "KRW")
+        price_review_html = (
+            f"<strong>{html.escape(str(price_review.get('status') or '-'))}</strong>"
+            f"<span class='muted'>유저평균 {html.escape(format_money(price_review.get('average_buy_price'), price_currency))} / 현재 {html.escape(format_money(price_review.get('current_price'), price_currency))}</span>"
+            f"<span class='muted'>괴리 {html.escape(format_plain_pct(price_review.get('gap_pct')))} · 매도 {html.escape(format_money(price_review.get('target_price'), price_currency))} · 손절 {html.escape(format_money(price_review.get('stop_price'), price_currency))}</span>"
+            f"<span class='muted'>{html.escape(str(price_review.get('memo') or ''))}</span>"
+        )
+        ai_reason = stock_confirmation_ai_reason(item)
+        flags = " ".join(f"<span class='chip'>{html.escape(str(flag))}</span>" for flag in item.get("flags") or [])
+        headlines = []
+        shown_news = (news.get("headlines") or [])[:3]
+        news_label = "종목뉴스"
+        if not shown_news:
+            shown_news = (news.get("market_headlines") or [])[:2]
+            news_label = "공통뉴스"
+        for headline in shown_news:
+            title = html.escape(str(headline.get("title") or "-"))
+            url = headline.get("url")
+            if url:
+                headlines.append(f"<a class='mini-link' href='{html.escape(str(url))}' target='_blank' rel='noopener'>{title}</a>")
+            else:
+                headlines.append(f"<span class='mini-link'>{title}</span>")
+        headline_html = "".join(headlines) or "<span class='muted'>뉴스 없음</span>"
+        link_html = " ".join(
+            f"<a class='chip' href='{html.escape(str(url))}' target='_blank' rel='noopener'>{html.escape(label)}</a>"
+            for label, url in [
+                ("분석", links.get("analytics")),
+                ("거래정보", links.get("transaction_status")),
+                ("뉴스", links.get("news")),
+            ]
+            if url
+        )
+        rows.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td><button type='button' class='symbol-link' data-symbol-detail='{html.escape(symbol_key)}'>{html.escape(symbol_text)}</button><span class='muted'>{html.escape(str(item.get('product_name') or ''))}</span><span class='muted'>{html.escape(str(overview.get('industry') or '-'))}</span>{link_html}</td>"
+            f"<td><span class='decision {decision_class}'>{html.escape(decision)}</span><span class='muted'>{html.escape(str(item.get('score') or '-'))}점</span>{flags}</td>"
+            f"<td>{price_review_html}</td>"
+            f"<td>{html.escape(ai_reason)}</td>"
+            f"<td>{html.escape(str(flow.get('trading_amount_rank') if flow.get('trading_amount_rank') is not None else '-'))}위"
+            f"<span class='muted'>{html.escape(format_money(flow.get('trading_amount_krw'), 'KRW'))}</span></td>"
+            f"<td>{html.escape(str(flow.get('trading_strength') if flow.get('trading_strength') is not None else '-'))}%</td>"
+            f"<td class='{return_class((flow.get('foreign_5d_net_volume') or 0) / 1_000_000 if flow.get('foreign_5d_net_volume') is not None else None)}'>{html.escape(format_volume(flow.get('foreign_5d_net_volume')))}"
+            f"<span class='muted'>매수순위 {html.escape(str(flow.get('foreign_rank_buy') or '-'))} / 매도순위 {html.escape(str(flow.get('foreign_rank_sell') or '-'))}</span></td>"
+            f"<td class='{return_class((flow.get('institution_5d_net_volume') or 0) / 1_000_000 if flow.get('institution_5d_net_volume') is not None else None)}'>{html.escape(format_volume(flow.get('institution_5d_net_volume')))}"
+            f"<span class='muted'>매수순위 {html.escape(str(flow.get('institution_rank_buy') or '-'))} / 매도순위 {html.escape(str(flow.get('institution_rank_sell') or '-'))}</span></td>"
+            f"<td>{html.escape(str(stability.get('position') or '-'))}<span class='muted'>부채비율 {html.escape(str(round(float(stability.get('liabilityRatio')), 1)) if stability.get('liabilityRatio') is not None else '-')}%</span></td>"
+            f"<td>{html.escape(format_money(overview.get('market_value_krw'), 'KRW'))}<span class='muted'>배당 {html.escape(format_money(dividend.get('latest_cash'), 'KRW'))} / {html.escape(pct(dividend.get('latest_yield_ratio')))}</span></td>"
+            f"<td>{html.escape(str(news.get('stock_news_count') or 0))}건<span class='muted'>{html.escape(news_label)} · 공통 {html.escape(str(news.get('market_headline_count') or 0))}건</span>{headline_html}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return "<p class='empty'>종목 컨펌 데이터를 만들 수 없습니다. 종목코드 검색 또는 공개 종목정보 API 접근을 확인하세요.</p>"
+    return (
+        "<p class='note'>최근매수/종목랭킹/수익권보유에 나온 종목을 대상으로, Toss 공개 종목정보의 거래대금·체결강도·외국인/기관 순매수·뉴스·재무 안정성을 붙인 확인 화면입니다. 유저가 샀다는 신호를 시장 수급과 뉴스로 다시 검증하는 용도입니다.</p>"
+        f"<p class='note'>확인 종목 {html.escape(str(stock_confirmation.get('confirmed_count') or len(items)))}개 · 후보 {html.escape(str(stock_confirmation.get('candidate_count') or '-'))}개 · 캐시 {html.escape(str(stock_confirmation.get('cache_hits') or 0))}개 · 신규조회 {html.escape(str(stock_confirmation.get('fetched_count') or 0))}개</p>"
+        "<table><thead><tr><th>#</th><th>종목</th><th>컨펌</th><th>가격 판단</th><th>AI 판단 근거</th><th>거래대금</th><th>체결강도</th><th>외국인 5일</th><th>기관 5일</th><th>재무 안정</th><th>규모/배당</th><th>뉴스</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
     )
 
@@ -3970,6 +4739,339 @@ def render_intraday_action_board(recent_buy: dict[str, Any], symbol_rankings: li
     symbol_items = "".join(symbol_body) or "<li><span class='muted'>현재 없음</span></li>"
     cards.append(f"<div class='action-card'><strong>과거 종목 관심</strong><ul>{symbol_items}</ul></div>")
     return f"<div class='action-grid'>{''.join(cards)}</div>"
+
+
+def today_candidate_reason(row: dict[str, Any]) -> str:
+    buyers = int(row.get("buyer_count") or 0)
+    reliable = int(row.get("reliable_buyer_count") or 0)
+    reliability = row.get("avg_user_reliability")
+    gap = pct(row.get("price_move_since_buy"))
+    reason = row.get("action_reason") or row.get("chase_rule") or ""
+    ai_verdict = row.get("ai_verdict")
+    ai_score = row.get("ai_composite_score")
+    ai_text = f" AI 종합 {ai_score}점/{ai_verdict}." if ai_score is not None else ""
+    return (
+        f"신뢰유저 {reliable}명/{buyers}명, 평균 신뢰도 {reliability or '-'}점. "
+        f"유저 평균가 대비 {gap}.{ai_text} {reason}"
+    )
+
+
+def render_today_candidate_card(row: dict[str, Any], tone: str) -> str:
+    symbol_text = str(row.get("symbol") or "-")
+    symbol_key = normalize_symbol_key(row.get("symbol") or row.get("stock_code") or symbol_text)
+    action = str(row.get("action") or "관망")
+    action_class = "decision-good" if action == "매수 후보" else "decision-bad" if action == "제외" else "decision-warn"
+    currency = row.get("current_price_currency") or "USD"
+    exit_plan = row.get("exit_plan") or {}
+    ai_parts = row.get("ai_score_parts") or {}
+    buyers = row.get("buyer_profiles") or []
+    buyer_chips = " ".join(
+        "<a class='chip' href='{url}' target='_blank' rel='noopener'>{name}</a>".format(
+            url=html.escape(str(profile.get("profile_url") or "#")),
+            name=html.escape(str(profile.get("author") or profile.get("profile_id") or "-")),
+        )
+        for profile in buyers[:3]
+    ) or "<span class='muted'>유저 없음</span>"
+    return (
+        f"<article class='signal-card signal-{tone}'>"
+        "<div class='signal-head'>"
+        f"<button type='button' class='symbol-link' data-symbol-detail='{html.escape(symbol_key)}'>{html.escape(symbol_text)}</button>"
+        f"<span class='decision {action_class}'>{html.escape(action)}</span>"
+        "</div>"
+        f"<p>{html.escape(today_candidate_reason(row))}</p>"
+        "<div class='signal-metrics'>"
+        f"<div><span>유저신호</span><strong>{html.escape(str(row.get('score') or '-'))}</strong></div>"
+        f"<div><span>AI 종합</span><strong>{html.escape(str(row.get('ai_composite_score') if row.get('ai_composite_score') is not None else '-'))}</strong><em>{html.escape(str(row.get('ai_verdict') or '-'))}</em></div>"
+        f"<div><span>괴리</span><strong class='{return_class(row.get('price_move_since_buy'))}'>{html.escape(pct(row.get('price_move_since_buy')))}</strong></div>"
+        f"<div><span>시장/종목</span><strong>{html.escape(str(ai_parts.get('market_confirmation') if ai_parts.get('market_confirmation') is not None else '-'))}</strong><em>종목 {html.escape(str(ai_parts.get('symbol_model') if ai_parts.get('symbol_model') is not None else '-'))}</em></div>"
+        f"<div><span>현재/평균</span><strong>{html.escape(format_money(row.get('current_price'), currency))}</strong><em>{html.escape(format_money(row.get('average_buy_price'), currency))}</em></div>"
+        f"<div><span>목표/손절</span><strong>{html.escape(format_money(exit_plan.get('target_price'), currency))}</strong><em>{html.escape(format_money(exit_plan.get('stop_price'), currency))}</em></div>"
+        "</div>"
+        f"<div class='signal-foot'><span>최근 {html.escape(format_trade_time(row.get('latest_buy_at')))}</span><span>{html.escape(str(row.get('buyer_count') or 0))}명 매수</span></div>"
+        f"<div class='signal-users'>{buyer_chips}</div>"
+        "</article>"
+    )
+
+
+def render_today_command_center(data: dict[str, Any]) -> str:
+    summary = data.get("summary") or {}
+    recent_buy = data.get("recent_buy") or {}
+    daily_scan = data.get("daily_profile_scan") or {}
+    recommendations = recent_buy.get("recommendations") or []
+    ai_buy_count = len([row for row in recommendations if row.get("ai_verdict") == "매수검토"])
+    buy_candidates = [
+        row for row in recommendations
+        if row.get("action") == "매수 후보" and row.get("chase_decision") in {"진입가능", "소액진입", "눌림후보"}
+    ][:4]
+    watch_candidates = [
+        row for row in recommendations
+        if row.get("action") != "제외" and row not in buy_candidates
+    ][:6]
+    blocked_candidates = [row for row in recommendations if row.get("action") == "제외"][:4]
+    if buy_candidates:
+        primary_message = f"지금은 1차 검토 후보 {len(buy_candidates)}개가 있습니다."
+        primary_class = "decision-good"
+        next_action = "장초반 같은 종목 추가 매수가 붙는지 확인하고, 가격괴리가 유지되면 소액 후보로 봅니다."
+    elif watch_candidates:
+        primary_message = "즉시 매수 후보는 없고 감시 후보만 있습니다."
+        primary_class = "decision-warn"
+        next_action = "상위 200명 장중 스캔을 다시 돌려 반복 매수 여부를 확인합니다."
+    else:
+        primary_message = "현재 최근매수 후보가 없습니다."
+        primary_class = "decision-bad"
+        next_action = "시장 시간에 장중 스캔부터 실행합니다."
+    new_buys = daily_scan.get("new_buys") or []
+    operator_items = [
+        ("마지막 모드", str(summary.get("operating_mode") or "-")),
+        ("스캔 대상", f"{summary.get('scan_target_count', 0):,}명"),
+        ("최근 창", f"{recent_buy.get('window_hours') or summary.get('recent_buy_window_hours') or '-'}시간"),
+        ("신규 매수", f"{summary.get('daily_new_buy_count', 0):,}건"),
+        ("추천 후보", f"{summary.get('recent_buy_recommendation_count', 0):,}개"),
+        ("AI 매수검토", f"{ai_buy_count:,}개"),
+        ("리포트", f"{summary.get('operation_report_count', 0):,}개"),
+    ]
+    operator_html = "".join(
+        f"<div><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></div>"
+        for label, value in operator_items
+    )
+    buy_html = "".join(render_today_candidate_card(row, "buy") for row in buy_candidates) or "<p class='empty'>현재 규칙상 바로 진입 후보는 없습니다.</p>"
+    watch_html = "".join(render_today_candidate_card(row, "watch") for row in watch_candidates[:4]) or "<p class='empty'>감시 후보 없음</p>"
+    blocked_html = "".join(render_today_candidate_card(row, "blocked") for row in blocked_candidates[:3]) or "<p class='empty'>추격 금지 후보 없음</p>"
+    new_buy_rows = []
+    for event in new_buys[:6]:
+        new_buy_rows.append(
+            "<li>"
+            f"<strong>{html.escape(str(event.get('symbol') or event.get('stock_name') or '-'))}</strong>"
+            f"<span>{html.escape(str(event.get('author') or '-'))} · {html.escape(format_trade_time(event.get('acted_at')))}</span>"
+            "</li>"
+        )
+    new_buy_html = "".join(new_buy_rows) or "<li><span class='muted'>이번 스캔 신규 매수 없음</span></li>"
+    return (
+        "<div class='today-shell'>"
+        "<section class='today-hero'>"
+        "<div>"
+        "<span class='brand-kicker'>Today Signal</span>"
+        f"<h2>{html.escape(primary_message)}</h2>"
+        f"<p>{html.escape(next_action)}</p>"
+        "</div>"
+        f"<span class='decision {primary_class}'>{html.escape(primary_message.split()[0])}</span>"
+        "</section>"
+        f"<section class='operator-strip'>{operator_html}</section>"
+        "<section class='today-grid-main'>"
+        "<div class='today-column today-primary'><h3>매수 검토</h3><p>가격과 유저 신호가 모두 맞을 때만 봅니다.</p>"
+        f"<div class='signal-list'>{buy_html}</div></div>"
+        "<div class='today-column'><h3>관망 후보</h3><p>월요일 장초반 반복 매수가 붙으면 승격됩니다.</p>"
+        f"<div class='signal-list compact'>{watch_html}</div></div>"
+        "</section>"
+        "<section class='today-grid-secondary'>"
+        "<div class='today-column'><h3>추격 금지/제외</h3><p>이미 올랐거나 근거가 약한 후보입니다.</p>"
+        f"<div class='signal-list compact'>{blocked_html}</div></div>"
+        "<div class='today-column'><h3>신규 매수 이벤트</h3><p>장중 스캔 이후 새로 잡힌 이벤트입니다.</p>"
+        f"<ul class='new-buy-list'>{new_buy_html}</ul></div>"
+        "</section>"
+        "</div>"
+    )
+
+
+def render_today_analysis_header(data: dict[str, Any]) -> str:
+    summary = data.get("summary") or {}
+    recent_buy = data.get("recent_buy") or {}
+    recommendations = recent_buy.get("recommendations") or []
+    ai_buy = [row for row in recommendations if row.get("ai_verdict") == "매수검토"]
+    ai_watch = [row for row in recommendations if row.get("ai_verdict") == "관망우선"]
+    recheck = [row for row in recommendations if row.get("ai_verdict") == "재확인"]
+    excluded = [row for row in recommendations if row.get("ai_verdict") == "제외우선" or row.get("action") == "제외"]
+    top = max(recommendations, key=lambda row: float(row.get("ai_composite_score") or 0), default={})
+    metric_items = [
+        ("최근 창", f"{recent_buy.get('window_hours') or summary.get('recent_buy_window_hours') or '-'}시간"),
+        ("테이블 후보", f"{len(recommendations):,}개"),
+        ("AI 매수검토", f"{len(ai_buy):,}개"),
+        ("관망우선", f"{len(ai_watch):,}개"),
+        ("재확인", f"{len(recheck):,}개"),
+        ("제외/추격금지", f"{len(excluded):,}개"),
+    ]
+    metrics = "".join(
+        f"<div><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></div>"
+        for label, value in metric_items
+    )
+    headline = (
+        f"최상단 후보는 {top.get('symbol')} · AI {top.get('ai_composite_score')}점 · 유저신호 {top.get('score')}점"
+        if top else
+        "현재 표시할 최근매수 후보가 없습니다."
+    )
+    return (
+        "<section class='analysis-hero'>"
+        "<div>"
+        "<span class='brand-kicker'>Intraday Analyst Table</span>"
+        "<h2>장중 판단은 이 테이블을 기준으로 봅니다</h2>"
+        f"<p>{html.escape(headline)}. 정렬은 판정 우선, 그 다음 AI 종합점수와 유저신호 점수 순입니다.</p>"
+        "</div>"
+        f"<div class='operator-strip analysis-strip'>{metrics}</div>"
+        "</section>"
+    )
+
+
+def render_operating_overview(data: dict[str, Any]) -> str:
+    summary = data.get("summary") or {}
+    market = data.get("market_status") or {}
+    recent_buy = data.get("recent_buy") or {}
+    stock_confirmation = data.get("stock_confirmation") or {}
+    operation_reports = data.get("operation_reports") or {}
+    latest_report = (operation_reports.get("reports") or [{}])[0]
+    cards = [
+        (
+            "1. 장중 종목추천",
+            "상위 200명 최신 매수 확인",
+            f"최근매수 후보 {summary.get('recent_buy_recommendation_count', 0):,}개 / 신규매수 {summary.get('daily_new_buy_count', 0):,}건",
+            "출근 후 09:00~09:30에 가장 먼저 실행하고, 가격괴리와 추가 매수 여부를 확인합니다.",
+        ),
+        (
+            "2. 유저 신뢰도 평가",
+            "누가 따라볼 만한지 선별",
+            f"최종 유저 {summary.get('final_ranked_user_count', 0):,}명 / 검증 이벤트 {summary.get('strategy_tested_event_count', 0):,}건",
+            "주 1~2회 전체 재계산하고, 단타 점수와 holdings 리스크를 같이 봅니다.",
+        ),
+        (
+            "3. 신규유저 찾기",
+            "후보풀 확장",
+            f"후보 {summary.get('candidate_count', 0):,}명 / 접근 가능 {summary.get('accessible_profile_count', 0):,}명",
+            "종목 커뮤니티와 공개 피드에서 새 유저를 늘려 상위 200명의 질을 개선합니다.",
+        ),
+        (
+            "4. 종목 컨펌",
+            "유저 신호를 시장 데이터로 검증",
+            f"컨펌 {summary.get('stock_confirmation_count', 0):,}개 / 수익권 보유 {summary.get('holding_accumulation_ranked_count', 0):,}개",
+            "유저가 샀다는 이유만으로 사지 않고 수급, 가격, 보유축적, 뉴스로 재확인합니다.",
+        ),
+    ]
+    rendered_cards = []
+    for title, subtitle, metric, note in cards:
+        rendered_cards.append(
+            "<div class='service-card'>"
+            f"<strong>{html.escape(title)}</strong>"
+            f"<span>{html.escape(subtitle)}</span>"
+            f"<em>{html.escape(metric)}</em>"
+            f"<p>{html.escape(note)}</p>"
+            "</div>"
+        )
+    flow_steps = [
+        ("수집", "공개 피드/종목 커뮤니티/거래내역/holdings/종목정보"),
+        ("정제", "레버리지 분리, 중복 이벤트 제거, 종목코드 보강, 현재가 매칭"),
+        ("검증", "유저별 1h~7d 성과, 승률, 평균수익, 집중도, holdings 리스크"),
+        ("판단", "최근매수 + 유저신뢰도 + 가격괴리 + 수급 + 보유축적을 종합"),
+        ("기록", "실행별 최종 리포트를 보관함에 누적"),
+    ]
+    flow_html = "".join(
+        "<div class='flow-step'>"
+        f"<strong>{html.escape(title)}</strong>"
+        f"<span>{html.escape(note)}</span>"
+        "</div>"
+        for title, note in flow_steps
+    )
+    summary_grid = (
+        "<details class='secondary-details'>"
+        "<summary>운영 상태와 전체 통계 보기</summary>"
+        "<div class='overview-metrics'>"
+        f"{render_weekend_prep(data)}"
+        "<section class='grid'>"
+        f"<div class='stat'><span>후보 유저</span><strong>{summary.get('candidate_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>수집 유저</span><strong>{summary.get('profile_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>거래 접근 가능</span><strong>{summary.get('accessible_profile_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>거래 이벤트</span><strong>{summary.get('profile_trade_event_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>깊이조회 유저</span><strong>{summary.get('deep_scanned_profile_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>검증 이벤트</span><strong>{summary.get('strategy_tested_event_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>신뢰도 산출 유저</span><strong>{summary.get('reliable_author_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>최종 순위 유저</span><strong>{summary.get('final_ranked_user_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>종목 랭킹</span><strong>{summary.get('symbol_trade_ranked_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>수익권 보유 종목</span><strong>{summary.get('holding_accumulation_ranked_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>종목 컨펌</span><strong>{summary.get('stock_confirmation_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>스캔 대상</span><strong>{summary.get('scan_target_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>최근매수 후보</span><strong>{summary.get('recent_buy_recommendation_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>Daily Scan 유저</span><strong>{summary.get('daily_scanned_profile_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>Daily 신규 이벤트</span><strong>{summary.get('daily_new_event_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>Daily 신규 매수</span><strong>{summary.get('daily_new_buy_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>Holdings 확인</span><strong>{summary.get('daily_holding_profile_count', 0):,}</strong></div>"
+        f"<div class='stat'><span>최종 리포트</span><strong>{summary.get('operation_report_count', 0):,}</strong></div>"
+        "</section>"
+        "</div>"
+        "</details>"
+    )
+    return (
+        "<div class='overview-layout'>"
+        "<section>"
+        "<h2 class='section-title'>운영 개요</h2>"
+        f"<p class='section-subtitle'>현재 모드 {html.escape(str(summary.get('operating_mode') or market.get('mode') or '-'))}. "
+        f"최근매수 윈도우 {html.escape(str(recent_buy.get('window_hours') or summary.get('recent_buy_window_hours') or '-'))}시간. "
+        f"마지막 리포트 {html.escape(str(latest_report.get('created_at') or '-'))}.</p>"
+        f"<div class='service-grid'>{''.join(rendered_cards)}</div>"
+        "</section>"
+        f"{summary_grid}"
+        "<section>"
+        "<h2 class='section-title'>전체 흐름</h2>"
+        f"<div class='flow-grid'>{flow_html}</div>"
+        "</section>"
+        "<section>"
+        "<h2 class='section-title'>오늘 사용 순서</h2>"
+        "<div class='use-order'>"
+        "<div><strong>장 시작 전</strong><span>리포트 보관함에서 지난 스캔 결과와 감시 후보 확인</span></div>"
+        "<div><strong>장초반</strong><span>상위 200명 장중 스캔 실행, 새 매수와 가격괴리 확인</span></div>"
+        "<div><strong>진입 전</strong><span>종목 컨펌에서 수급/뉴스/보유축적 확인 후 소액 여부 결정</span></div>"
+        "<div><strong>장마감 후</strong><span>성과 관찰, 유저 신뢰도 재계산, 후보풀 확장</span></div>"
+        "</div>"
+        "</section>"
+        "</div>"
+    )
+
+
+def render_data_catalog(data: dict[str, Any]) -> str:
+    summary = data.get("summary") or {}
+    rows = [
+        ("후보 유저", "공개 피드/종목 커뮤니티", f"{summary.get('candidate_count', 0):,}명", "프로필 ID, 닉네임, 발견 출처", "유저풀 확장"),
+        ("거래내역", "유저 거래 탭", f"{summary.get('profile_trade_event_count', 0):,}건", "매수/매도, 종목, 수량, 금액, 평균가, 시각", "유저 신뢰도/최근매수"),
+        ("Holdings", "유저 포트폴리오", f"{summary.get('historical_holding_profile_count', 0):,}명", "보유종목, 비중, 평균단가, 수익권/물림", "유저 리스크/축적 종목"),
+        ("가격 데이터", "공개 시세/차트", f"{summary.get('strategy_tested_event_count', 0):,}검증", "1h, 4h, 8h, 1d, 3d, 5d, 7d 수익률", "백테스트/승률"),
+        ("종목정보", "Toss 종목 분석/거래정보", f"{summary.get('stock_confirmation_count', 0):,}개", "거래대금, 체결강도, 외국인/기관, 재무, 배당", "종목 컨펌"),
+        ("뉴스", "Toss 뉴스", "참고값", "종목뉴스/공통 헤드라인 구분", "이벤트 확인"),
+        ("실행 리포트", "로컬 통합 JSON", f"{summary.get('operation_report_count', 0):,}개", "실행 시각, 액션, 결과, 최종 판단", "나중에 복기"),
+    ]
+    rendered = []
+    for name, source, amount, fields, usage in rows:
+        rendered.append(
+            "<tr>"
+            f"<td><strong>{html.escape(name)}</strong></td>"
+            f"<td>{html.escape(source)}</td>"
+            f"<td>{html.escape(amount)}</td>"
+            f"<td>{html.escape(fields)}</td>"
+            f"<td>{html.escape(usage)}</td>"
+            "</tr>"
+        )
+    return (
+        "<p class='note'>현재 시스템이 실제로 쓰는 데이터 목록입니다. 민감한 주문/계좌 변경 데이터는 쓰지 않고, 수집된 조회 결과는 통합 JSON과 HTML 리포트로 정리합니다.</p>"
+        "<table><thead><tr><th>데이터</th><th>출처</th><th>현재 규모</th><th>주요 필드</th><th>활용처</th></tr></thead>"
+        f"<tbody>{''.join(rendered)}</tbody></table>"
+    )
+
+
+def render_service_catalog(data: dict[str, Any]) -> str:
+    services = [
+        ("장중 종목추천", "상위 200명 최근 매수 감지", "오늘 볼 것 / 최종 리포트", "매수 후보, 관망, 제외와 목표/손절 참고가"),
+        ("전체유저 신뢰도 평가", "거래내역 3페이지 + holdings + 과거 가격", "유저 랭킹", "단타형/분산형/레버리지 편중/보유리스크"),
+        ("신규유저 찾기", "공개 피드와 종목 커뮤니티", "데이터·운영", "후보풀, 접근 가능 유저, 다음 스캔 대상"),
+        ("종목 컨펌", "Toss 종목정보/거래정보/뉴스", "종목 컨펌", "수급/가격/뉴스/재무 기반 재확인"),
+        ("수익권 보유", "Holdings 스냅샷", "수익권 보유", "좋은 유저들이 안 팔고 들고 있는 종목"),
+        ("성과 복기", "추천 이후 가격 변화", "오늘 볼 것 / 리포트", "1h~24h 성과 추적"),
+    ]
+    rendered = []
+    for service, input_data, screen, output in services:
+        rendered.append(
+            "<div class='service-row'>"
+            f"<strong>{html.escape(service)}</strong>"
+            f"<span>{html.escape(input_data)}</span>"
+            f"<span>{html.escape(screen)}</span>"
+            f"<em>{html.escape(output)}</em>"
+            "</div>"
+        )
+    return f"<div class='service-table'>{''.join(rendered)}</div>"
 
 
 def render_pipeline_overview(data: dict[str, Any]) -> str:
@@ -4524,7 +5626,67 @@ def render_unified_short_rankings(rankings: list[dict[str, Any]]) -> str:
     )
 
 
-def render_user_detail_dialog(rankings: list[dict[str, Any]]) -> str:
+def build_symbol_detail_payload(data: dict[str, Any]) -> list[dict[str, Any]]:
+    buckets: dict[str, dict[str, Any]] = {}
+
+    def keys_for(*values: Any) -> list[str]:
+        keys = []
+        for value in values:
+            key = normalize_symbol_key(value)
+            if key and key not in keys:
+                keys.append(key)
+        return keys
+
+    def ensure(keys: list[str], symbol: Any = None, name: Any = None) -> dict[str, Any]:
+        primary = keys[0] if keys else normalize_symbol_key(symbol or name)
+        if not primary:
+            primary = f"unknown-{len(buckets) + 1}"
+        row = buckets.setdefault(primary, {
+            "key": primary,
+            "aliases": [],
+            "symbol": symbol or name or "-",
+            "name": name or "",
+        })
+        if symbol and (not row.get("symbol") or row.get("symbol") == "-"):
+            row["symbol"] = symbol
+        if name and not row.get("name"):
+            row["name"] = name
+        for key in keys:
+            if key and key not in row["aliases"]:
+                row["aliases"].append(key)
+            buckets.setdefault(key, row)
+        return row
+
+    for item in (data.get("recent_buy") or {}).get("recommendations") or []:
+        row = ensure(keys_for(item.get("symbol"), item.get("stock_code"), item.get("quote_provider_symbol")), item.get("symbol"), item.get("name"))
+        row["recent_buy"] = item
+    for item in data.get("symbol_trade_rankings") or []:
+        row = ensure(keys_for(item.get("symbol"), item.get("name"), item.get("stock_code")), item.get("symbol"), item.get("name"))
+        row["symbol_model"] = item
+    for item in (data.get("stock_confirmation") or {}).get("items") or []:
+        row = ensure(keys_for(item.get("symbol"), item.get("product_name"), item.get("product_code")), item.get("symbol"), item.get("product_name"))
+        row["confirmation"] = item
+    for item in data.get("holding_accumulation_rankings") or []:
+        row = ensure(keys_for(item.get("symbol"), item.get("name"), item.get("stock_code")), item.get("symbol"), item.get("name"))
+        row["accumulation"] = item
+
+    seen = set()
+    payload = []
+    for row in buckets.values():
+        identity = id(row)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        payload.append(row)
+    payload.sort(key=lambda row: (
+        -float(((row.get("recent_buy") or {}).get("score") or 0)),
+        -float(((row.get("confirmation") or {}).get("score") or 0)),
+        str(row.get("symbol") or ""),
+    ))
+    return payload
+
+
+def render_user_detail_dialog(rankings: list[dict[str, Any]], symbol_details: list[dict[str, Any]] | None = None) -> str:
     payload = []
     for item in rankings:
         payload.append({
@@ -4542,6 +5704,7 @@ def render_user_detail_dialog(rankings: list[dict[str, Any]]) -> str:
             ]
         })
     json_text = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    symbol_json_text = json.dumps(symbol_details or [], ensure_ascii=False).replace("</", "<\\/")
     return f"""
 <dialog id="userDialog" class="user-dialog">
   <div class="dialog-head">
@@ -4554,13 +5717,22 @@ def render_user_detail_dialog(rankings: list[dict[str, Any]]) -> str:
   <div id="dlgBody" class="dialog-body"></div>
 </dialog>
 <script id="userRankingsJson" type="application/json">{json_text}</script>
+<script id="symbolDetailsJson" type="application/json">{symbol_json_text}</script>
 <script>
 const USER_RANKINGS = JSON.parse(document.getElementById('userRankingsJson').textContent);
 const USER_BY_ID = new Map(USER_RANKINGS.map(row => [String(row.profile_id || ''), row]));
+const SYMBOL_DETAILS = JSON.parse(document.getElementById('symbolDetailsJson').textContent);
+const SYMBOL_BY_KEY = new Map();
+SYMBOL_DETAILS.forEach(row => {{
+  (row.aliases || [row.key]).forEach(key => SYMBOL_BY_KEY.set(String(key || '').toLowerCase(), row));
+  SYMBOL_BY_KEY.set(String(row.key || '').toLowerCase(), row);
+}});
 const dlg = document.getElementById('userDialog');
 const fmtPct = value => value === null || value === undefined ? '-' : ((value * 100 >= 0 ? '+' : '') + (value * 100).toFixed(2) + '%');
+const fmtPlainPct = value => value === null || value === undefined ? '-' : ((Number(value) >= 0 ? '+' : '') + Number(value).toFixed(2) + '%');
 const fmtNum = value => value === null || value === undefined ? '-' : Number(value).toLocaleString('ko-KR', {{ maximumFractionDigits: 2 }});
 const fmtMoney = (krw, usd) => usd !== null && usd !== undefined ? '$' + fmtNum(usd) : (krw !== null && krw !== undefined ? fmtNum(krw) + '원' : '-');
+const fmtPrice = (value, currency) => value === null || value === undefined ? '-' : (String(currency || '').toUpperCase() === 'KRW' ? fmtNum(value) + '원' : '$' + fmtNum(value));
 function escapeHtml(value) {{
   return String(value ?? '').replace(/[&<>"']/g, ch => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }}[ch]));
 }}
@@ -4599,6 +5771,60 @@ function renderUser(row) {{
     <section class="detail-section"><h4>시간대별 검증</h4><table><thead><tr><th>시간</th><th>샘플</th><th>평균</th><th>승률</th><th>최악</th></tr></thead><tbody>${{horizonRows}}</tbody></table></section>
     <section class="detail-section"><h4>Holdings</h4><p class="muted">${{(risk.risk_flags || []).join(', ') || '특이사항 없음'}} · 감점 ${{risk.penalty || 0}}</p><table><thead><tr><th>종목</th><th>비중</th><th>평단</th></tr></thead><tbody>${{holdingRows}}</tbody></table></section>
     <section class="detail-section"><h4>최근 거래</h4><table><thead><tr><th>시간</th><th>구분</th><th>종목</th><th>평단</th><th>금액</th></tr></thead><tbody>${{tradeRows}}</tbody></table></section>
+  `;
+}}
+function renderSymbol(row) {{
+  const recent = row.recent_buy || {{}};
+  const model = row.symbol_model || {{}};
+  const confirm = row.confirmation || {{}};
+  const accum = row.accumulation || {{}};
+  const price = confirm.price_review || {{}};
+  const exitPlan = recent.exit_plan || {{}};
+  const flow = confirm.flow || {{}};
+  const overview = confirm.overview || {{}};
+  const stability = confirm.stability || {{}};
+  const currency = recent.current_price_currency || price.currency || 'USD';
+  const links = confirm.links || {{}};
+  const events = (recent.events || []).slice(0, 10).map(e =>
+    `<tr><td>${{(e.acted_at || '').replace('T',' ').slice(0,16)}}</td><td>${{escapeHtml(e.author || '-')}}</td><td>${{escapeHtml(e.side || '-')}}</td><td>${{fmtMoney(e.amount_krw, e.amount_usd)}}</td><td>${{fmtMoney(e.avg_krw, e.avg_usd)}}</td></tr>`
+  ).join('') || '<tr><td colspan="5" class="muted">최근 매수 이벤트 없음</td></tr>';
+  const buyers = (recent.buyer_profiles || []).slice(0, 8).map(profile =>
+    `<a class="chip" href="${{escapeHtml(profile.profile_url || '#')}}" target="_blank" rel="noopener">${{escapeHtml(profile.author || profile.profile_id || '-')}}</a>`
+  ).join('') || '<span class="muted">매수 유저 없음</span>';
+  const holders = (accum.top_positive_holders || []).slice(0, 8).map(holder =>
+    `<a class="chip" href="${{escapeHtml(holder.profile_url || '#')}}" target="_blank" rel="noopener">${{escapeHtml(holder.author || '-')}} ${{fmtPct(holder.unrealized_return)}}</a>`
+  ).join('') || '<span class="muted">수익권 보유 근거 없음</span>';
+  const linkHtml = [
+    ['분석', links.analytics],
+    ['거래정보', links.transaction_status],
+    ['뉴스', links.news],
+  ].filter(([, url]) => url).map(([label, url]) =>
+    `<a class="chip" href="${{escapeHtml(url)}}" target="_blank" rel="noopener">${{label}}</a>`
+  ).join('') || '<span class="muted">Toss 상세 링크 없음</span>';
+  return `
+    <section class="detail-grid">
+      ${{kv('장중 판정', recent.action || '-')}}
+      ${{kv('유저신호 점수', fmtNum(recent.score))}}
+      ${{kv('AI 종합점수', `${{fmtNum(recent.ai_composite_score)}} / ${{recent.ai_verdict || '-'}}`)}}
+      ${{kv('외부데이터 점수', fmtNum(recent.external_data_score))}}
+      ${{kv('가격 괴리', fmtPct(recent.price_move_since_buy), Number(recent.price_move_since_buy || 0) >= 0 ? 'pos' : 'neg')}}
+      ${{kv('매수 유저', `${{recent.reliable_buyer_count || 0}}/${{recent.buyer_count || 0}}명`)}}
+      ${{kv('현재가', fmtPrice(recent.current_price ?? price.current_price, currency))}}
+      ${{kv('평균 매수가', fmtPrice(recent.average_buy_price ?? price.average_buy_price, currency))}}
+      ${{kv('목표가', fmtPrice(exitPlan.target_price ?? price.target_price, currency))}}
+      ${{kv('손절가', fmtPrice(exitPlan.stop_price ?? price.stop_price, currency))}}
+      ${{kv('종목모델 점수', fmtNum(model.score))}}
+      ${{kv('공개시장 컨펌', `${{confirm.decision || '-'}} / ${{fmtNum(confirm.score)}}`)}}
+      ${{kv('축적 점수', fmtNum(accum.score))}}
+      ${{kv('보유 수익권', `${{accum.positive_holder_count || 0}}명`)}}
+    </section>
+    <section class="detail-section"><h4>AI 종합 판단</h4><p class="ai-box">${{escapeHtml(recent.ai_reason || recent.action_reason || recent.chase_rule || confirm.ai_reason || model.decision || '월요일 장중 재스캔으로 반복 매수 여부를 확인해야 합니다.')}}</p></section>
+    <section class="detail-section"><h4>AI 점수 구성</h4><div class="detail-grid">${{kv('가격 타이밍', fmtNum((recent.ai_score_parts || {{}}).price_timing))}}${{kv('시장 컨펌', fmtNum((recent.ai_score_parts || {{}}).market_confirmation))}}${{kv('종목 모델', fmtNum((recent.ai_score_parts || {{}}).symbol_model))}}${{kv('보유 축적', fmtNum((recent.ai_score_parts || {{}}).holding_accumulation))}}</div></section>
+    <section class="detail-section"><h4>가격 판단</h4><p class="note">유저 평균가 대비 현재가가 너무 벌어졌으면 추격 금지로 봅니다. 목표/손절은 참고값이며, 장중 체결가 기준으로 다시 확인해야 합니다.</p><div class="detail-grid">${{kv('Toss 가격검토', price.status || '-')}}${{kv('컨펌 괴리', fmtPlainPct(price.gap_pct), Number(price.gap_pct || 0) >= 0 ? 'pos' : 'neg')}}${{kv('추격 판단', recent.chase_decision || '-')}}${{kv('허용 괴리', `${{recent.max_chase_gap_pct ?? '-'}}%`)}}</div></section>
+    <section class="detail-section"><h4>매수 유저</h4><div>${{buyers}}</div><table><thead><tr><th>시간</th><th>유저</th><th>구분</th><th>금액</th><th>평단</th></tr></thead><tbody>${{events}}</tbody></table></section>
+    <section class="detail-section"><h4>종목 모델</h4><div class="detail-grid">${{kv('평균 수익률', fmtPct(model.avg_return), Number(model.avg_return || 0) >= 0 ? 'pos' : 'neg')}}${{kv('승률', fmtPct(model.win_rate))}}${{kv('검증 샘플', fmtNum(model.tested_returns))}}${{kv('신뢰 유저', `${{model.trusted_author_count || 0}}명`)}}</div></section>
+    <section class="detail-section"><h4>공개시장 컨펌</h4><div class="detail-grid">${{kv('거래대금 순위', flow.trading_amount_rank ?? '-')}}${{kv('거래강도', `${{flow.trading_strength ?? '-'}}%`)}}${{kv('외국인 5일', fmtNum(flow.foreign_5d_net_volume))}}${{kv('기관 5일', fmtNum(flow.institution_5d_net_volume))}}${{kv('업종', overview.industry || '-')}}${{kv('안정성', stability.position || '-')}}</div><div>${{linkHtml}}</div></section>
+    <section class="detail-section"><h4>수익권 보유</h4><div class="detail-grid">${{kv('판정', accum.decision || '-')}}${{kv('보유 유저', `${{accum.holder_count || 0}}명`)}}${{kv('평균 미실현', fmtPct(accum.avg_unrealized_return), Number(accum.avg_unrealized_return || 0) >= 0 ? 'pos' : 'neg')}}${{kv('평균 비중', `${{accum.avg_weight ?? '-'}}%`)}}</div><div>${{holders}}</div></section>
   `;
 }}
 const tableState = {{
@@ -4721,6 +5947,22 @@ function bindRankTable(kind) {{
 }}
 bindRankTable('short');
 bindRankTable('final');
+function bindHorizontalScrollProxies() {{
+  document.querySelectorAll('[data-scroll-proxy]').forEach(proxy => {{
+    const key = proxy.dataset.scrollProxy;
+    const target = document.querySelector(`[data-scroll-target="${{key}}"]`);
+    if (!target) return;
+    const sync = (from, to) => {{
+      if (to.__syncingScroll) return;
+      from.__syncingScroll = true;
+      to.scrollLeft = from.scrollLeft;
+      from.__syncingScroll = false;
+    }};
+    proxy.addEventListener('scroll', () => sync(proxy, target), {{ passive: true }});
+    target.addEventListener('scroll', () => sync(target, proxy), {{ passive: true }});
+  }});
+}}
+bindHorizontalScrollProxies();
 function activateDashboardTab(name) {{
   document.querySelectorAll('.tab-button').forEach(button => {{
     button.classList.toggle('active', button.dataset.tabTarget === name);
@@ -4736,18 +5978,29 @@ document.querySelectorAll('[data-tab-target]').forEach(button => {{
   button.addEventListener('click', () => activateDashboardTab(button.dataset.tabTarget));
 }});
 const initialTab = (location.hash || '').replace('#', '');
-if (['today', 'brief', 'symbols', 'accumulation', 'users', 'risk', 'system'].includes(initialTab)) {{
+if (['overview', 'today', 'brief', 'symbols', 'confirm', 'accumulation', 'users', 'ops', 'data', 'risk', 'system'].includes(initialTab)) {{
   activateDashboardTab(initialTab);
 }}
 document.addEventListener('click', event => {{
+  const symbolButton = event.target.closest('[data-symbol-detail]');
+  if (symbolButton) {{
+    const row = SYMBOL_BY_KEY.get(String(symbolButton.dataset.symbolDetail || '').toLowerCase());
+    if (!row) return;
+    document.getElementById('dlgName').textContent = row.symbol || '종목 상세';
+    document.getElementById('dlgMeta').textContent = `${{row.name || '-'}} · 최근매수/종목모델/공개시장/보유축적 근거`;
+    document.getElementById('dlgBody').innerHTML = renderSymbol(row);
+    dlg.showModal();
+    return;
+  }}
   const button = event.target.closest('[data-profile-detail]');
-  if (!button) return;
-  const row = USER_BY_ID.get(String(button.dataset.profileDetail));
-  if (!row) return;
-  document.getElementById('dlgName').textContent = row.author || '유저 상세';
-  document.getElementById('dlgMeta').textContent = `ID ${{row.profile_id || '-'}} · ${{row.trade_style || '미분류'}} · 최근 ${{(row.latest_trade_at || '').replace('T',' ').slice(0,16)}}`;
-  document.getElementById('dlgBody').innerHTML = renderUser(row);
-  dlg.showModal();
+  if (button) {{
+    const row = USER_BY_ID.get(String(button.dataset.profileDetail));
+    if (!row) return;
+    document.getElementById('dlgName').textContent = row.author || '유저 상세';
+    document.getElementById('dlgMeta').textContent = `ID ${{row.profile_id || '-'}} · ${{row.trade_style || '미분류'}} · 최근 ${{(row.latest_trade_at || '').replace('T',' ').slice(0,16)}}`;
+    document.getElementById('dlgBody').innerHTML = renderUser(row);
+    dlg.showModal();
+  }}
 }});
 document.getElementById('dlgClose').addEventListener('click', () => dlg.close());
 dlg.addEventListener('click', event => {{ if (event.target === dlg) dlg.close(); }});
@@ -4985,7 +6238,12 @@ def index_by_symbol(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return indexed
 
 
-def final_report_entry_plan(row: dict[str, Any], symbol_row: dict[str, Any] | None, accumulation_row: dict[str, Any] | None) -> str:
+def final_report_entry_plan(
+    row: dict[str, Any],
+    symbol_row: dict[str, Any] | None,
+    accumulation_row: dict[str, Any] | None,
+    confirmation_row: dict[str, Any] | None = None,
+) -> str:
     action = row.get("action")
     chase = row.get("chase_decision")
     buyers = int(row.get("buyer_count") or 0)
@@ -4993,11 +6251,12 @@ def final_report_entry_plan(row: dict[str, Any], symbol_row: dict[str, Any] | No
     gap = row.get("price_move_since_buy")
     has_symbol_validation = bool(symbol_row and symbol_row.get("decision") in {"관심", "관망"})
     has_accumulation = bool(accumulation_row and accumulation_row.get("decision") == "축적 관심")
+    has_confirmation = bool(confirmation_row and confirmation_row.get("score") and float(confirmation_row.get("score") or 0) >= 55)
     if action == "매수 후보" and chase in {"진입가능", "소액진입", "눌림후보"}:
         return "월요일 1차 후보. 장초반 추가 매수와 가격괴리 재확인 후 소액 진입 검토."
     if buyers >= 3 and reliable >= 3 and chase == "눌림후보":
         return "감시 우선. 이미 눌린 상태면 장초반 반등 확인 후 소액 후보."
-    if buyers >= 2 and reliable >= 2 and (has_symbol_validation or has_accumulation):
+    if buyers >= 2 and reliable >= 2 and (has_symbol_validation or has_accumulation or has_confirmation):
         return "보조 근거 있음. 장초반 같은 종목 추가 매수가 붙으면 후보로 승격."
     if gap is not None and float(gap) > 0.03:
         return "추격 금지에 가깝다. 장초반 급등하면 버리고 눌림만 대기."
@@ -5006,13 +6265,53 @@ def final_report_entry_plan(row: dict[str, Any], symbol_row: dict[str, Any] | No
     return "관망. 월요일 실시간 스캔에서 신뢰 유저 수가 늘어나는지 확인."
 
 
+def final_report_ai_evidence(
+    row: dict[str, Any],
+    symbol_row: dict[str, Any] | None,
+    accumulation_row: dict[str, Any] | None,
+    confirmation_row: dict[str, Any] | None,
+    plan: str,
+) -> str:
+    parts = [
+        f"유저근거: 매수 {int(row.get('buyer_count') or 0)}명, 신뢰유저 {int(row.get('reliable_buyer_count') or 0)}명, 평균 신뢰도 {row.get('avg_user_reliability') or '-'}점.",
+        f"가격근거: 유저 평균매수가 대비 {pct(row.get('price_move_since_buy'))}, 목표까지 {format_plain_pct((row.get('exit_plan') or {}).get('current_to_target_pct'))}.",
+    ]
+    if symbol_row:
+        parts.append(
+            f"과거검증: 종목 점수 {symbol_row.get('score') or '-'}점, "
+            f"{horizon_label(str(symbol_row.get('best_horizon') or '8h')) if symbol_row.get('best_horizon') else '단기'} "
+            f"승률 {pct(symbol_row.get('win_rate'))}."
+        )
+    else:
+        parts.append("과거검증: 아직 같은 종목의 충분한 검증 데이터가 약함.")
+    if confirmation_row:
+        confirmation_price = (confirmation_row.get("price_review") or {}).get("status")
+        parts.append(
+            f"공개시장확인: {confirmation_row.get('decision') or '-'} {confirmation_row.get('score') or '-'}점, "
+            f"가격 {confirmation_price or '-'}, 신호 {', '.join(str(flag) for flag in (confirmation_row.get('flags') or [])[:3]) or '특이신호 적음'}."
+        )
+    else:
+        parts.append("공개시장확인: 종목 컨펌 데이터가 없어 수급/뉴스 검증 약함.")
+    if accumulation_row:
+        parts.append(
+            f"보유축적: 수익권 보유 {accumulation_row.get('positive_holder_count') or 0}명/"
+            f"{accumulation_row.get('holder_count') or 0}명."
+        )
+    else:
+        parts.append("보유축적: holdings 기반 축적 근거는 약함.")
+    parts.append(f"종합결론: {plan}")
+    return " ".join(parts)
+
+
 def render_intraday_service_final_report(data: dict[str, Any]) -> str:
     recent_buy = data.get("recent_buy") or {}
     recommendations = recent_buy.get("recommendations") or []
     symbol_rankings = data.get("symbol_trade_rankings") or []
     accumulations = data.get("holding_accumulation_rankings") or []
+    confirmations = (data.get("stock_confirmation") or {}).get("items") or []
     symbol_index = index_by_symbol(symbol_rankings)
     accumulation_index = index_by_symbol(accumulations)
+    confirmation_index = index_by_symbol(confirmations)
     buy_candidates = [
         row for row in recommendations
         if row.get("action") == "매수 후보" and row.get("chase_decision") in {"진입가능", "소액진입", "눌림후보"}
@@ -5037,6 +6336,7 @@ def render_intraday_service_final_report(data: dict[str, Any]) -> str:
         symbol = row.get("symbol")
         symbol_row = symbol_index.get(normalize_symbol_key(symbol))
         accumulation_row = accumulation_index.get(normalize_symbol_key(symbol))
+        confirmation_row = confirmation_index.get(normalize_symbol_key(symbol))
         buyer_profiles = row.get("buyer_profiles") or []
         buyers = " ".join(
             "<a class='chip' href='{url}' target='_blank' rel='noopener'>{name} {score}</a>".format(
@@ -5055,6 +6355,13 @@ def render_intraday_service_final_report(data: dict[str, Any]) -> str:
             )
         else:
             validation.append("종목검증 데이터 없음")
+        if confirmation_row:
+            price_review = confirmation_row.get("price_review") or {}
+            validation.append(
+                f"종목컨펌 {html.escape(str(confirmation_row.get('decision') or '-'))} "
+                f"{html.escape(str(confirmation_row.get('score') or '-'))}점, "
+                f"가격 {html.escape(str(price_review.get('status') or '-'))}"
+            )
         if accumulation_row:
             validation.append(
                 f"수익권보유 {html.escape(str(accumulation_row.get('holder_count') or 0))}명, "
@@ -5062,7 +6369,8 @@ def render_intraday_service_final_report(data: dict[str, Any]) -> str:
             )
         else:
             validation.append("수익권보유 근거 없음")
-        plan = final_report_entry_plan(row, symbol_row, accumulation_row)
+        plan = final_report_entry_plan(row, symbol_row, accumulation_row, confirmation_row)
+        ai_evidence = final_report_ai_evidence(row, symbol_row, accumulation_row, confirmation_row, plan)
         exit_plan = row.get("exit_plan") or {}
         action = str(row.get("action") or "관망")
         action_class = "decision-good" if action == "매수 후보" else "decision-bad" if action == "제외" else "decision-warn"
@@ -5079,7 +6387,7 @@ def render_intraday_service_final_report(data: dict[str, Any]) -> str:
             f"<span class='muted block'>목표 {html.escape(str(exit_plan.get('target_return_pct') if exit_plan.get('target_return_pct') is not None else '-'))}% · 손절 {html.escape(format_money(exit_plan.get('stop_price'), row.get('current_price_currency') or 'USD'))}</span>"
             f"<span class='muted block'>현재가 기준 남은 여지 {html.escape(str(exit_plan.get('current_to_target_pct') if exit_plan.get('current_to_target_pct') is not None else '-'))}%</span></td>"
             f"<td>{'<br>'.join(validation)}</td>"
-            f"<td><strong>{html.escape(plan)}</strong><span class='muted block'>{html.escape(str(row.get('chase_rule') or row.get('action_reason') or ''))}</span></td>"
+            f"<td><strong>{html.escape(plan)}</strong><span class='muted block'>{html.escape(ai_evidence)}</span><span class='muted block'>{html.escape(str(row.get('chase_rule') or row.get('action_reason') or ''))}</span></td>"
             "</tr>"
         )
     rows_html = "".join(rendered) or "<tr><td colspan='8' class='muted'>현재 리포트 후보 없음</td></tr>"
@@ -5328,6 +6636,7 @@ def unified_dashboard_report() -> dict[str, Any]:
     final_user_rankings = data.get("final_user_rankings") or []
     symbol_trade_rankings = data.get("symbol_trade_rankings") or []
     holding_accumulation_rankings = data.get("holding_accumulation_rankings") or []
+    stock_confirmation = data.get("stock_confirmation") or {}
     daily_scan = data.get("daily_profile_scan") or {}
     operation_reports = data.get("operation_reports") or {}
     planned_scan_targets = {"profiles": data.get("planned_scan_targets") or [], "scanned_profile_count": summary.get("scan_target_count", 0)}
@@ -5339,69 +6648,159 @@ def unified_dashboard_report() -> dict[str, Any]:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AI 투자 통합 대시보드</title>
   <style>
-    :root {{ --bg:#f4f6f9; --panel:#fff; --line:#d8dee8; --line2:#edf1f6; --ink:#172033; --muted:#66758a; --pos:#067647; --neg:#b42318; --blue:#1457b8; --soft:#f8fafc; }}
-    body {{ margin:0; background:var(--bg); color:var(--ink); font-family:Arial, "Malgun Gothic", sans-serif; }}
-    main {{ max-width:1500px; margin:0 auto; padding:28px; }}
-    h1 {{ margin:0 0 6px; font-size:28px; letter-spacing:0; }}
-    h2 {{ margin:30px 0 10px; font-size:19px; letter-spacing:0; }}
-    .meta {{ color:var(--muted); line-height:1.6; margin-bottom:18px; }}
-    .grid {{ display:grid; grid-template-columns:repeat(6, minmax(130px, 1fr)); gap:10px; }}
-    .stat {{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; box-shadow:0 1px 2px rgba(15,23,42,.04); }}
-    .stat span {{ display:block; color:var(--muted); font-size:12px; margin-bottom:6px; }}
-    .stat strong {{ display:block; font-size:22px; }}
-    .panel {{ margin-top:12px; background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; box-shadow:0 1px 2px rgba(15,23,42,.04); }}
-    .section-title {{ margin:0 0 10px; font-size:17px; }}
-    .section-subtitle {{ margin:0 0 12px; color:var(--muted); font-size:13px; line-height:1.55; }}
-    .workspace-tabs {{ margin-top:22px; }}
-    .tab-nav {{ display:flex; gap:6px; flex-wrap:wrap; padding:6px; background:#e9eef5; border:1px solid var(--line); border-radius:10px; position:sticky; top:0; z-index:5; }}
-    .tab-button {{ border:0; border-radius:8px; background:transparent; color:#475569; padding:9px 13px; cursor:pointer; font-weight:800; }}
-    .tab-button.active {{ background:#fff; color:#0f172a; box-shadow:0 1px 2px rgba(15,23,42,.08); }}
-    .tab-panel {{ display:none; padding-top:18px; }}
+    :root {{ --bg:#f7f8fa; --panel:#fff; --line:#e5e8ef; --line2:#eef1f5; --ink:#191f28; --muted:#8b95a1; --sub:#4e5968; --pos:#00a661; --neg:#f04452; --blue:#3182f6; --blue-soft:#edf6ff; --soft:#f9fafb; --shadow:0 1px 2px rgba(25,31,40,.04), 0 8px 24px rgba(25,31,40,.04); }}
+    * {{ box-sizing:border-box; }}
+    html, body {{ width:100%; max-width:100%; overflow-x:auto; }}
+    body {{ margin:0; background:var(--bg); color:var(--ink); font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic", Arial, sans-serif; -webkit-font-smoothing:antialiased; }}
+    main {{ width:min(100%, 1440px); min-width:0; margin:0 auto; padding:28px 24px 48px; }}
+    h1 {{ margin:0; font-size:28px; line-height:1.25; letter-spacing:0; font-weight:850; }}
+    h2 {{ margin:30px 0 10px; font-size:20px; letter-spacing:0; }}
+    .app-header {{ display:flex; align-items:flex-start; justify-content:space-between; gap:24px; margin-bottom:22px; }}
+    .brand-kicker {{ display:inline-flex; align-items:center; gap:6px; color:var(--blue); background:var(--blue-soft); border-radius:999px; padding:6px 10px; font-size:12px; font-weight:800; margin-bottom:10px; }}
+    .meta {{ color:var(--muted); line-height:1.6; margin-top:8px; font-size:13px; }}
+    .header-actions {{ display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }}
+    .status-pill {{ display:inline-flex; align-items:center; min-height:34px; border-radius:999px; padding:0 12px; background:#fff; border:1px solid var(--line); color:var(--sub); font-weight:750; box-shadow:0 1px 2px rgba(25,31,40,.04); }}
+    .grid {{ display:grid; grid-template-columns:repeat(6, minmax(130px, 1fr)); gap:8px; margin-top:14px; }}
+    .stat {{ background:var(--panel); border:1px solid var(--line2); border-radius:14px; padding:14px 14px 13px; box-shadow:0 1px 2px rgba(25,31,40,.025); }}
+    .stat span {{ display:block; color:var(--muted); font-size:12px; margin-bottom:7px; font-weight:700; }}
+    .stat strong {{ display:block; font-size:24px; letter-spacing:-.2px; }}
+    .panel {{ margin-top:12px; max-width:100%; min-width:0; background:var(--panel); border:1px solid var(--line2); border-radius:16px; overflow:hidden; box-shadow:var(--shadow); }}
+    .section-title {{ margin:0 0 8px; font-size:19px; line-height:1.35; font-weight:850; }}
+    .section-subtitle {{ margin:0 0 14px; color:var(--muted); font-size:13px; line-height:1.6; }}
+    .workspace-tabs {{ margin-top:22px; min-width:0; max-width:100%; }}
+    .tab-nav {{ display:flex; gap:4px; flex-wrap:wrap; padding:8px; background:rgba(255,255,255,.92); border:1px solid var(--line2); border-radius:18px; position:sticky; top:10px; z-index:5; box-shadow:var(--shadow); backdrop-filter:blur(14px); }}
+    .tab-group-label {{ flex-basis:100%; color:#b0b8c1; font-size:10px; font-weight:850; padding:7px 8px 2px; text-transform:uppercase; letter-spacing:.04em; }}
+    .tab-button {{ border:0; border-radius:12px; background:transparent; color:var(--sub); padding:10px 13px; cursor:pointer; font-weight:800; transition:background .14s ease, color .14s ease; }}
+    .tab-button:hover {{ background:#f2f4f6; }}
+    .tab-button.active {{ background:var(--blue); color:#fff; box-shadow:0 6px 14px rgba(49,130,246,.22); }}
+    .tab-panel {{ display:none; padding-top:24px; min-width:0; max-width:100%; }}
     .tab-panel.active {{ display:block; }}
-    .section-stack {{ display:grid; gap:18px; }}
+    .section-stack {{ display:grid; gap:18px; min-width:0; }}
+    .overview-layout {{ display:grid; gap:18px; min-width:0; }}
+    .service-grid {{ display:grid; grid-template-columns:repeat(4, minmax(190px, 1fr)); gap:10px; }}
+    .service-card {{ background:#fff; border:1px solid var(--line2); border-radius:18px; padding:17px; box-shadow:var(--shadow); }}
+    .service-card strong, .service-card span, .service-card em {{ display:block; }}
+    .service-card strong {{ font-size:15px; }}
+    .service-card span {{ color:#475569; margin-top:5px; }}
+    .service-card em {{ color:var(--blue); font-style:normal; font-weight:850; margin-top:9px; font-size:18px; }}
+    .service-card p {{ margin:8px 0 0; color:var(--muted); font-size:13px; line-height:1.45; }}
+    .flow-grid {{ display:grid; grid-template-columns:repeat(5, minmax(150px, 1fr)); gap:8px; }}
+    .flow-step {{ position:relative; background:#fff; border:1px solid var(--line2); border-radius:16px; padding:15px; min-height:100px; box-shadow:0 1px 2px rgba(25,31,40,.025); }}
+    .flow-step strong, .flow-step span {{ display:block; }}
+    .flow-step span {{ color:var(--muted); margin-top:7px; font-size:13px; line-height:1.45; }}
+    .use-order {{ display:grid; grid-template-columns:repeat(4, minmax(170px, 1fr)); gap:10px; }}
+    .use-order div {{ background:#fff; border:1px solid var(--line2); border-radius:16px; padding:15px; box-shadow:0 1px 2px rgba(25,31,40,.025); }}
+    .use-order strong, .use-order span {{ display:block; }}
+    .use-order span {{ color:var(--muted); margin-top:6px; line-height:1.45; }}
+    .service-table {{ display:grid; gap:8px; }}
+    .service-row {{ display:grid; grid-template-columns:180px 1fr 180px 1.3fr; gap:12px; align-items:start; background:#fff; border:1px solid var(--line2); border-radius:16px; padding:15px; box-shadow:0 1px 2px rgba(25,31,40,.025); }}
+    .service-row span {{ color:var(--muted); }}
+    .service-row em {{ color:#334155; font-style:normal; }}
     .action-grid {{ display:grid; grid-template-columns:repeat(4, minmax(180px, 1fr)); gap:10px; }}
-    .action-card {{ border:1px solid var(--line); border-radius:10px; background:#fff; padding:12px; }}
+    .action-card {{ border:1px solid var(--line2); border-radius:16px; background:#fff; padding:15px; box-shadow:0 1px 2px rgba(25,31,40,.025); }}
     .action-card > strong {{ display:block; margin-bottom:8px; }}
     .action-card ul {{ list-style:none; padding:0; margin:0; display:grid; gap:8px; }}
     .action-card li strong, .action-card li span {{ display:block; }}
     .action-card li span {{ color:var(--muted); font-size:12px; margin-top:2px; }}
-    .status-band {{ display:flex; gap:14px; flex-wrap:wrap; align-items:center; background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px; margin:14px 0; box-shadow:0 1px 2px rgba(15,23,42,.04); }}
+    .today-shell {{ display:grid; gap:18px; }}
+    .analysis-hero {{ display:grid; grid-template-columns:minmax(280px, .85fr) 1.15fr; gap:16px; align-items:stretch; background:#fff; border:1px solid var(--line2); border-radius:22px; padding:20px; box-shadow:var(--shadow); margin-bottom:14px; }}
+    .analysis-hero h2 {{ margin:0; font-size:24px; line-height:1.32; }}
+    .analysis-hero p {{ margin:9px 0 0; color:var(--muted); line-height:1.6; }}
+    .analysis-strip {{ margin:0; box-shadow:none; align-content:stretch; }}
+    .analysis-table {{ display:block; width:100%; max-width:calc(100vw - 48px); overflow-x:auto; overflow-y:hidden; overscroll-behavior-x:contain; }}
+    .analysis-table table {{ min-width:1760px; width:1760px; }}
+    .analysis-table::-webkit-scrollbar, .x-scroll-proxy::-webkit-scrollbar {{ height:13px; }}
+    .analysis-table::-webkit-scrollbar-track, .x-scroll-proxy::-webkit-scrollbar-track {{ background:#edf1f5; border-radius:999px; }}
+    .analysis-table::-webkit-scrollbar-thumb, .x-scroll-proxy::-webkit-scrollbar-thumb {{ background:#9aa6b2; border-radius:999px; border:3px solid #edf1f5; }}
+    .analysis-table th:nth-child(2), .analysis-table td:nth-child(2) {{ position:sticky; left:0; z-index:2; background:#fff; box-shadow:1px 0 0 var(--line2); }}
+    .analysis-table th:nth-child(2) {{ background:#fbfcfd; z-index:3; }}
+    .analysis-summary {{ display:grid; grid-template-columns:repeat(6, minmax(130px, 1fr)); gap:8px; padding:14px; border-bottom:1px solid var(--line2); background:#fff; }}
+    .analysis-summary div {{ background:#f8fafc; border:1px solid #eef2f6; border-radius:14px; padding:12px; min-height:72px; }}
+    .analysis-summary span, .analysis-summary strong, .analysis-summary em {{ display:block; }}
+    .analysis-summary span {{ color:var(--muted); font-size:12px; font-weight:800; }}
+    .analysis-summary strong {{ margin-top:5px; font-size:18px; }}
+    .analysis-summary em {{ margin-top:3px; color:var(--muted); font-style:normal; font-size:12px; }}
+    .x-scroll-proxy {{ display:block; width:100%; max-width:calc(100vw - 48px); overflow-x:auto; overflow-y:hidden; height:20px; padding:3px 0; background:#fff; border-bottom:1px solid var(--line2); }}
+    .x-scroll-proxy > div {{ width:1760px; height:1px; }}
+    .secondary-details {{ background:#fff; border:1px solid var(--line2); border-radius:18px; box-shadow:var(--shadow); overflow:hidden; }}
+    .secondary-details summary {{ cursor:pointer; padding:16px 18px; font-weight:850; color:var(--sub); }}
+    .secondary-details[open] summary {{ border-bottom:1px solid var(--line2); }}
+    .secondary-details .today-shell {{ padding:18px; }}
+    .overview-metrics {{ padding:18px; display:grid; gap:14px; }}
+    .today-hero {{ display:flex; justify-content:space-between; gap:18px; align-items:flex-start; background:#fff; border:1px solid var(--line2); border-radius:22px; padding:22px; box-shadow:var(--shadow); }}
+    .today-hero h2 {{ margin:0; font-size:25px; line-height:1.32; }}
+    .today-hero p {{ margin:9px 0 0; color:var(--muted); line-height:1.6; }}
+    .operator-strip {{ display:grid; grid-template-columns:repeat(6, minmax(120px, 1fr)); gap:8px; }}
+    .operator-strip div {{ background:#fff; border:1px solid var(--line2); border-radius:16px; padding:14px; box-shadow:0 1px 2px rgba(25,31,40,.025); }}
+    .operator-strip span, .operator-strip strong {{ display:block; }}
+    .operator-strip span {{ color:var(--muted); font-size:12px; font-weight:750; margin-bottom:6px; }}
+    .operator-strip strong {{ font-size:18px; }}
+    .today-grid-main {{ display:grid; grid-template-columns:1.25fr 1fr; gap:14px; }}
+    .today-grid-secondary {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }}
+    .today-column {{ background:#fff; border:1px solid var(--line2); border-radius:20px; padding:18px; box-shadow:var(--shadow); }}
+    .today-column h3 {{ margin:0; font-size:18px; }}
+    .today-column > p {{ margin:7px 0 14px; color:var(--muted); font-size:13px; line-height:1.55; }}
+    .signal-list {{ display:grid; gap:10px; }}
+    .signal-list.compact {{ grid-template-columns:repeat(2, minmax(220px, 1fr)); }}
+    .signal-card {{ border:1px solid var(--line2); border-radius:18px; padding:15px; background:#fff; box-shadow:0 1px 2px rgba(25,31,40,.025); }}
+    .signal-buy {{ border-color:#bce9d1; background:linear-gradient(180deg, #fbfffd 0%, #fff 100%); }}
+    .signal-watch {{ border-color:#ffe2a8; }}
+    .signal-blocked {{ border-color:#ffd5d8; }}
+    .signal-head {{ display:flex; justify-content:space-between; align-items:center; gap:10px; }}
+    .signal-head strong, .signal-head .symbol-link {{ font-size:18px; }}
+    .signal-card p {{ margin:10px 0 12px; color:#4e5968; line-height:1.55; font-size:13px; }}
+    .signal-metrics {{ display:grid; grid-template-columns:repeat(4, minmax(86px, 1fr)); gap:8px; }}
+    .signal-metrics div {{ background:#f9fafb; border-radius:13px; padding:10px; min-height:66px; }}
+    .signal-metrics span, .signal-metrics strong, .signal-metrics em {{ display:block; }}
+    .signal-metrics span {{ color:var(--muted); font-size:11px; font-weight:800; }}
+    .signal-metrics strong {{ margin-top:5px; font-size:15px; }}
+    .signal-metrics em {{ margin-top:3px; color:var(--muted); font-size:12px; font-style:normal; }}
+    .signal-foot {{ display:flex; justify-content:space-between; color:var(--muted); font-size:12px; margin-top:10px; }}
+    .signal-users {{ margin-top:8px; }}
+    .new-buy-list {{ list-style:none; padding:0; margin:0; display:grid; gap:9px; }}
+    .new-buy-list li {{ border:1px solid var(--line2); border-radius:14px; padding:11px 12px; }}
+    .new-buy-list strong, .new-buy-list span {{ display:block; }}
+    .new-buy-list span {{ color:var(--muted); font-size:12px; margin-top:4px; }}
+    .status-band {{ display:flex; gap:14px; flex-wrap:wrap; align-items:center; background:#fff; border:1px solid var(--line2); border-radius:16px; padding:15px; margin:14px 0; box-shadow:var(--shadow); }}
     .status-band span {{ color:var(--muted); }}
     .todo-grid {{ display:grid; grid-template-columns:repeat(4, minmax(160px, 1fr)); gap:10px; margin-top:10px; }}
-    .todo {{ background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px; box-shadow:0 1px 2px rgba(15,23,42,.04); }}
+    .todo {{ background:#fff; border:1px solid var(--line2); border-radius:16px; padding:15px; box-shadow:0 1px 2px rgba(25,31,40,.025); }}
     .todo strong, .todo span {{ display:block; }}
     .todo span {{ color:var(--muted); margin-top:6px; line-height:1.45; }}
     .ai-brief h3 {{ margin:0 0 8px; font-size:18px; }}
     .ai-brief h4 {{ margin:18px 0 10px; font-size:15px; }}
     .ai-card-grid {{ display:grid; grid-template-columns:repeat(4, minmax(190px, 1fr)); gap:10px; }}
-    .ai-card {{ border:1px solid var(--line); border-radius:10px; background:#fff; padding:12px; }}
+    .ai-card {{ border:1px solid var(--line2); border-radius:16px; background:#fff; padding:15px; box-shadow:0 1px 2px rgba(25,31,40,.025); }}
     .ai-card strong, .ai-card span {{ display:block; }}
     .ai-card span {{ color:var(--muted); font-size:12px; margin-top:4px; }}
     .ai-card p {{ margin:8px 0 0; color:#334155; font-size:13px; line-height:1.45; }}
     .brief-list {{ margin:8px 0 0; padding-left:20px; color:#334155; line-height:1.7; }}
     .inner-panel {{ margin-top:0; }}
     table {{ width:100%; border-collapse:collapse; }}
-    th, td {{ border-bottom:1px solid var(--line2); padding:10px 12px; text-align:left; vertical-align:top; font-size:13px; line-height:1.45; }}
-    th {{ background:#f1f5f9; color:#334155; position:sticky; top:0; z-index:1; font-size:12px; font-weight:800; }}
+    th, td {{ border-bottom:1px solid var(--line2); padding:13px 14px; text-align:left; vertical-align:top; font-size:13px; line-height:1.5; }}
+    th {{ background:#fbfcfd; color:#6b7684; position:sticky; top:0; z-index:1; font-size:12px; font-weight:850; }}
     tr:last-child td {{ border-bottom:0; }}
-    tbody tr:hover {{ background:#fbfdff; }}
-    a {{ color:var(--blue); font-weight:700; text-decoration:none; }}
+    tbody tr:hover {{ background:#f9fbff; }}
+    a {{ color:var(--blue); font-weight:750; text-decoration:none; }}
     button {{ font:inherit; }}
-    input, select {{ min-height:34px; border:1px solid var(--line); border-radius:7px; background:#fff; color:var(--ink); padding:0 10px; font:inherit; font-size:13px; }}
+    input, select {{ min-height:38px; border:1px solid var(--line); border-radius:12px; background:#fff; color:var(--ink); padding:0 12px; font:inherit; font-size:13px; outline:none; }}
+    input:focus, select:focus {{ border-color:var(--blue); box-shadow:0 0 0 3px rgba(49,130,246,.12); }}
     input[type="search"] {{ min-width:240px; }}
     label {{ display:inline-flex; align-items:center; gap:6px; color:#334155; font-size:13px; }}
     .link-btn {{ border:0; background:transparent; color:var(--blue); font-weight:800; padding:0; cursor:pointer; text-align:left; }}
+    .symbol-link {{ border:0; background:transparent; color:var(--ink); font-weight:850; padding:0; cursor:pointer; text-align:left; display:block; }}
+    .symbol-link:hover {{ color:var(--blue); }}
     .mini-link {{ display:block; margin-top:4px; font-size:11px; color:var(--muted); }}
-    .icon-btn {{ border:1px solid var(--line); border-radius:7px; background:#fff; padding:7px 10px; cursor:pointer; }}
-    .chip {{ display:inline-block; margin:2px 4px 2px 0; padding:3px 7px; border:1px solid var(--line); border-radius:999px; background:#f8fafc; white-space:nowrap; font-size:12px; color:#334155; }}
+    .icon-btn {{ border:1px solid var(--line); border-radius:11px; background:#fff; padding:8px 11px; cursor:pointer; }}
+    .chip {{ display:inline-block; margin:2px 4px 2px 0; padding:4px 8px; border:1px solid #e8edf4; border-radius:999px; background:#f8fafc; white-space:nowrap; font-size:12px; color:#4e5968; font-weight:700; }}
     .pos {{ color:var(--pos); font-weight:700; }}
     .neg {{ color:var(--neg); font-weight:700; }}
     .muted {{ color:var(--muted); }}
     .block {{ display:block; margin-top:3px; }}
-    .empty {{ margin:0; padding:16px; color:var(--muted); background:var(--panel); border:1px solid var(--line); border-radius:8px; }}
+    .empty {{ margin:0; padding:18px; color:var(--muted); background:var(--panel); border:1px solid var(--line2); border-radius:14px; }}
     .note {{ margin:12px 0; color:var(--muted); line-height:1.6; font-size:13px; }}
-    .table-shell {{ overflow:auto; }}
-    .table-toolbar {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:12px; border-bottom:1px solid var(--line); background:#fbfcfe; }}
+    .table-shell {{ display:block; width:100%; max-width:100%; min-width:0; overflow:auto; }}
+    .table-toolbar {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:14px; border-bottom:1px solid var(--line2); background:#fff; }}
     .table-toolbar select:last-child {{ margin-left:auto; }}
     .rank-table {{ min-width:1180px; }}
     .rank-no {{ color:var(--muted); font-weight:800; width:44px; }}
@@ -5410,10 +6809,10 @@ def unified_dashboard_report() -> dict[str, Any]:
     .tag-row {{ margin-top:6px; }}
     .score-stack strong {{ display:block; font-size:17px; }}
     .score-stack span {{ color:var(--muted); font-size:12px; }}
-    .decision {{ display:inline-block; padding:5px 8px; border-radius:7px; background:#f1f5f9; color:#334155; font-weight:800; }}
-    .decision-good {{ background:#ecfdf3; color:#067647; }}
-    .decision-warn {{ background:#fffaeb; color:#b54708; }}
-    .decision-bad {{ background:#fef3f2; color:#b42318; }}
+    .decision {{ display:inline-block; padding:6px 9px; border-radius:999px; background:#f2f4f6; color:#4e5968; font-weight:850; }}
+    .decision-good {{ background:#e9f9f0; color:#008a4e; }}
+    .decision-warn {{ background:#fff6e6; color:#b76e00; }}
+    .decision-bad {{ background:#fff0f1; color:#e42939; }}
     .pager {{ display:flex; justify-content:flex-end; align-items:center; gap:10px; padding:12px; border-top:1px solid var(--line); background:#fbfcfe; }}
     .pager button {{ border:1px solid var(--line); border-radius:7px; background:#fff; padding:7px 12px; cursor:pointer; }}
     .pager button:disabled {{ color:#98a2b3; background:#f8fafc; cursor:not-allowed; }}
@@ -5431,66 +6830,65 @@ def unified_dashboard_report() -> dict[str, Any]:
     .detail-section h4 {{ margin:0 0 8px; font-size:15px; }}
     .ai-box {{ margin:0 0 8px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#f8fafc; font-weight:700; }}
     .report-archive {{ display:grid; gap:10px; }}
-    .report-post {{ border:1px solid var(--line); border-radius:10px; background:#fff; overflow:hidden; box-shadow:0 1px 2px rgba(15,23,42,.04); }}
-    .report-post summary {{ cursor:pointer; display:grid; grid-template-columns:220px 120px 1fr auto; gap:10px; align-items:center; padding:13px 14px; background:#f8fafc; list-style:none; }}
+    .report-post {{ border:1px solid var(--line2); border-radius:16px; background:#fff; overflow:hidden; box-shadow:var(--shadow); }}
+    .report-post summary {{ cursor:pointer; display:grid; grid-template-columns:220px 120px 1fr auto; gap:10px; align-items:center; padding:16px; background:#fff; list-style:none; }}
     .report-post summary::-webkit-details-marker {{ display:none; }}
     .report-post summary span {{ color:var(--muted); font-size:12px; }}
     .report-post summary em {{ color:#334155; font-style:normal; font-size:13px; line-height:1.4; }}
     .report-body {{ padding:14px; border-top:1px solid var(--line); display:grid; gap:12px; }}
     .report-body h4 {{ margin:8px 0 0; font-size:14px; }}
-    @media (max-width: 1000px) {{ main {{ padding:14px; }} .grid, .todo-grid, .action-grid, .ai-card-grid {{ grid-template-columns:repeat(2, minmax(130px, 1fr)); }} .panel {{ overflow-x:auto; }} th, td {{ white-space:nowrap; }} input[type="search"] {{ min-width:180px; }} }}
-    @media (max-width: 700px) {{ .detail-grid {{ grid-template-columns:repeat(2, minmax(130px, 1fr)); }} .dialog-body {{ padding:14px; }} .table-toolbar select:last-child {{ margin-left:0; }} .pager {{ justify-content:center; }} .tab-nav {{ position:static; }} .tab-button {{ flex:1 1 46%; }} .report-post summary {{ grid-template-columns:1fr; }} }}
+    @media (max-width: 1000px) {{ main {{ padding:14px; }} .grid, .todo-grid, .action-grid, .ai-card-grid, .service-grid, .flow-grid, .use-order, .operator-strip, .analysis-summary {{ grid-template-columns:repeat(2, minmax(130px, 1fr)); }} .analysis-table, .x-scroll-proxy {{ max-width:calc(100vw - 28px); }} .today-grid-main, .today-grid-secondary {{ grid-template-columns:1fr; }} .service-row {{ grid-template-columns:1fr 1fr; }} .panel {{ overflow-x:auto; }} th, td {{ white-space:nowrap; }} input[type="search"] {{ min-width:180px; }} }}
+    @media (max-width: 700px) {{ .app-header, .today-hero {{ flex-direction:column; }} .analysis-hero, .detail-grid, .service-grid, .flow-grid, .use-order, .operator-strip, .signal-list.compact, .signal-metrics {{ grid-template-columns:1fr; }} .service-row {{ grid-template-columns:1fr; }} .dialog-body {{ padding:14px; }} .table-toolbar select:last-child {{ margin-left:0; }} .pager {{ justify-content:center; }} .tab-nav {{ position:static; }} .tab-button {{ flex:1 1 46%; }} .report-post summary {{ grid-template-columns:1fr; }} }}
   </style>
 </head>
 <body>
 <main>
-  <h1>AI 투자 통합 대시보드</h1>
-  <div class="meta">생성: {generated_at} · 단일 HTML: {html.escape(str(UNIFIED_HTML_PATH.name))} · 단일 통합 JSON: {html.escape(str(UNIFIED_DATA_PATH.name))}</div>
-  <section>{render_weekend_prep(data)}</section>
-  <section class="grid">
-    <div class="stat"><span>후보 유저</span><strong>{summary.get('candidate_count', 0):,}</strong></div>
-    <div class="stat"><span>수집 유저</span><strong>{summary.get('profile_count', 0):,}</strong></div>
-    <div class="stat"><span>거래 접근 가능</span><strong>{summary.get('accessible_profile_count', 0):,}</strong></div>
-    <div class="stat"><span>거래 이벤트</span><strong>{summary.get('profile_trade_event_count', 0):,}</strong></div>
-    <div class="stat"><span>깊이조회 유저</span><strong>{summary.get('deep_scanned_profile_count', 0):,}</strong></div>
-    <div class="stat"><span>검증 이벤트</span><strong>{summary.get('strategy_tested_event_count', 0):,}</strong></div>
-    <div class="stat"><span>신뢰도 산출 유저</span><strong>{summary.get('reliable_author_count', 0):,}</strong></div>
-    <div class="stat"><span>최종 순위 유저</span><strong>{summary.get('final_ranked_user_count', 0):,}</strong></div>
-    <div class="stat"><span>종목 랭킹</span><strong>{summary.get('symbol_trade_ranked_count', 0):,}</strong></div>
-    <div class="stat"><span>수익권 보유 종목</span><strong>{summary.get('holding_accumulation_ranked_count', 0):,}</strong></div>
-    <div class="stat"><span>스캔 대상</span><strong>{summary.get('scan_target_count', 0):,}</strong></div>
-    <div class="stat"><span>최근매수 후보</span><strong>{summary.get('recent_buy_recommendation_count', 0):,}</strong></div>
-    <div class="stat"><span>Daily Scan 유저</span><strong>{summary.get('daily_scanned_profile_count', 0):,}</strong></div>
-    <div class="stat"><span>Daily 신규 이벤트</span><strong>{summary.get('daily_new_event_count', 0):,}</strong></div>
-    <div class="stat"><span>Daily 신규 매수</span><strong>{summary.get('daily_new_buy_count', 0):,}</strong></div>
-    <div class="stat"><span>Holdings 확인</span><strong>{summary.get('daily_holding_profile_count', 0):,}</strong></div>
-    <div class="stat"><span>최종 리포트</span><strong>{summary.get('operation_report_count', 0):,}</strong></div>
-  </section>
-
+  <header class="app-header">
+    <div>
+      <span class="brand-kicker">Public Data AI Research</span>
+      <h1>AI 투자 통합 대시보드</h1>
+      <div class="meta">생성: {generated_at} · 단일 HTML: {html.escape(str(UNIFIED_HTML_PATH.name))} · 단일 통합 JSON: {html.escape(str(UNIFIED_DATA_PATH.name))}</div>
+    </div>
+    <div class="header-actions">
+      <span class="status-pill">읽기 전용</span>
+      <span class="status-pill">{html.escape(str(summary.get('operating_mode') or 'market_closed'))}</span>
+      <span class="status-pill">상위 {summary.get('scan_target_count', 0):,}명 감시</span>
+    </div>
+  </header>
   <section class="workspace-tabs">
     <nav class="tab-nav" aria-label="대시보드 메뉴">
-      <button type="button" class="tab-button active" data-tab-target="today">오늘 볼 것</button>
+      <span class="tab-group-label">Overview</span>
+      <button type="button" class="tab-button active" data-tab-target="overview">운영 개요</button>
+      <button type="button" class="tab-button" data-tab-target="today">장중 판단</button>
       <button type="button" class="tab-button" data-tab-target="brief">AI 브리핑</button>
-      <button type="button" class="tab-button" data-tab-target="symbols">종목 분석</button>
+      <span class="tab-group-label">Models</span>
+      <button type="button" class="tab-button" data-tab-target="symbols">종목 모델</button>
+      <button type="button" class="tab-button" data-tab-target="confirm">종목 컨펌</button>
       <button type="button" class="tab-button" data-tab-target="accumulation">수익권 보유</button>
-      <button type="button" class="tab-button" data-tab-target="users">유저 랭킹</button>
-      <button type="button" class="tab-button" data-tab-target="ops">최종 리포트</button>
+      <button type="button" class="tab-button" data-tab-target="users">유저 모델</button>
+      <span class="tab-group-label">Operations</span>
+      <button type="button" class="tab-button" data-tab-target="ops">리포트 보관함</button>
+      <button type="button" class="tab-button" data-tab-target="data">데이터·서비스</button>
       <button type="button" class="tab-button" data-tab-target="risk">리스크</button>
-      <button type="button" class="tab-button" data-tab-target="system">시스템</button>
+      <button type="button" class="tab-button" data-tab-target="system">파이프라인</button>
     </nav>
 
-    <section id="tab-today" class="tab-panel active">
+    <section id="tab-overview" class="tab-panel active">
+      {render_operating_overview(data)}
+    </section>
+
+    <section id="tab-today" class="tab-panel">
       <div class="section-stack">
         <div>
-          <h2 class="section-title">장중 의사결정 보드</h2>
-          <p class="section-subtitle">최근매수 후보를 매수 후보/관망/제외로 나누고, 과거 종목 랭킹 상위도 같이 보여줍니다.</p>
-          {render_intraday_action_board(recent_buy, symbol_trade_rankings)}
-        </div>
-        <div>
-          <h2 class="section-title">최근 매수 추천</h2>
-          <p class="section-subtitle">상위 유저들이 최근 window 안에서 산 종목을 모아, 현재가와 신뢰도 기준으로 후보를 보여줍니다.</p>
+          {render_today_analysis_header(data)}
+          <h2 class="section-title">장중 판단 상세 테이블</h2>
+          <p class="section-subtitle">가장 먼저 보는 메인 화면입니다. 유저신호 점수는 원본 신호, AI 종합점수는 가격·뉴스·종목정보·거래정보·수익권 보유를 합친 보조 판단입니다. 종목명을 누르면 근거 전체를 봅니다.</p>
           <div class="panel">{render_unified_recent_buys(recent_buy)}</div>
         </div>
+        <details class="secondary-details">
+          <summary>요약 카드 보기</summary>
+          {render_today_command_center(data)}
+        </details>
         <div>
           <h2 class="section-title">Daily Scan 신규 매수</h2>
           <p class="section-subtitle">마지막 스캔 이후 새로 잡힌 매수 이벤트입니다. 장중에는 이 영역이 가장 먼저 볼 곳입니다.</p>
@@ -5513,6 +6911,14 @@ def unified_dashboard_report() -> dict[str, Any]:
         <h2 class="section-title">종목 기준 거래 랭킹</h2>
         <p class="section-subtitle">수집된 유저 거래를 종목별로 재집계합니다. 레버리지/인버스 종목은 빼고, 비레버리지 단타 성과와 신뢰 유저 참여를 봅니다.</p>
         <div class="panel">{render_symbol_trade_rankings(symbol_trade_rankings)}</div>
+      </div>
+    </section>
+
+    <section id="tab-confirm" class="tab-panel">
+      <div>
+        <h2 class="section-title">종목 컨펌</h2>
+        <p class="section-subtitle">유저 매수 신호가 나온 종목을 Toss 종목정보/거래정보/뉴스 공개 데이터로 다시 확인합니다. 장중에는 여기서 수급과 뉴스가 같이 받쳐주는지 먼저 봅니다.</p>
+        <div class="panel">{render_stock_confirmation(stock_confirmation)}</div>
       </div>
     </section>
 
@@ -5552,6 +6958,21 @@ def unified_dashboard_report() -> dict[str, Any]:
       </div>
     </section>
 
+    <section id="tab-data" class="tab-panel">
+      <div class="section-stack">
+        <div>
+          <h2 class="section-title">데이터 수집 목록</h2>
+          <p class="section-subtitle">현재 시스템이 가져오는 데이터, 출처, 필드, 활용처를 한 곳에서 봅니다.</p>
+          <div class="panel">{render_data_catalog(data)}</div>
+        </div>
+        <div>
+          <h2 class="section-title">제공 서비스 목록</h2>
+          <p class="section-subtitle">각 서비스가 어떤 데이터를 입력으로 쓰고, 어느 화면에서 어떤 결과를 제공하는지 정리합니다.</p>
+          {render_service_catalog(data)}
+        </div>
+      </div>
+    </section>
+
     <section id="tab-ops" class="tab-panel">
       <div>
         <h2 class="section-title">서비스별 최종 리포트</h2>
@@ -5571,7 +6992,7 @@ def unified_dashboard_report() -> dict[str, Any]:
 
   <p class="note">이 대시보드는 조회/분석용입니다. 주문 실행, 계좌 변경, tossctl 거래 명령은 포함하지 않습니다. 내부 계산용 JSON은 파이프라인 재실행을 위해 남겨두고, 사람이 볼 결과물은 이 HTML 하나로 통합했습니다.</p>
 </main>
-{render_user_detail_dialog(final_user_rankings)}
+{render_user_detail_dialog(final_user_rankings, build_symbol_detail_payload(data))}
 </body>
 </html>
 """

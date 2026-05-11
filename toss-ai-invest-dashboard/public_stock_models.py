@@ -1314,11 +1314,15 @@ def fetch_profile_trade_history(
     headers: dict[str, str],
     max_pages: int = 2,
     delay_seconds: float = 1.5,
+    cutoff_dt: dt.datetime | None = None,
 ) -> dict[str, Any]:
+    """cutoff_dt 지정 시 그 시각 이전 거래 만나면 페이지 더 안 부름.
+    max_pages는 cutoff 없을 때 또는 안전망 (default 2). cutoff 사용 시 max_pages를 크게(예 10) 줘서 자유 페이지화."""
     profile_id = str(profile["profile_id"])
     events: list[dict[str, Any]] = []
     cursor: dict[str, Any] = {"pageDirection": "DOWN", "includeReply": False}
     seen_cursors = set()
+    stop_due_to_cutoff = False
     for page_no in range(max(1, max_pages)):
         cursor_key = json.dumps(cursor, sort_keys=True, ensure_ascii=False)
         if cursor_key in seen_cursors:
@@ -1337,6 +1341,16 @@ def fetch_profile_trade_history(
                 continue
             events.append(event)
 
+        # cutoff 체크: 이 페이지에서 가장 오래된 거래가 cutoff 이전이면 다음 페이지 호출 X
+        if cutoff_dt is not None and page_events:
+            oldest_in_page = None
+            for ev in page_events:
+                ts = parse_dt(ev.get("acted_at"))
+                if ts and (oldest_in_page is None or ts < oldest_in_page):
+                    oldest_in_page = ts
+            if oldest_in_page is not None and oldest_in_page < cutoff_dt:
+                stop_due_to_cutoff = True
+
         next_trade_id = None
         next_acted_at = None
         for node in iter_dicts(result_payload):
@@ -1349,6 +1363,8 @@ def fetch_profile_trade_history(
             )
             next_acted_at = next_acted_at or node.get("lastActedAt") or node.get("actedAt") or context.get("lastExecutedAt")
         if not next_trade_id or not next_acted_at:
+            break
+        if stop_due_to_cutoff:
             break
         cursor = {
             "pageDirection": "DOWN",
@@ -1823,6 +1839,9 @@ def daily_profile_scan(
     profile_limit: int,
     delay_seconds: float,
     include_holdings: bool,
+    max_workers: int = 4,
+    max_pages: int = 2,
+    cutoff_hours: float | None = None,
 ) -> dict[str, Any]:
     if not acknowledged:
         raise ValueError("--i-understand-session-risk is required before using a logged-in browser session")
@@ -1842,17 +1861,28 @@ def daily_profile_scan(
     new_events = []
     errors = []
     holdings_rows = []
-    for profile in profiles:
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    keys_lock = threading.Lock()
+    cutoff_dt = None
+    if cutoff_hours and cutoff_hours > 0:
+        cutoff_dt = now_kst().astimezone(dt.timezone.utc) - dt.timedelta(hours=cutoff_hours)
+
+    def scan_one(profile: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {"profile": profile, "status": "ok"}
         try:
-            row = fetch_profile_trade_history(profile, headers, max_pages=1, delay_seconds=delay_seconds)
-            profile_new_events = [event for event in row.get("events") or [] if profile_event_key(event) not in existing_keys]
-            new_events.extend(profile_new_events)
-            existing_keys.update(profile_event_key(event) for event in profile_new_events)
-            scanned_rows.append({
+            row = fetch_profile_trade_history(profile, headers, max_pages=max_pages, delay_seconds=delay_seconds, cutoff_dt=cutoff_dt)
+            page_events = row.get("events") or []
+            with keys_lock:
+                profile_new = [e for e in page_events if profile_event_key(e) not in existing_keys]
+                for e in profile_new:
+                    existing_keys.add(profile_event_key(e))
+            result["row"] = {
                 "profile_id": row.get("profile_id"),
                 "nickname": row.get("nickname"),
                 "latest_event_count": row.get("event_count"),
-                "new_event_count": len(profile_new_events),
+                "new_event_count": len(profile_new),
                 "selection_source": profile.get("selection_source"),
                 "selection_score": profile.get("selection_score"),
                 "selection_score_after_holdings": profile.get("selection_score_after_holdings"),
@@ -1863,11 +1893,13 @@ def daily_profile_scan(
                 "win_rate": profile.get("win_rate"),
                 "latest_trade_at": profile.get("latest_trade_at"),
                 "symbol_concentration": profile.get("symbol_concentration"),
-            })
+            }
+            result["new_events"] = profile_new
         except RuntimeError as exc:
             error = str(exc).split(":", 1)[-1].strip()[:240]
-            errors.append({"profile_id": profile.get("profile_id"), "nickname": profile.get("nickname"), "error": error})
-            scanned_rows.append({
+            result["status"] = "error"
+            result["error"] = error
+            result["row"] = {
                 "profile_id": profile.get("profile_id"),
                 "nickname": profile.get("nickname"),
                 "latest_event_count": 0,
@@ -1883,20 +1915,36 @@ def daily_profile_scan(
                 "latest_trade_at": profile.get("latest_trade_at"),
                 "symbol_concentration": profile.get("symbol_concentration"),
                 "error": error,
-            })
-
+            }
+            result["new_events"] = []
         if include_holdings:
             try:
-                holdings_rows.append(fetch_profile_holdings(profile, headers))
+                result["holdings"] = fetch_profile_holdings(profile, headers)
             except RuntimeError as exc:
-                holdings_rows.append({
+                result["holdings"] = {
                     "profile_id": profile.get("profile_id"),
                     "nickname": profile.get("nickname"),
                     "holdings": [],
                     "holding_count": 0,
                     "error": str(exc).split(":", 1)[-1].strip()[:240],
-                })
+                }
         time.sleep(delay_seconds)
+        return result
+
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+        futures = [pool.submit(scan_one, profile) for profile in profiles]
+        for fut in as_completed(futures):
+            res = fut.result()
+            scanned_rows.append(res["row"])
+            new_events.extend(res.get("new_events") or [])
+            if res["status"] == "error":
+                errors.append({
+                    "profile_id": res["profile"].get("profile_id"),
+                    "nickname": res["profile"].get("nickname"),
+                    "error": res.get("error"),
+                })
+            if "holdings" in res:
+                holdings_rows.append(res["holdings"])
 
     merged_events = dedupe_profile_events(existing_events + new_events)
     events_output = {
@@ -2116,6 +2164,7 @@ def profile_strategy_report(
     min_samples: int = 3,
     event_limit: int | None = None,
     incremental: bool = True,
+    half_life_days: float = 30.0,
 ) -> dict[str, Any]:
     if not PROFILE_HISTORY_REPORT_PATH.exists():
         raise ValueError("profile history report is missing; run --profile-history-report first")
@@ -2130,27 +2179,63 @@ def profile_strategy_report(
     rows = []
     cache_hits = 0
     recomputed = 0
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    cache_lock = threading.Lock()
+
+    # 1단계: cache hit/miss 분리 (락 없이 빠름)
+    miss_events = []
     for event in events:
         key = backtest_cache_key(event)
         cached_row = row_cache.get(key)
         if cached_row and row_has_usable_horizons(cached_row, horizons):
-            row = cached_row
+            cached_row["backtest_cache_key"] = key
+            rows.append(cached_row)
             cache_hits += 1
         else:
-            row = backtest_event(event, horizons, chart_cache=chart_cache, disk_chart_cache=disk_chart_cache)
-            recomputed += 1
-            if incremental and recomputed % 100 == 0:
-                if disk_chart_cache:
-                    chart_cache_write(disk_chart_cache)
-                PROFILE_BACKTEST_ROW_CACHE_PATH.write_text(json.dumps({
-                    "updated_at": now_kst().isoformat(),
-                    "mode": "profile-backtest-row-cache",
-                    "partial": True,
-                    "rows": list(row_cache.values()),
-                }, ensure_ascii=False), encoding="utf-8")
+            miss_events.append((key, event))
+
+    # 2단계: cache miss만 병렬 백테스트 (Yahoo Finance API 호출)
+    def process_miss(item):
+        key, event = item
+        row = backtest_event(event, horizons, chart_cache=chart_cache, disk_chart_cache=disk_chart_cache)
         row["backtest_cache_key"] = key
-        rows.append(row)
-        row_cache[key] = row
+        return key, row
+
+    worker_count = 6  # Yahoo Finance 동시 호출 안전선
+    if miss_events:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            futures = [pool.submit(process_miss, item) for item in miss_events]
+            for fut in as_completed(futures):
+                key, row = fut.result()
+                rows.append(row)
+                with cache_lock:
+                    row_cache[key] = row
+                    recomputed += 1
+                    # partial save를 lock 안에서 atomic 수행
+                    # (다른 worker는 lock release까지 wait — chart_cache 변경 없음)
+                    if incremental and recomputed % 1000 == 0:
+                        try:
+                            if disk_chart_cache:
+                                # lock 잡힌 상태에서 직렬화 (다른 thread가 chart_cache 변경 못함)
+                                chart_cache_payload = {
+                                    "updated_at": now_kst().isoformat(),
+                                    "mode": "chart-cache",
+                                    "entries": dict(disk_chart_cache),
+                                }
+                                CHART_CACHE_PATH.write_text(
+                                    json.dumps(chart_cache_payload, ensure_ascii=False),
+                                    encoding="utf-8",
+                                )
+                            PROFILE_BACKTEST_ROW_CACHE_PATH.write_text(json.dumps({
+                                "updated_at": now_kst().isoformat(),
+                                "mode": "profile-backtest-row-cache",
+                                "partial": True,
+                                "rows": list(row_cache.values()),
+                            }, ensure_ascii=False), encoding="utf-8")
+                        except Exception as exc:
+                            pass  # partial save 실패해도 진행 계속
     if disk_chart_cache:
         chart_cache_write(disk_chart_cache)
     by_author = []
@@ -2174,8 +2259,28 @@ def profile_strategy_report(
             continue
         non_leverage_author_rows = [row for row in author_rows if not is_leveraged_event(row)]
         non_leverage_values, non_leverage_short_values, non_leverage_horizon_stats = grouped_author_returns(non_leverage_author_rows, horizons)
-        avg_return = sum(values) / len(values)
-        win_rate = sum(1 for value in values if value > 0) / len(values)
+        # Recency-weighted avg/win (exp decay)
+        now_utc = now_kst().astimezone(dt.timezone.utc)
+        ln2 = math.log(2.0)
+        weighted_returns: list[tuple[float, float]] = []
+        for row in author_rows:
+            ts = parse_dt(row.get("timestamp") or row.get("acted_at"))
+            if not ts:
+                continue
+            age_days = max(0.0, (now_utc - ts).total_seconds() / 86400.0)
+            weight = math.exp(-age_days * ln2 / max(0.1, half_life_days))
+            for horizon_key in (f"{h}h" for h in horizons):
+                raw_ret = realized_returns(row, horizon_key)
+                ret = usable_strategy_return(raw_ret)
+                if ret is not None:
+                    weighted_returns.append((ret, weight))
+        if weighted_returns:
+            total_w = sum(w for _, w in weighted_returns)
+            avg_return = sum(r * w for r, w in weighted_returns) / total_w
+            win_rate = sum(w for r, w in weighted_returns if r > 0) / total_w
+        else:
+            avg_return = sum(values) / len(values)
+            win_rate = sum(1 for value in values if value > 0) / len(values)
         short_avg_return = sum(short_values) / len(short_values) if short_values else None
         short_win_rate = sum(1 for value in short_values if value > 0) / len(short_values) if short_values else None
         non_leverage_short_avg_return = (
@@ -2209,6 +2314,22 @@ def profile_strategy_report(
             default=None,
         )
         score = reliability_score(len(values), avg_return, win_rate, worst_return, symbol_conc, latest_trade_at)
+        # Trader frequency (F) — 거래 빈도 카테고리
+        trade_dates = [parse_dt(row.get("timestamp") or row.get("acted_at")) for row in author_rows]
+        trade_dates = [t for t in trade_dates if t]
+        if trade_dates:
+            span_days = max(1.0, (max(trade_dates) - min(trade_dates)).total_seconds() / 86400.0)
+            freq_per_week = len(author_rows) / (span_days / 7.0)
+        else:
+            freq_per_week = 0.0
+        if freq_per_week >= 10:
+            trader_freq = "단타"
+        elif freq_per_week >= 3:
+            trader_freq = "스윙"
+        elif freq_per_week > 0:
+            trader_freq = "장기"
+        else:
+            trader_freq = "미상"
         by_author.append({
             "author": author,
             "profile_id": next((row.get("profile_id") for row in author_rows if row.get("profile_id")), None),
@@ -2237,6 +2358,8 @@ def profile_strategy_report(
             "leveraged_buy_events": len(leveraged_events),
             "leverage_trade_ratio": round(leverage_ratio, 4),
             "trade_style": trade_style,
+            "trader_frequency": trader_freq,
+            "trade_freq_per_week": round(freq_per_week, 2),
             "latest_trade_at": latest_trade_at,
             "reliability_score": score,
             "expected_pnl_krw_on_10m": round(capital * avg_return),
@@ -2710,11 +2833,15 @@ def chase_entry_plan(
             "rule": "5% 근처 추격은 매우 강한 신호일 때만 소액",
         }
     if move <= 0.06:
+        if move < 0:
+            rule_msg = "매수가 근처(약한 눌림)지만 신뢰 유저 수/점수 부족"
+        else:
+            rule_msg = "유저 매수가보다 올라 기대수익/손절폭이 나빠짐"
         return {
             "decision": "관망",
             "max_chase_gap_pct": 3.0,
             "position_scale": 0.0,
-            "rule": "유저 매수가보다 많이 올라 기대수익/손절폭이 나빠짐",
+            "rule": rule_msg,
         }
     return {
         "decision": "추격금지",
@@ -2814,9 +2941,20 @@ def symbol_risk_tags(symbol: str | None, name: str | None = None, stock_code: st
     return tags or ["일반"]
 
 
-def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> dict[str, Any]:
+def build_recent_buy_report(
+    hours: float = 4.0,
+    capital: int = 10_000_000,
+    user_prices: dict[str, float] | None = None,
+) -> dict[str, Any]:
     if not DAILY_PROFILE_SCAN_PATH.exists():
         raise ValueError("daily profile scan is missing; run --daily-profile-scan first")
+    user_prices = user_prices or {}
+    # Holdings 누적 데이터 (점수 보너스용)
+    try:
+        unified_existing = read_json_file(UNIFIED_DATA_PATH, {})
+        holding_accumulation_data = unified_existing.get("holding_accumulation_rankings") or []
+    except Exception:
+        holding_accumulation_data = []
     daily = json.loads(DAILY_PROFILE_SCAN_PATH.read_text(encoding="utf-8"))
     daily_events = (
         json.loads(DAILY_PROFILE_EVENTS_PATH.read_text(encoding="utf-8"))
@@ -2827,8 +2965,10 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
     eligible_profile_count = max(1, int(daily.get("scanned_profile_count") or 0))
     cutoff = now_kst().astimezone(dt.timezone.utc) - dt.timedelta(hours=hours)
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    sell_grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     candidate_events = list(daily.get("new_buys") or [])
     candidate_events.extend(event for event in daily_events.get("events") or [] if event.get("side") == "BUY")
+    sell_events_all = [event for event in daily_events.get("events") or [] if event.get("side") == "SELL"]
     seen_events = set()
     for event in candidate_events:
         key = profile_event_key(event)
@@ -2846,16 +2986,42 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
             "user_reliability": round(user_score, 1),
             "weighted_amount_krw": round(weighted_amount),
         })
+    seen_sell_events = set()
+    for event in sell_events_all:
+        key = profile_event_key(event)
+        if key in seen_sell_events:
+            continue
+        seen_sell_events.add(key)
+        acted_at = parse_dt(event.get("acted_at"))
+        if not acted_at or acted_at < cutoff:
+            continue
+        author = event.get("author") or ""
+        user_score = (reliability.get(author) or {}).get("reliability_score") or 0.0
+        sell_grouped[str(event.get("symbol") or event.get("stock_name") or "-")].append({
+            **event,
+            "user_reliability": round(user_score, 1),
+        })
 
     recommendations = []
     for symbol, events in grouped.items():
-        is_leveraged = symbol.upper() in LEVERAGED_SYMBOLS if isinstance(symbol, str) else False
+        sample_event = events[0] if events else {}
+        is_leveraged = is_leveraged_name(symbol, sample_event.get("stock_name"), sample_event.get("stock_code"))
         if is_leveraged:
             continue
-        authors = sorted({event.get("author") for event in events if event.get("author")})
+        sell_events = sell_grouped.get(symbol, [])
+        buyer_ids_raw = {str(event.get("profile_id")) for event in events if event.get("profile_id")}
+        seller_ids_raw = {str(event.get("profile_id")) for event in sell_events if event.get("profile_id")}
+        rotation_ids = buyer_ids_raw & seller_ids_raw
+        pure_buyer_ids = buyer_ids_raw - rotation_ids
+        pure_seller_ids = seller_ids_raw - rotation_ids
+        pure_buyer_events = [event for event in events if str(event.get("profile_id")) in pure_buyer_ids]
+        pure_seller_events = [event for event in sell_events if str(event.get("profile_id")) in pure_seller_ids]
+        rotation_buyer_events = [event for event in events if str(event.get("profile_id")) in rotation_ids]
+        rotation_seller_events = [event for event in sell_events if str(event.get("profile_id")) in rotation_ids]
+        authors = sorted({event.get("author") for event in pure_buyer_events if event.get("author")})
         buyer_profiles_by_id: dict[str, dict[str, Any]] = {}
         amount_by_profile: dict[str, float] = defaultdict(float)
-        for event in events:
+        for event in pure_buyer_events:
             profile_id = str(event.get("profile_id") or "")
             if not profile_id:
                 continue
@@ -2866,40 +3032,114 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
                 "profile_url": f"https://www.tossinvest.com/community/profile/{profile_id}",
                 "user_reliability": event.get("user_reliability"),
             })
+        seller_profiles_by_id: dict[str, dict[str, Any]] = {}
+        sell_amount_by_profile: dict[str, float] = defaultdict(float)
+        for event in pure_seller_events:
+            profile_id = str(event.get("profile_id") or "")
+            if not profile_id:
+                continue
+            sell_amount_by_profile[profile_id] += float(event.get("amount_krw") or 0.0)
+            seller_profiles_by_id.setdefault(profile_id, {
+                "profile_id": profile_id,
+                "author": event.get("author") or profile_id,
+                "profile_url": f"https://www.tossinvest.com/community/profile/{profile_id}",
+                "user_reliability": event.get("user_reliability"),
+            })
+        rotation_profiles_by_id: dict[str, dict[str, Any]] = {}
+        for event in rotation_buyer_events + rotation_seller_events:
+            profile_id = str(event.get("profile_id") or "")
+            if not profile_id:
+                continue
+            rotation_profiles_by_id.setdefault(profile_id, {
+                "profile_id": profile_id,
+                "author": event.get("author") or profile_id,
+                "profile_url": f"https://www.tossinvest.com/community/profile/{profile_id}",
+                "user_reliability": event.get("user_reliability"),
+            })
         buyer_profile_count = len(buyer_profiles_by_id)
+        seller_profile_count = len(seller_profiles_by_id)
+        rotation_profile_count = len(rotation_profiles_by_id)
         reliable_buyer_count = len([
             row for row in buyer_profiles_by_id.values()
             if float(row.get("user_reliability") or 0.0) >= 50.0
         ])
+        reliable_seller_count = len([
+            row for row in seller_profiles_by_id.values()
+            if float(row.get("user_reliability") or 0.0) >= 50.0
+        ])
         buyer_participation_rate = buyer_profile_count / eligible_profile_count
         reliable_buyer_participation_rate = reliable_buyer_count / eligible_profile_count
-        reliability_values = [float(event.get("user_reliability") or 0.0) for event in events]
-        amount = sum(float(event.get("amount_krw") or 0.0) for event in events)
-        weighted_amount = sum(float(event.get("weighted_amount_krw") or 0.0) for event in events)
+        seller_participation_rate = seller_profile_count / eligible_profile_count
+        reliability_values = [float(event.get("user_reliability") or 0.0) for event in pure_buyer_events]
+        seller_reliability_values = [float(event.get("user_reliability") or 0.0) for event in pure_seller_events]
+        amount = sum(float(event.get("amount_krw") or 0.0) for event in pure_buyer_events)
+        sell_amount_total = sum(float(event.get("amount_krw") or 0.0) for event in pure_seller_events)
+        weighted_amount = sum(float(event.get("weighted_amount_krw") or 0.0) for event in pure_buyer_events)
         amount_concentration = max(amount_by_profile.values()) / amount if amount > 0 and amount_by_profile else 0.0
         max_reliability = max(reliability_values) if reliability_values else 0.0
         avg_reliability = sum(reliability_values) / len(reliability_values) if reliability_values else 0.0
-        buyer_score = min(20.0, buyer_participation_rate / 0.05 * 20.0)
-        reliable_buyer_score = min(10.0, reliable_buyer_participation_rate / 0.03 * 10.0)
-        reliability_score_part = min(35.0, avg_reliability * 0.35)
-        amount_score = min(20.0, math.log1p(max(0.0, weighted_amount)) / math.log(100_000_000) * 20)
-        recency_times = [parse_dt(event.get("acted_at")) for event in events]
+        avg_seller_reliability = (
+            sum(seller_reliability_values) / len(seller_reliability_values)
+            if seller_reliability_values else 0.0
+        )
+        # Person-based scoring (옵션 C, 사람 수 기준 — 금액 점수 제거)
+        buyer_score = min(25.0, buyer_participation_rate / 0.05 * 25.0)
+        reliable_buyer_score = min(15.0, reliable_buyer_participation_rate / 0.03 * 15.0)
+        reliability_score_part = min(30.0, avg_reliability * 0.30)
+        # Holding bonus: 신뢰 유저들이 보유 중인 종목이면 + 점수 (사용자 요청)
+        holding_bonus = 0.0
+        try:
+            for h_row in (holding_accumulation_data or []):
+                if str(h_row.get("symbol") or "").upper() == str(symbol).upper():
+                    h_count = h_row.get("holder_count") or 0
+                    pos_ratio = h_row.get("positive_holder_ratio") or 0
+                    avg_user = h_row.get("avg_user_score") or 0
+                    # 보유자 수 + 수익권 비율 + 보유자 신뢰도
+                    if h_count >= 20 and pos_ratio >= 0.7 and avg_user >= 55:
+                        holding_bonus = 10.0   # 강한 보강
+                    elif h_count >= 10 and pos_ratio >= 0.6:
+                        holding_bonus = 5.0    # 중간 보강
+                    elif h_count >= 5:
+                        holding_bonus = 2.0    # 약한 보강
+                    break
+        except Exception:
+            pass
+        consensus_denominator = buyer_profile_count + seller_profile_count
+        consensus_ratio = (
+            (buyer_profile_count - seller_profile_count) / consensus_denominator
+            if consensus_denominator > 0 else 0.0
+        )
+        consensus_score = round(15.0 * consensus_ratio, 2)
+        amount_score = 0.0  # 금액 점수 제거 (사용자 요청: 사람 수 기준)
+        recency_times = [parse_dt(event.get("acted_at")) for event in pure_buyer_events]
         latest = max([value for value in recency_times if value], default=None)
         recency_part = 15.0 * trade_recency_score(latest.isoformat() if latest else None)
+        if buyer_profile_count == 0:
+            # 매수자 0명 (rotation만 있거나 매도만 발생) — 추천 후보에서 제외
+            continue
         latest_event = max(
-            events,
+            pure_buyer_events,
             key=lambda row: parse_dt(row.get("acted_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
         )
         quote = fetch_public_quote(symbol, latest_event.get("stock_code"))
-        current_price = quote.get("price") if quote else None
+        quote_at = now_kst().isoformat()
+        quote_provider_price = quote.get("price") if quote else None
+        current_price = quote_provider_price
         current_currency = quote.get("currency") if quote else None
+        user_override_price = None
+        if symbol in user_prices:
+            user_override_price = float(user_prices[symbol])
+            current_price = user_override_price
+            if current_currency is None:
+                stock_code_value = latest_event.get("stock_code") or ""
+                current_currency = "KRW" if stock_code_value.startswith("A") else "USD"
         average_buy_price = None
         price_move_pct = None
         if current_price is not None:
             if current_currency == "USD":
-                average_buy_price = weighted_average_buy_price(events, "avg_usd")
+                average_buy_price = weighted_average_buy_price(pure_buyer_events, "avg_usd")
             elif current_currency == "KRW":
-                average_buy_price = weighted_average_buy_price(events, "avg_krw")
+                average_buy_price = weighted_average_buy_price(pure_buyer_events, "avg_krw")
             if average_buy_price and average_buy_price > 0:
                 price_move_pct = (float(current_price) / average_buy_price) - 1.0
         unknown_reliability_rate = (
@@ -2911,7 +3151,7 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
         leverage_penalty = 5.0 if is_leveraged else 0.0
         chase_penalty = chase_price_penalty(price_move_pct, is_leveraged)
         penalty_total = unknown_reliability_penalty + leverage_penalty + chase_penalty
-        raw_score = buyer_score + reliable_buyer_score + reliability_score_part + amount_score + recency_part
+        raw_score = buyer_score + reliable_buyer_score + reliability_score_part + recency_part + consensus_score + holding_bonus
         final_score = round(max(0.0, raw_score - penalty_total), 1)
         action, action_reason = classify_action(final_score, price_move_pct, reliable_buyer_count, buyer_profile_count)
         gap_label = price_gap_label(price_move_pct)
@@ -2956,8 +3196,9 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
                 "buyer_participation": round(buyer_score, 2),
                 "reliable_buyer_participation": round(reliable_buyer_score, 2),
                 "user_reliability": round(reliability_score_part, 2),
-                "amount": round(amount_score, 2),
+                "consensus": round(consensus_score, 2),
                 "recency": round(recency_part, 2),
+                "holding_bonus": round(holding_bonus, 2),
                 "penalty_total": round(penalty_total, 2),
                 "penalties": {
                     "unknown_reliability": round(unknown_reliability_penalty, 2),
@@ -2965,7 +3206,26 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
                     "chase_price": round(chase_penalty, 2),
                 },
             },
-            "buy_count": len(events),
+            "seller_count": seller_profile_count,
+            "seller_participation_rate": round(seller_participation_rate, 6),
+            "reliable_seller_count": reliable_seller_count,
+            "rotation_count": rotation_profile_count,
+            "consensus_ratio": round(consensus_ratio, 4),
+            "sellers": sorted({event.get("author") for event in pure_seller_events if event.get("author")}),
+            "seller_profiles": sorted(
+                seller_profiles_by_id.values(),
+                key=lambda row: float(row.get("user_reliability") or 0.0),
+                reverse=True,
+            ),
+            "rotation_profiles": sorted(
+                rotation_profiles_by_id.values(),
+                key=lambda row: float(row.get("user_reliability") or 0.0),
+                reverse=True,
+            ),
+            "sell_count": len(pure_seller_events),
+            "sell_amount_krw": round(sell_amount_total),
+            "avg_seller_reliability": round(avg_seller_reliability, 1),
+            "buy_count": len(pure_buyer_events),
             "buyers": authors,
             "buyer_profiles": sorted(
                 buyer_profiles_by_id.values(),
@@ -2980,6 +3240,10 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
             "average_buy_price": round(average_buy_price, 4) if average_buy_price is not None else None,
             "current_price": round(float(current_price), 4) if current_price is not None else None,
             "current_price_currency": current_currency,
+            "current_price_source": "user_override" if user_override_price is not None else "system_quote",
+            "user_override_price": round(user_override_price, 4) if user_override_price is not None else None,
+            "quote_provider_price": round(float(quote_provider_price), 4) if quote_provider_price is not None else None,
+            "quote_at": quote_at,
             "price_move_since_buy": round(price_move_pct, 6) if price_move_pct is not None else None,
             "price_move_since_buy_pct": round(price_move_pct * 100, 2) if price_move_pct is not None else None,
             "quote_provider_symbol": quote.get("provider_symbol") if quote else None,
@@ -2992,25 +3256,61 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
                 * min(1.0, final_score / 100)
                 * float(chase_plan["position_scale"] or 0.0)
             ),
-            "events": sorted(events, key=lambda row: parse_dt(row.get("acted_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)[:20],
+            "events": sorted(pure_buyer_events, key=lambda row: parse_dt(row.get("acted_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)[:20],
+            "sell_events": sorted(pure_seller_events, key=lambda row: parse_dt(row.get("acted_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)[:20],
+            "rotation_events": sorted(rotation_buyer_events + rotation_seller_events, key=lambda row: parse_dt(row.get("acted_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)[:20],
         })
-    recommendations.sort(key=lambda row: (row["score"], row["avg_user_reliability"], row["amount_krw"]), reverse=True)
+    # 매도만 발생한 종목 별도 추출 (사용자 우려: "다 매도하는데 모르면 곤란")
+    sell_only_symbols = []
+    for symbol, sell_events in sell_grouped.items():
+        if symbol in grouped:
+            continue
+        if not sell_events:
+            continue
+        sample_sell = sell_events[0] if sell_events else {}
+        is_leveraged_sym = is_leveraged_name(symbol, sample_sell.get("stock_name"), sample_sell.get("stock_code"))
+        if is_leveraged_sym:
+            continue
+        unique_sellers = {str(event.get("profile_id")) for event in sell_events if event.get("profile_id")}
+        reliable_unique_sellers = {
+            str(event.get("profile_id")) for event in sell_events
+            if event.get("profile_id") and float(event.get("user_reliability") or 0.0) >= 50.0
+        }
+        sell_amt = sum(float(event.get("amount_krw") or 0.0) for event in sell_events)
+        latest_sell = max(
+            (parse_dt(event.get("acted_at")) for event in sell_events if parse_dt(event.get("acted_at"))),
+            default=None,
+        )
+        sell_only_symbols.append({
+            "symbol": symbol,
+            "stock_code": next((event.get("stock_code") for event in sell_events if event.get("stock_code")), None),
+            "seller_count": len(unique_sellers),
+            "reliable_seller_count": len(reliable_unique_sellers),
+            "sell_event_count": len(sell_events),
+            "sell_amount_krw": round(sell_amt),
+            "sellers": sorted({event.get("author") for event in sell_events if event.get("author")}),
+            "latest_sell_at": latest_sell.isoformat() if latest_sell else None,
+        })
+    sell_only_symbols.sort(key=lambda row: (row["reliable_seller_count"], row["seller_count"], row["sell_amount_krw"]), reverse=True)
+    recommendations.sort(key=lambda row: (row["score"], row["avg_user_reliability"], row["buyer_count"]), reverse=True)
     output = {
         "generated_at": now_kst().isoformat(),
         "mode": "recent-buy-recommendation",
         "window_hours": hours,
         "scoring": {
-            "version": "buyer-participation-v2",
+            "version": "person-based-v3-with-sell-consensus",
             "eligible_profile_count": eligible_profile_count,
             "buyer_participation_full_score_pct": 5.0,
             "reliable_buyer_participation_full_score_pct": 3.0,
             "score_weights": {
-                "buyer_participation": 20,
-                "reliable_buyer_participation": 10,
-                "avg_user_reliability": 35,
-                "weighted_amount": 20,
+                "buyer_participation": 25,
+                "reliable_buyer_participation": 15,
+                "avg_user_reliability": 30,
+                "consensus": 15,
                 "recency": 15,
             },
+            "rotation_policy": "같은 유저 매수+매도 = rotation 분류, 매수/매도자 양쪽에서 제외",
+            "consensus_formula": "(buyer_count - seller_count) / (buyer_count + seller_count + 1)",
             "penalties": {
                 "unknown_reliability": "up to -8 by unknown/zero-reliability event ratio",
                 "leveraged_symbol": "excluded from recommendations",
@@ -3020,13 +3320,122 @@ def build_recent_buy_report(hours: float = 4.0, capital: int = 10_000_000) -> di
         "source": str(DAILY_PROFILE_SCAN_PATH),
         "recommendation_count": len(recommendations),
         "recommendations": recommendations,
+        "sell_only_symbol_count": len(sell_only_symbols),
+        "sell_only_symbols": sell_only_symbols,
     }
     RECENT_BUY_REPORT_PATH.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
     return output
 
 
-def recent_buy_html_report(hours: float = 4.0, capital: int = 10_000_000) -> dict[str, Any]:
-    report = build_recent_buy_report(hours=hours, capital=capital)
+RECENT_TRADE_TIMELINE_PATH = RAW_DATA_DIR / "recent_trade_timeline.json"
+
+
+def build_recent_trade_timeline(hours: float = 4.0) -> dict[str, Any]:
+    """종목 단위 최근 거래 타임라인 — 점수와 무관하게 최근 거래 시각순 정렬."""
+    if not DAILY_PROFILE_EVENTS_PATH.exists():
+        raise ValueError("daily profile events file missing; run --daily-profile-scan first")
+    daily_events = json.loads(DAILY_PROFILE_EVENTS_PATH.read_text(encoding="utf-8"))
+    reliability = reliability_by_author()
+    cutoff = now_kst().astimezone(dt.timezone.utc) - dt.timedelta(hours=hours)
+    by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in daily_events.get("events") or []:
+        side = (event.get("side") or "").upper()
+        if side not in ("BUY", "SELL"):
+            continue
+        acted_at = parse_dt(event.get("acted_at"))
+        if not acted_at or acted_at < cutoff:
+            continue
+        author = event.get("author") or ""
+        user_score = (reliability.get(author) or {}).get("reliability_score") or 0.0
+        by_symbol[str(event.get("symbol") or event.get("stock_name") or "-")].append({
+            **event,
+            "user_reliability": round(user_score, 1),
+        })
+
+    timeline = []
+    for symbol, events in by_symbol.items():
+        events_sorted = sorted(
+            events,
+            key=lambda e: parse_dt(e.get("acted_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+            reverse=True,
+        )
+        latest = parse_dt(events_sorted[0].get("acted_at")) if events_sorted else None
+        buy_events = [e for e in events_sorted if (e.get("side") or "").upper() == "BUY"]
+        sell_events = [e for e in events_sorted if (e.get("side") or "").upper() == "SELL"]
+        buyer_ids = {str(e.get("profile_id")) for e in buy_events if e.get("profile_id")}
+        seller_ids = {str(e.get("profile_id")) for e in sell_events if e.get("profile_id")}
+        rotation_ids = buyer_ids & seller_ids
+        pure_buyer_ids = buyer_ids - rotation_ids
+        pure_seller_ids = seller_ids - rotation_ids
+        reliable_buyer_count = len({
+            str(e.get("profile_id")) for e in buy_events
+            if str(e.get("profile_id")) in pure_buyer_ids and float(e.get("user_reliability") or 0.0) >= 50.0
+        })
+        reliable_seller_count = len({
+            str(e.get("profile_id")) for e in sell_events
+            if str(e.get("profile_id")) in pure_seller_ids and float(e.get("user_reliability") or 0.0) >= 50.0
+        })
+        is_lev = symbol.upper() in LEVERAGED_SYMBOLS if isinstance(symbol, str) else False
+        stock_code = next((e.get("stock_code") for e in events_sorted if e.get("stock_code")), None)
+        market = "KRX" if (stock_code or "").startswith("A") and len(stock_code or "") <= 8 else (
+            "해외" if stock_code else "미상"
+        )
+        buy_amt = sum(float(e.get("amount_krw") or 0.0) for e in buy_events)
+        sell_amt = sum(float(e.get("amount_krw") or 0.0) for e in sell_events)
+        timeline.append({
+            "symbol": symbol,
+            "stock_code": stock_code,
+            "market": market,
+            "is_leveraged": is_lev,
+            "latest_event_at": latest.isoformat() if latest else None,
+            "latest_side": events_sorted[0].get("side") if events_sorted else None,
+            "event_count": len(events_sorted),
+            "buy_event_count": len(buy_events),
+            "sell_event_count": len(sell_events),
+            "pure_buyer_count": len(pure_buyer_ids),
+            "pure_seller_count": len(pure_seller_ids),
+            "rotation_count": len(rotation_ids),
+            "reliable_buyer_count": reliable_buyer_count,
+            "reliable_seller_count": reliable_seller_count,
+            "buy_amount_krw": round(buy_amt),
+            "sell_amount_krw": round(sell_amt),
+            "net_amount_krw": round(buy_amt - sell_amt),
+            "recent_events": [
+                {
+                    "acted_at": e.get("acted_at"),
+                    "side": e.get("side"),
+                    "author": e.get("author"),
+                    "user_reliability": e.get("user_reliability"),
+                    "quantity": e.get("quantity"),
+                    "amount_krw": e.get("amount_krw"),
+                    "amount_usd": e.get("amount_usd"),
+                    "avg_krw": e.get("avg_krw"),
+                    "avg_usd": e.get("avg_usd"),
+                }
+                for e in events_sorted[:8]
+            ],
+        })
+    timeline.sort(key=lambda row: row["latest_event_at"] or "", reverse=True)
+    output = {
+        "generated_at": now_kst().isoformat(),
+        "mode": "recent-trade-timeline",
+        "window_hours": hours,
+        "source": str(DAILY_PROFILE_EVENTS_PATH),
+        "sort_by": "latest_event_at DESC",
+        "symbol_count": len(timeline),
+        "symbols": timeline,
+    }
+    RECENT_TRADE_TIMELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RECENT_TRADE_TIMELINE_PATH.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+    return output
+
+
+def recent_buy_html_report(
+    hours: float = 4.0,
+    capital: int = 10_000_000,
+    user_prices: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    report = build_recent_buy_report(hours=hours, capital=capital, user_prices=user_prices)
     append_recent_buy_log(report)
     evaluate_recent_buy_recommendations()
     rows = []
@@ -4178,83 +4587,477 @@ def ai_brief_recent_buy_comment(item: dict[str, Any]) -> str:
     return f"{symbol}: {action}/{chase}, 점수 {score}, 매수가 대비 {gap}, 매수유저 {buyers}명(신뢰 {reliable}명). {reason}"
 
 
+USER_TOSS_PROFILE_ID = "1762713"  # 본인 토스 프로필 ID
+USER_HOLDINGS_CACHE_PATH = RAW_DATA_DIR / "user_holdings_cache.json"
+
+
+def fetch_user_holdings_from_trades(session_curl_file: str | None = None, session_headers_file: str | None = None) -> dict[str, Any]:
+    """본인 거래내역으로 net 포지션 + 가중 평균 매수가 계산 → cache 저장."""
+    try:
+        headers = load_session_headers(session_headers_file, session_curl_file)
+    except Exception as exc:
+        return {"error": f"session load failed: {exc}", "holdings": {}}
+    profile = {"profile_id": USER_TOSS_PROFILE_ID, "nickname": "self"}
+    result = fetch_profile_trade_history(profile, headers, max_pages=20, delay_seconds=0.3)
+    events = result.get("events") or []
+    by_sym: dict[str, dict[str, list]] = defaultdict(lambda: {"buys": [], "sells": []})
+    for e in events:
+        sym = e.get("symbol") or "-"
+        side = (e.get("side") or "").upper()
+        if side == "BUY":
+            by_sym[sym]["buys"].append(e)
+        elif side == "SELL":
+            by_sym[sym]["sells"].append(e)
+    holdings: dict[str, dict[str, Any]] = {}
+    for sym, d in by_sym.items():
+        buy_qty = sum(float(e.get("quantity") or 0) for e in d["buys"])
+        sell_qty = sum(float(e.get("quantity") or 0) for e in d["sells"])
+        net_qty = buy_qty - sell_qty
+        if net_qty <= 0.0001:
+            continue
+        total_amt_krw = sum(float(e.get("amount_krw") or 0) for e in d["buys"])
+        total_amt_usd = sum(float(e.get("amount_usd") or 0) for e in d["buys"])
+        avg_krw = total_amt_krw / buy_qty if buy_qty else 0
+        avg_usd = total_amt_usd / buy_qty if buy_qty else 0
+        stock_code = next((e.get("stock_code") for e in d["buys"] if e.get("stock_code")), None)
+        currency = "KRW" if str(stock_code or "").startswith("A") else "USD"
+        shares_int = int(round(net_qty)) if abs(net_qty - round(net_qty)) < 0.01 else net_qty
+        holdings[sym] = {
+            "aliases": [sym],
+            "shares": shares_int,
+            "avg_price": round(avg_usd, 2) if currency == "USD" else round(avg_krw),
+            "currency": currency,
+            "stock_code": stock_code,
+        }
+    USER_HOLDINGS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    USER_HOLDINGS_CACHE_PATH.write_text(json.dumps({
+        "updated_at": now_kst().isoformat(),
+        "profile_id": USER_TOSS_PROFILE_ID,
+        "holding_count": len(holdings),
+        "holdings": holdings,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "updated_at": now_kst().isoformat(),
+        "profile_id": USER_TOSS_PROFILE_ID,
+        "holding_count": len(holdings),
+        "holdings": holdings,
+    }
+
+
+def load_user_holdings() -> dict[str, dict[str, Any]]:
+    """캐시된 user holdings 로드. 없으면 fallback static dict."""
+    if USER_HOLDINGS_CACHE_PATH.exists():
+        try:
+            data = json.loads(USER_HOLDINGS_CACHE_PATH.read_text(encoding="utf-8"))
+            cached = data.get("holdings") or {}
+            if cached:
+                return cached
+        except Exception:
+            pass
+    return USER_HOLDINGS_SYMBOLS_STATIC
+
+
+USER_HOLDINGS_SYMBOLS_STATIC = {
+    "MSFT": {"aliases": ["MSFT", "마이크로소프트"], "shares": 3, "avg_price": 427.0, "currency": "USD", "stock_code": "US5949181045"},
+    "BA": {"aliases": ["BA", "보잉"], "shares": 2, "avg_price": 224.0, "currency": "USD", "stock_code": "US0970231058"},
+    "VOO": {"aliases": ["VOO"], "shares": 7, "avg_price": 651.0, "currency": "USD", "stock_code": "US9229083632"},
+    "QQQM": {"aliases": ["QQQM"], "shares": 10, "avg_price": 266.0, "currency": "USD", "stock_code": "US46138G6492"},
+    "VXUS": {"aliases": ["VXUS"], "shares": 33, "avg_price": 85.0, "currency": "USD", "stock_code": "US9219097683"},
+    "SCHD": {"aliases": ["SCHD"], "shares": 80, "avg_price": 31.0, "currency": "USD", "stock_code": "US8085247773"},
+    "IAU": {"aliases": ["IAU"], "shares": 7, "avg_price": 89.0, "currency": "USD", "stock_code": "US4642851053"},
+    "삼성전자": {"aliases": ["삼성전자", "Samsung Electronics", "Samsung"], "shares": 6, "avg_price": 283500.0, "currency": "KRW", "stock_code": "A005930"},
+}
+
+
+def size_guide_for_score(score: float | None, gap_pct: float | None) -> dict[str, Any]:
+    """점수 + 갭으로 권장 사이즈(자금 대비 %) 계산"""
+    s = float(score or 0)
+    g = float(gap_pct or 0)
+    if s >= 80:
+        base_pct = 35
+    elif s >= 70:
+        base_pct = 20
+    elif s >= 60:
+        base_pct = 10
+    elif s >= 50:
+        base_pct = 3
+    else:
+        return {"pct": 0, "note": "점수 부족, 진입 비추"}
+    # gap 보정: 매수가보다 비싸면 사이즈 줄임
+    if g > 3:
+        base_pct = round(base_pct * 0.3)
+        note = f"점수 양호하나 매수가 대비 +{g:.1f}% — 사이즈 70% 차감"
+    elif g > 1:
+        base_pct = round(base_pct * 0.6)
+        note = f"매수가 위 +{g:.1f}% — 사이즈 40% 차감"
+    elif g >= -3:
+        note = f"진입 적합 (갭 {g:+.1f}%)"
+    else:
+        note = f"눌림 {g:+.1f}% — 하락 이유 확인 후 진입"
+    return {"pct": base_pct, "note": note}
+
+
 def build_ai_decision_brief(data: dict[str, Any]) -> dict[str, Any]:
     recent = (data.get("recent_buy") or {}).get("recommendations") or []
+    sell_only = (data.get("recent_buy") or {}).get("sell_only_symbols") or []
     accumulation = data.get("holding_accumulation_rankings") or []
     users = data.get("final_user_rankings") or []
     market = data.get("market_status") or {}
-    buy_candidates = [
+    performance = data.get("recent_buy_performance") or read_json_file(RECENT_BUY_PERFORMANCE_PATH, {})
+
+    # 진입 가능 후보 (1순위)
+    actionable = [
         row for row in recent
-        if row.get("action") == "매수 후보" and row.get("chase_decision") in {"진입가능", "눌림후보", "소액진입"}
-    ][:5]
-    watch_candidates = [
-        row for row in recent
-        if row.get("action") == "관망" or row.get("chase_decision") in {"관망", "강한근거만소액", "가격확인"}
-    ][:8]
-    chase_blocked = [
-        row for row in recent
-        if row.get("chase_decision") == "추격금지" or row.get("action") == "제외"
-    ][:8]
-    accumulation_focus = [
-        row for row in accumulation
-        if row.get("decision") == "축적 관심"
-    ][:8]
-    top_users = [
-        row for row in users
-        if (row.get("short_term_score") or 0) > 0
-    ][:10]
-    checklist = [
-        "최근매수 후보는 반드시 현재가/평균매수가 괴리를 먼저 확인한다.",
-        "매수가 대비 +3% 초과는 기본 관망, +5% 근처는 강한 신호여도 소액만 허용한다.",
-        "레버리지/인버스 종목은 추천/진입 후보에서 제외한다.",
-        "유저 1명 단독 신호는 추격하지 않고 다음 스캔에서 추가 매수 확인을 기다린다.",
-        "수익권 보유 탭은 단타 진입보다 중기 관심 종목 후보로만 본다.",
+        if (row.get("buyer_count") or 0) >= 2
+        and (row.get("seller_count") or 0) <= (row.get("buyer_count") or 0)
+        and (row.get("score") or 0) >= 55
     ]
-    markdown_lines = [
-        "# AI 투자 의사결정 브리프",
+    actionable.sort(key=lambda r: (r.get("score") or 0, r.get("reliable_buyer_count") or 0), reverse=True)
+    top_pick = actionable[0] if actionable else None
+
+    # 보유 종목용 24시간 윈도우 매수/매도 집계 (사용자 우려 반영: 4h 너무 짧음, 미국 정규장 + KRX 모두 잡힘)
+    reliability = reliability_by_author()
+    holdings_24h_buy: dict[str, dict[str, Any]] = {}
+    holdings_24h_sell: dict[str, dict[str, Any]] = {}
+    try:
+        events_data = read_json_file(DAILY_PROFILE_EVENTS_PATH, {"events": []})
+        cutoff_24h = now_kst().astimezone(dt.timezone.utc) - dt.timedelta(hours=24)
+        # 보유 종목 alias 모음
+        alias_to_ticker = {}
+        for tk, meta in load_user_holdings().items():
+            for al in (meta.get("aliases") or [tk]):
+                alias_to_ticker[al.upper()] = tk
+        for ev in events_data.get("events", []):
+            sym_up = (ev.get("symbol") or "").upper()
+            tk = alias_to_ticker.get(sym_up)
+            if not tk:
+                continue
+            acted = parse_dt(ev.get("acted_at"))
+            if not acted or acted < cutoff_24h:
+                continue
+            side = (ev.get("side") or "").upper()
+            author = ev.get("author") or ""
+            user_score = (reliability.get(author) or {}).get("reliability_score") or 0.0
+            if user_score < 50:
+                continue  # 신뢰 유저만
+            bucket = holdings_24h_sell if side == "SELL" else holdings_24h_buy if side == "BUY" else None
+            if bucket is None:
+                continue
+            entry = bucket.setdefault(tk, {"profiles": set(), "amount_krw": 0.0, "events": [], "max_amount_krw": 0.0, "latest_at": None})
+            entry["profiles"].add(str(ev.get("profile_id")))
+            amt = float(ev.get("amount_krw") or 0.0)
+            entry["amount_krw"] += amt
+            entry["max_amount_krw"] = max(entry["max_amount_krw"], amt)
+            entry["events"].append(ev)
+            if entry["latest_at"] is None or acted > entry["latest_at"]:
+                entry["latest_at"] = acted
+    except Exception:
+        pass
+
+    # 사용자 보유 종목 — dedicated 상태 (수량/평가손익/시그널)
+    holdings_status: list[dict[str, Any]] = []
+    all_recent_symbols = {(row.get("symbol") or "").upper(): row for row in recent}
+    all_sell_symbols = {(row.get("symbol") or "").upper(): row for row in sell_only}
+    for ticker, meta in load_user_holdings().items():
+        aliases = meta.get("aliases", [ticker])
+        shares = meta.get("shares", 0)
+        avg_price = meta.get("avg_price", 0.0)
+        currency = meta.get("currency", "USD")
+        stock_code = meta.get("stock_code")
+
+        # 신호 매칭
+        matched = None
+        match_type = None
+        for alias in aliases:
+            up = alias.upper()
+            if up in all_recent_symbols:
+                matched = all_recent_symbols[up]
+                match_type = "buy_signal" if (matched.get("buyer_count") or 0) >= (matched.get("seller_count") or 0) else "mixed"
+                break
+            if up in all_sell_symbols:
+                matched = all_sell_symbols[up]
+                match_type = "sell_only"
+                break
+
+        # 현재가 fetch
+        quote = fetch_public_quote(ticker, stock_code)
+        current_price = quote.get("price") if quote else None
+        cost_basis = shares * avg_price
+        market_value = (shares * current_price) if current_price else None
+        unrealized_pnl = (market_value - cost_basis) if market_value is not None else None
+        unrealized_pct = ((current_price / avg_price - 1.0) * 100) if (current_price and avg_price) else None
+
+        # severity — 4h 매수/매도 비율 + 24h 보유 종목 큰 매도 (사용자 우려 반영)
+        buyer_count = (matched or {}).get("buyer_count") or 0
+        seller_count = (matched or {}).get("seller_count") or (matched or {}).get("reliable_seller_count") or 0
+        reliable_sellers = (matched or {}).get("reliable_seller_count") or 0
+        net = buyer_count - seller_count
+        # 24h 큰 매도 체크 (보유 종목 한정)
+        h24_sell = holdings_24h_sell.get(ticker)
+        h24_buy = holdings_24h_buy.get(ticker)
+        has_24h_signal = bool(h24_sell or h24_buy)
+        # 4h에 신호 없어도 24h 매도 큰 거 있으면 알림
+        if matched is None and h24_sell:
+            sellers_24h = len(h24_sell["profiles"])
+            amt_24h = h24_sell["amount_krw"]
+            max_amt = h24_sell["max_amount_krw"]
+            # 종목별 임계 (B): holdings 보유자 수로 종목 카테고리 추정
+            # 신뢰 유저 보유자 많은 종목 = 대형주 → 큰 매도 임계 ↑
+            h_count_for_sym = 0
+            for h_row in (accumulation or []):
+                if str(h_row.get("symbol") or "").upper() in {a.upper() for a in (meta.get("aliases") or [ticker])}:
+                    h_count_for_sym = h_row.get("holder_count") or 0
+                    break
+            if h_count_for_sym >= 30:
+                big_thr, mid_thr = 200_000_000, 80_000_000  # 대형주: 2억+ / 8천만+
+                cat = "대형"
+            elif h_count_for_sym >= 10:
+                big_thr, mid_thr = 80_000_000, 30_000_000   # 중형주: 8천만+ / 3천만+
+                cat = "중형"
+            else:
+                big_thr, mid_thr = 30_000_000, 10_000_000   # 소형주: 3천만+ / 1천만+
+                cat = "소형"
+            if max_amt >= big_thr:
+                signal = f"🚨 24h 큰 매도 [{cat}] — {amt_24h/10000:,.0f}만원 ({sellers_24h}명, 단일 max {max_amt/10000:,.0f}만)"
+                severity = "🚨"
+            elif sellers_24h >= 3 or amt_24h >= mid_thr:
+                signal = f"⚠️ 24h 매도 [{cat}] {sellers_24h}명 ({amt_24h/10000:,.0f}만원)"
+                severity = "⚠️"
+            else:
+                signal = f"🟡 24h 매도 [{cat}] {sellers_24h}명 ({amt_24h/10000:,.0f}만원)"
+                severity = "🟡"
+            match_type = "sell_24h"
+        elif matched is None and h24_buy:
+            buyers_24h = len(h24_buy["profiles"])
+            signal = f"🟢 24h 매수 {buyers_24h}명"
+            severity = "🟢"
+            match_type = "buy_24h"
+        elif matched is None:
+            signal = "조용"
+            severity = "—"
+        elif match_type == "sell_only" or buyer_count == 0:
+            # 매도만 (매수 0)
+            if reliable_sellers >= 3 or seller_count >= 5:
+                signal = f"🚨 강한 매도 (매도 {seller_count}명)"
+                severity = "🚨"
+            elif reliable_sellers >= 2:
+                signal = f"⚠️ 매도 주의 (매도 {seller_count}명)"
+                severity = "⚠️"
+            else:
+                signal = f"🟡 매도자 출현 ({seller_count}명)"
+                severity = "🟡"
+        elif buyer_count >= seller_count * 3 and buyer_count >= 5:
+            signal = f"🟢 강한 매수 (매수 {buyer_count} vs 매도 {seller_count})"
+            severity = "🟢"
+        elif net >= 3:
+            signal = f"🟢 매수 우세 (매수 {buyer_count} vs 매도 {seller_count})"
+            severity = "🟢"
+        elif net > 0:
+            signal = f"🟢 매수 약우세 (매수 {buyer_count} vs 매도 {seller_count})"
+            severity = "🟢"
+        elif net == 0:
+            signal = f"🟡 균형 (매수 {buyer_count} vs 매도 {seller_count})"
+            severity = "🟡"
+        elif reliable_sellers >= 3 or seller_count >= 5:
+            signal = f"🚨 강한 매도 (매수 {buyer_count} vs 매도 {seller_count})"
+            severity = "🚨"
+        else:
+            signal = f"⚠️ 매도 우세 (매수 {buyer_count} vs 매도 {seller_count})"
+            severity = "⚠️"
+
+        holdings_status.append({
+            "ticker": ticker,
+            "shares": shares,
+            "avg_price": avg_price,
+            "current_price": current_price,
+            "currency": currency,
+            "cost_basis": cost_basis,
+            "market_value": market_value,
+            "unrealized_pnl": unrealized_pnl,
+            "unrealized_pct": unrealized_pct,
+            "signal": signal,
+            "severity": severity,
+            "match_type": match_type,
+            "matched_score": (matched or {}).get("score"),
+        })
+
+    # 호환을 위해 holdings_impact 형식 유지 (신호 있는 것만)
+    holdings_impact = [
+        {
+            "ticker": h["ticker"],
+            "match_type": h["match_type"],
+            "severity": h["signal"],
+            "summary": (
+                f"수량 {h['shares']}, 평가손익 {h['unrealized_pct']:+.2f}% — {h['signal']}"
+                if h["unrealized_pct"] is not None else h["signal"]
+            ),
+        }
+        for h in holdings_status if h["match_type"]
+    ]
+
+    # 큰 매도 경고 (사람 수 기준이라 금액도 참고용)
+    big_sells = sorted(sell_only, key=lambda r: r.get("sell_amount_krw") or 0, reverse=True)[:3]
+
+    # 신뢰도 높은 유저 top 5 (팔로우용)
+    top_users = sorted(
+        [row for row in users if (row.get("final_reliability_score") or 0) > 0],
+        key=lambda r: r.get("final_reliability_score") or 0,
+        reverse=True,
+    )[:5]
+
+    # TL;DR 결정 — 시스템 신뢰도 1h 16% / 4h 24% 감안, 임계 강화
+    if top_pick and (top_pick.get("score") or 0) >= 80:
+        tldr = f"🟢 강한 매수 후보 1개: {top_pick.get('symbol')} (점수 {top_pick.get('score')}, 4h+ 보유 권장)"
+    elif top_pick and (top_pick.get("score") or 0) >= 70:
+        tldr = f"🟡 중간 신호 1개: {top_pick.get('symbol')} (점수 {top_pick.get('score')}) — 소액 진입 가능, 4h+ 보유"
+    elif top_pick:
+        tldr = f"🟡 약한 신호 1개: {top_pick.get('symbol')} (점수 {top_pick.get('score')}) — 진입 비추, 관찰 권장"
+    else:
+        tldr = "🔴 관망. 명확한 매수 후보 없음."
+
+    # 시간대 hint — KRX (09:00-15:30) vs US (22:30-05:00 KST 서머타임)
+    kst_now = now_kst()
+    hour = kst_now.hour
+    if 9 <= hour < 16:
+        market_hint = "🇰🇷 KRX 정규장 시간 — 한국 종목 시그널 위주"
+    elif 22 <= hour or hour < 5:
+        market_hint = "🇺🇸 미국 정규장 시간 — 미국 종목 시그널 위주"
+    elif 16 <= hour < 22:
+        market_hint = "⏸️ KRX 마감 ~ 미장 시작 전 — 신호 적음, 한국 시간외 가끔"
+    else:
+        market_hint = "⏸️ 미장 마감 ~ KRX 개장 전 — 신호 적음"
+
+    md = [
+        "# 📊 오늘 한 줄 답",
+        "",
+        f"**{tldr}**",
         "",
         f"- 생성: {data.get('generated_at')}",
-        f"- 시장 상태: {market.get('label') or '-'}",
-        f"- 최근매수 후보: {len(recent)}개",
-        f"- 수익권 보유 종목: {len(accumulation)}개",
+        f"- 시장: {market.get('label') or '-'}",
+        f"- 시간대: {market_hint}",
         "",
-        "## 오늘 바로 볼 후보",
     ]
-    if buy_candidates:
-        markdown_lines.extend(f"- {ai_brief_recent_buy_comment(row)}" for row in buy_candidates)
-    else:
-        markdown_lines.append("- 현재 규칙상 바로 진입 후보는 없음. 최근매수 스캔을 장중에 다시 실행.")
-    markdown_lines.extend(["", "## 추격매수 주의/보류"])
-    if watch_candidates or chase_blocked:
-        markdown_lines.extend(f"- {ai_brief_recent_buy_comment(row)}" for row in (watch_candidates + chase_blocked)[:10])
-    else:
-        markdown_lines.append("- 현재 추격매수 판단 대상 없음.")
-    markdown_lines.extend(["", "## 수익권 보유/축적 관심"])
-    if accumulation_focus:
-        for row in accumulation_focus:
-            markdown_lines.append(
-                f"- {row.get('symbol')}: 보유 {row.get('holder_count')}명, 수익권 {row.get('positive_holder_count')}명, 평균 미실현 {pct(row.get('avg_unrealized_return'))}, 판정 {row.get('decision')}"
+
+    if top_pick:
+        score = top_pick.get("score")
+        sym = top_pick.get("symbol")
+        bc = top_pick.get("buyer_count", 0)
+        rbc = top_pick.get("reliable_buyer_count", 0)
+        sc = top_pick.get("seller_count", 0)
+        rot = top_pick.get("rotation_count", 0)
+        cur = top_pick.get("current_price")
+        cur_src = top_pick.get("current_price_source", "system_quote")
+        curr = top_pick.get("current_price_currency", "KRW")
+        gap_pct = top_pick.get("price_move_since_buy_pct", 0)
+        ep = top_pick.get("exit_plan") or {}
+        target = ep.get("target_price")
+        stop = ep.get("stop_price")
+        size = size_guide_for_score(score, gap_pct)
+        md.extend([
+            "## 1순위 후보",
+            f"- **{sym}** — 점수 {score}",
+            f"- 매수 {bc}명 (신뢰 {rbc}) vs 매도 {sc}명, rotation {rot}명 별도",
+            f"- 현재가: {cur:,.0f} {curr} (갭 {gap_pct:+.2f}%, {'사용자 입력' if cur_src == 'user_override' else '시스템 quote'})",
+        ])
+        if target and stop:
+            md.append(f"- 목표 {target:,.0f} / 손절 {stop:,.0f}")
+        md.append(f"- **권장 사이즈: trading capital의 {size['pct']}%** — {size['note']}")
+        md.append("")
+
+    md.extend([
+        "## 📌 내 보유 종목 현황",
+        "",
+        "| 종목 | 수량 | 매수가 | 현재가 | 평가손익 | 시그널 |",
+        "|---|---:|---:|---:|---:|---|",
+    ])
+    total_cost = 0.0
+    total_value = 0.0
+    for h in holdings_status:
+        cur_str = f"{h['current_price']:,.2f}" if h['current_price'] is not None else "-"
+        pnl_str = f"{h['unrealized_pct']:+.2f}%" if h['unrealized_pct'] is not None else "-"
+        avg_str = f"{h['avg_price']:,.0f}" if h['currency'] == "KRW" else f"{h['avg_price']:,.2f}"
+        cur_disp = f"{h['current_price']:,.0f}" if (h['current_price'] is not None and h['currency'] == "KRW") else cur_str
+        md.append(
+            f"| **{h['ticker']}** | {h['shares']} | {avg_str} {h['currency']} | {cur_disp} {h['currency']} | {pnl_str} | {h['signal']} |"
+        )
+        # 합산 (KRW 종목 환산은 단순화 — 별도 표시)
+        if h['cost_basis']:
+            total_cost += h['cost_basis']
+        if h['market_value']:
+            total_value += h['market_value']
+    # 신호 있는 것만 강조
+    alerts = [h for h in holdings_status if h['match_type']]
+    if alerts:
+        md.append("")
+        md.append(f"**🚨 신호 발생 종목: {len(alerts)}개** — " + ", ".join(f"{h['ticker']} ({h['signal']})" for h in alerts))
+
+    # 일반 큰 매도 섹션 제거 (사용자 요청 2026-05-11): 매도는 보유 종목 한정. 큰 매도는 보유 종목 표에서만 표시.
+
+    if top_users:
+        md.extend(["", "## 👤 신뢰 유저 TOP 5 (팔로우 후보)"])
+        for u in top_users:
+            pid = u.get("profile_id")
+            url = f"https://www.tossinvest.com/community/profile/{pid}" if pid else ""
+            link = f" — [{url}]({url})" if url else ""
+            freq = u.get("trader_frequency") or "?"
+            freq_per_week = u.get("trade_freq_per_week")
+            freq_str = f"[{freq}{f' {freq_per_week}건/주' if freq_per_week else ''}]"
+            md.append(
+                f"- **{u.get('author')}** {freq_str} — 최종 신뢰도 {u.get('final_reliability_score')}, 단타 {u.get('short_term_score') or '-'}{link}"
             )
-    else:
-        markdown_lines.append("- holdings 기반 축적 관심 종목 부족.")
-    markdown_lines.extend(["", "## 우선 감시 유저"])
-    markdown_lines.extend(
-        f"- {row.get('author')}: 단타 {row.get('short_term_score')}, 최종 {row.get('final_reliability_score')}, {row.get('ai_review')}"
-        for row in top_users[:8]
-    )
-    markdown_lines.extend(["", "## Claude Code 판단 체크리스트"])
-    markdown_lines.extend(f"- {item}" for item in checklist)
-    markdown = "\n".join(markdown_lines) + "\n"
+
+    # 신뢰 유저 보유 인기 종목 TOP 5 (중기 관심 종목)
+    accumulation_top = [
+        row for row in accumulation
+        if (row.get("holder_count") or 0) >= 10 and (row.get("positive_holder_ratio") or 0) >= 0.6
+    ][:5]
+    if accumulation_top:
+        md.extend(["", "## 📈 신뢰 유저들이 들고 있는 인기 종목 TOP 5"])
+        for row in accumulation_top:
+            holders = row.get("holder_count", 0)
+            pos = row.get("positive_holder_count", 0)
+            avg_ret = (row.get("avg_unrealized_return") or 0) * 100
+            avg_user = row.get("avg_user_score") or 0
+            cur = row.get("current_price")
+            curr = row.get("current_currency") or "USD"
+            md.append(
+                f"- **{row.get('symbol')}** ({holders}명 보유, 수익권 {pos}명, 평균 {avg_ret:+.1f}%, 유저 신뢰도 평균 {avg_user:.1f})"
+            )
+
+    # 시스템 신뢰도 검증 (Task 1)
+    perf_summary = (performance or {}).get("summary") or {}
+    obs_count = (performance or {}).get("observation_count", 0)
+    if obs_count > 0:
+        md.extend(["", "## 📈 시스템 신뢰도 (자기 검증)"])
+        md.append(f"- 추천 누적 관측: {obs_count}건")
+        for horizon in ("1h", "4h", "24h"):
+            stat = perf_summary.get(horizon)
+            if not stat or not stat.get("count"):
+                continue
+            wr = stat.get("win_rate")
+            avg = stat.get("avg_return")
+            n = stat.get("count")
+            wr_str = f"{wr*100:.0f}%" if wr is not None else "-"
+            avg_str = f"{avg*100:+.2f}%" if avg is not None else "-"
+            md.append(f"- {horizon}: 승률 {wr_str} · 평균 수익 {avg_str} (n={n})")
+
+    md.extend(["", "---", "디테일이 필요하면: 종목 컨펌, 점수 산식, 매도자 명단, rotation 명단 등은 따로 요청해주세요."])
+    markdown = "\n".join(md) + "\n"
     AI_DECISION_BRIEF_PATH.write_text(markdown, encoding="utf-8")
     return {
         "generated_at": data.get("generated_at"),
         "brief_path": str(AI_DECISION_BRIEF_PATH),
-        "buy_candidates": buy_candidates,
-        "watch_candidates": watch_candidates,
-        "chase_blocked": chase_blocked,
-        "accumulation_focus": accumulation_focus,
+        "tldr": tldr,
+        "top_pick": top_pick,
+        "buy_candidates": actionable[:5],
+        "watch_candidates": [r for r in recent if r not in actionable][:8],
+        "chase_blocked": [],
+        "accumulation_focus": [],
+        "holdings_impact": holdings_impact,
+        "holdings_status": holdings_status,
+        "big_sells": big_sells,
         "top_users": top_users,
-        "checklist": checklist,
+        "checklist": [],
     }
 
 
@@ -4465,29 +5268,20 @@ def render_unified_recent_buys(recent_buy: dict[str, Any]) -> str:
             "<tr>"
             f"<td>{index}</td>"
             f"<td><button type='button' class='symbol-link' data-symbol-detail='{html.escape(symbol_key)}'>{html.escape(symbol_text)}</button><span class='muted'>{tags}</span></td>"
-            f"<td><span class='decision {action_class}'>{html.escape(action)}</span><span class='muted'>{html.escape(str(item.get('action_reason') or ''))}</span></td>"
-            f"<td><strong>{html.escape(str(item.get('chase_decision') or '-'))}</strong><span class='muted'>{html.escape(str(item.get('chase_rule') or ''))}</span>"
-            f"<span class='muted'>허용괴리 {html.escape(str(item.get('max_chase_gap_pct') if item.get('max_chase_gap_pct') is not None else '-'))}% · 비중 {html.escape(str(item.get('position_scale') if item.get('position_scale') is not None else '-'))}</span></td>"
-            f"<td>{html.escape(str(item.get('score') or '-'))}<span class='muted'>유저신호 raw {html.escape(str(item.get('raw_score') or '-'))}</span></td>"
-            f"<td><strong>{html.escape(str(item.get('ai_composite_score') if item.get('ai_composite_score') is not None else '-'))}</strong><span class='muted'>{html.escape(str(item.get('ai_verdict') or '-'))}</span><span class='muted'>외부데이터 {html.escape(str(item.get('external_data_score') if item.get('external_data_score') is not None else '-'))}</span></td>"
-            f"<td>{html.escape(str(item.get('ai_reason') or '-'))}</td>"
-            f"<td>{html.escape(str(item.get('buyer_count') or 0))}명"
-            f"<span class='muted'>{html.escape(str(item.get('buyer_participation_pct') or 0))}% / {html.escape(str(item.get('eligible_profile_count') or '-'))}명</span></td>"
-            f"<td>{html.escape(str(item.get('avg_user_reliability') or '-'))}</td>"
-            f"<td>{html.escape(format_money(item.get('amount_krw'), 'KRW'))}</td>"
-            f"<td>{html.escape(format_money(item.get('suggested_position_krw_on_10m'), 'KRW'))}</td>"
-            f"<td>{html.escape(format_trade_time(item.get('latest_buy_at')))}</td>"
+            f"<td><span class='decision {action_class}'>{html.escape(action)}</span><span class='muted'>{html.escape(str(item.get('chase_decision') or ''))}</span></td>"
+            f"<td><strong>{html.escape(str(item.get('score') or '-'))}</strong></td>"
+            f"<td>매수 <strong>{html.escape(str(item.get('buyer_count') or 0))}</strong>명<span class='muted'>신뢰 {html.escape(str(item.get('reliable_buyer_count') or 0))}명</span><span class='muted'>매도 {html.escape(str(item.get('seller_count') or 0))} · rot {html.escape(str(item.get('rotation_count') or 0))}</span></td>"
             f"<td class='{return_class(item.get('price_move_since_buy'))}'>{html.escape(pct(item.get('price_move_since_buy')))}"
-            f"<span class='muted'>{html.escape(str(item.get('price_gap_label') or '-'))} · 현재 {html.escape(format_money(item.get('current_price'), currency))} / 평균 {html.escape(format_money(item.get('average_buy_price'), currency))}</span></td>"
-            f"<td>{html.escape(format_money(exit_plan.get('target_price'), currency))}<span class='muted'>목표 {html.escape(str(exit_plan.get('target_return_pct') if exit_plan.get('target_return_pct') is not None else '-'))}% · 손절 {html.escape(format_money(exit_plan.get('stop_price'), currency))}</span><span class='muted'>{html.escape(str(exit_plan.get('rule') or ''))}</span></td>"
+            f"<span class='muted'>현재 {html.escape(format_money(item.get('current_price'), currency))}</span><span class='muted'>평균 {html.escape(format_money(item.get('average_buy_price'), currency))}</span></td>"
+            f"<td>{html.escape(format_money(exit_plan.get('target_price'), currency))}<span class='muted'>손절 {html.escape(format_money(exit_plan.get('stop_price'), currency))}</span></td>"
             f"<td>{buyers}</td>"
             "</tr>"
         )
     if not rows:
         return "<p class='empty'>현재 설정한 최근 시간창 안에서는 매수 후보가 없습니다. 8시간/12시간 창으로 넓혀 확인하세요.</p>"
     header = (
-        "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>추격매수</th><th>유저신호</th><th>AI 종합</th><th>AI 판단 근거</th><th>매수 유저</th><th>평균 신뢰도</th>"
-        "<th>매수 금액</th><th>1000만원 기준 1차</th><th>최근 매수</th><th>현재가/매수가</th><th>목표/손절 참고</th><th>유저 링크</th></tr></thead>"
+        "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>점수</th><th>매수/매도</th>"
+        "<th>현재가/매수가</th><th>목표/손절</th><th>유저 링크</th></tr></thead>"
     )
     return (
         f"{summary_html}"
@@ -5125,54 +5919,144 @@ def render_pipeline_overview(data: dict[str, Any]) -> str:
 
 def render_ai_decision_brief(data: dict[str, Any]) -> str:
     brief = data.get("ai_decision_brief") or {}
-    buy_candidates = brief.get("buy_candidates") or []
-    watch_candidates = brief.get("watch_candidates") or []
-    blocked = brief.get("chase_blocked") or []
-    accumulation = brief.get("accumulation_focus") or []
-    checklist = brief.get("checklist") or []
+    tldr = brief.get("tldr") or ""
+    top_pick = brief.get("top_pick") or {}
+    holdings_impact = brief.get("holdings_impact") or []
+    big_sells = brief.get("big_sells") or []
+    top_users = brief.get("top_users") or []
+    performance = data.get("recent_buy_performance") or read_json_file(RECENT_BUY_PERFORMANCE_PATH, {})
+    perf_summary = (performance or {}).get("summary") or {}
+    obs_count = (performance or {}).get("observation_count", 0)
 
-    def recent_cards(rows: list[dict[str, Any]], empty: str) -> str:
-        if not rows:
-            return f"<p class='empty'>{html.escape(empty)}</p>"
-        cards = []
-        for row in rows[:8]:
-            cards.append(
-                "<div class='ai-card'>"
-                f"<strong>{html.escape(str(row.get('symbol') or '-'))}</strong>"
-                f"<span>{html.escape(str(row.get('action') or '-'))} · {html.escape(str(row.get('chase_decision') or '-'))} · {html.escape(str(row.get('score') or '-'))}점</span>"
-                f"<span class='{return_class(row.get('price_move_since_buy'))}'>매수가 대비 {html.escape(pct(row.get('price_move_since_buy')))}</span>"
-                f"<p>{html.escape(str(row.get('chase_rule') or row.get('action_reason') or ''))}</p>"
-                "</div>"
+    # TL;DR 박스
+    tldr_color = "#0d8a4a" if tldr.startswith("🟢") else ("#cc6a00" if tldr.startswith("🟡") else "#b3261e")
+    tldr_html = (
+        f"<div class='ai-card' style='border-left:5px solid {tldr_color}; padding:14px; margin-bottom:18px'>"
+        f"<strong style='font-size:18px'>{html.escape(tldr)}</strong>"
+        f"<span class='muted'>생성: {html.escape(str(data.get('generated_at','-'))[:19])}</span>"
+        "</div>"
+    )
+
+    # 1순위 후보 + 사이즈 가이드
+    top_pick_html = ""
+    if top_pick:
+        gap = top_pick.get("price_move_since_buy_pct", 0) or 0
+        size = size_guide_for_score(top_pick.get("score"), gap)
+        cur = top_pick.get("current_price")
+        curr = top_pick.get("current_price_currency", "KRW")
+        ep = top_pick.get("exit_plan") or {}
+        top_pick_html = (
+            "<div class='ai-card' style='padding:14px;margin-bottom:18px'>"
+            f"<h4>🎯 1순위 후보: {html.escape(str(top_pick.get('symbol')))}</h4>"
+            f"<p>점수 <strong>{top_pick.get('score')}</strong> · "
+            f"매수 <strong>{top_pick.get('buyer_count',0)}명</strong> (신뢰 {top_pick.get('reliable_buyer_count',0)}) "
+            f"vs 매도 {top_pick.get('seller_count',0)}명 · rotation {top_pick.get('rotation_count',0)}명</p>"
+            f"<p>현재가 {format_money(cur, curr)} (갭 {gap:+.2f}%, "
+            f"{'사용자 입력' if top_pick.get('current_price_source') == 'user_override' else '시스템 quote'})</p>"
+            f"<p>목표 {format_money(ep.get('target_price'), curr)} / 손절 {format_money(ep.get('stop_price'), curr)}</p>"
+            f"<p><strong>권장 사이즈: trading capital의 {size['pct']}%</strong> — {html.escape(size['note'])}</p>"
+            "</div>"
+        )
+
+    # 보유 종목 dedicated 상태 (수량/매수가/현재가/평가손익/시그널)
+    holdings_status = brief.get("holdings_status") or []
+    if holdings_status:
+        def cls_pnl(v):
+            return "pos" if (v or 0) > 0 else ("neg" if (v or 0) < 0 else "")
+        rows = []
+        for h in holdings_status:
+            cur = h.get("current_price")
+            pnl = h.get("unrealized_pct")
+            currency = h.get("currency", "USD")
+            avg_str = f"{h['avg_price']:,.0f}" if currency == "KRW" else f"{h['avg_price']:,.2f}"
+            cur_str = (
+                (f"{cur:,.0f}" if currency == "KRW" else f"{cur:,.2f}")
+                if cur is not None else "-"
             )
-        return f"<div class='ai-card-grid'>{''.join(cards)}</div>"
+            pnl_str = f"{pnl:+.2f}%" if pnl is not None else "-"
+            rows.append(
+                "<tr>"
+                f"<td><strong>{html.escape(str(h['ticker']))}</strong></td>"
+                f"<td>{h.get('shares', 0)}</td>"
+                f"<td>{avg_str} {currency}</td>"
+                f"<td>{cur_str} {currency}</td>"
+                f"<td class='{cls_pnl(pnl)}'>{pnl_str}</td>"
+                f"<td>{html.escape(str(h.get('signal','-')))}</td>"
+                "</tr>"
+            )
+        alerts = [h for h in holdings_status if h.get('match_type')]
+        alert_note = (
+            f"<p class='note' style='color:#cc6a00'>🚨 신호 발생 {len(alerts)}개: "
+            + ", ".join(f"{h['ticker']} ({h['signal']})" for h in alerts) + "</p>"
+        ) if alerts else "<p class='note'>모든 보유 종목 조용 (신호 없음)</p>"
+        holdings_html = (
+            "<h4>📌 내 보유 종목 현황</h4>"
+            f"{alert_note}"
+            "<div class='panel inner-panel'><table><thead><tr><th>종목</th><th>수량</th><th>매수가</th><th>현재가</th><th>평가손익</th><th>시그널</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>"
+        )
+    else:
+        holdings_html = "<h4>📌 내 보유 종목 현황</h4><p class='empty'>보유 종목 데이터 없음</p>"
 
-    accumulation_rows = []
-    for row in accumulation[:8]:
-        accumulation_rows.append(
+    # 큰 매도 섹션 제거 (사용자 요청). 매도는 보유 종목 한정.
+    big_sells_html = ""
+
+    # 신뢰 유저 TOP 5 (팔로우)
+    if top_users:
+        user_rows = "".join(
             "<tr>"
-            f"<td>{html.escape(str(row.get('symbol') or '-'))}</td>"
-            f"<td>{html.escape(str(row.get('decision') or '-'))}</td>"
-            f"<td>{html.escape(str(row.get('holder_count') or 0))}명</td>"
-            f"<td>{html.escape(str(row.get('positive_holder_count') or 0))}명</td>"
-            f"<td class='{return_class(row.get('avg_unrealized_return'))}'>{html.escape(pct(row.get('avg_unrealized_return')))}</td>"
+            f"<td><strong>{html.escape(str(u.get('author','-')))}</strong></td>"
+            f"<td>{u.get('final_reliability_score','-')}</td>"
+            f"<td>{u.get('short_term_score') or '-'}</td>"
+            f"<td><a href='https://www.tossinvest.com/community/profile/{html.escape(str(u.get('profile_id','')))}' target='_blank' rel='noopener'>토스 프로필</a></td>"
+            "</tr>"
+            for u in top_users
+        )
+        users_html = (
+            "<h4>👤 신뢰 유저 TOP 5 (팔로우 후보)</h4>"
+            "<div class='panel inner-panel'><table><thead><tr><th>닉네임</th><th>최종 신뢰도</th><th>단타 점수</th><th>링크</th></tr></thead>"
+            f"<tbody>{user_rows}</tbody></table></div>"
+        )
+    else:
+        users_html = ""
+
+    # 시스템 신뢰도 검증
+    perf_rows = []
+    for horizon in ("1h", "4h", "24h"):
+        stat = perf_summary.get(horizon)
+        if not stat or not stat.get("count"):
+            continue
+        wr = stat.get("win_rate")
+        avg = stat.get("avg_return")
+        n = stat.get("count")
+        perf_rows.append(
+            "<tr>"
+            f"<td>{horizon}</td>"
+            f"<td>{wr*100:.0f}%</td>"
+            f"<td>{avg*100:+.2f}%</td>"
+            f"<td>{n}</td>"
             "</tr>"
         )
-    checklist_items = "".join(f"<li>{html.escape(str(item))}</li>" for item in checklist)
+    if perf_rows:
+        perf_html = (
+            "<h4>📈 시스템 신뢰도 (자기 검증)</h4>"
+            f"<p class='note'>추천 누적 관측: {obs_count}건</p>"
+            "<div class='panel inner-panel'><table><thead><tr><th>기간</th><th>승률</th><th>평균 수익</th><th>n</th></tr></thead>"
+            f"<tbody>{''.join(perf_rows)}</tbody></table></div>"
+        )
+    else:
+        perf_html = ""
+
     markdown_path = brief.get("brief_path")
     return (
         "<div class='ai-brief'>"
-        "<h3>AI 판단 브리핑</h3>"
-        "<p class='note'>파이썬이 만든 점수표를 그대로 따라 사지 않고, Claude Code가 아래 증거를 읽고 최종 판단을 설명하도록 만든 브리프입니다.</p>"
-        "<h4>바로 볼 후보</h4>"
-        f"{recent_cards(buy_candidates, '현재 규칙상 바로 진입 후보는 없습니다. 장중 스캔을 다시 실행하세요.')}"
-        "<h4>추격매수 주의</h4>"
-        f"{recent_cards((watch_candidates + blocked)[:8], '현재 추격매수 판단 대상이 없습니다.')}"
-        "<h4>수익권 보유/축적 관심</h4>"
-        "<div class='panel inner-panel'><table><thead><tr><th>종목</th><th>판정</th><th>보유 유저</th><th>수익권 유저</th><th>평균 미실현</th></tr></thead>"
-        f"<tbody>{''.join(accumulation_rows) or '<tr><td colspan=\"5\" class=\"muted\">축적 관심 종목 없음</td></tr>'}</tbody></table></div>"
-        "<h4>Claude Code 체크리스트</h4>"
-        f"<ul class='brief-list'>{checklist_items}</ul>"
-        f"<p class='note'>Markdown 브리프: {html.escape(str(markdown_path or AI_DECISION_BRIEF_PATH))}</p>"
+        f"{tldr_html}"
+        f"{top_pick_html}"
+        f"{holdings_html}"
+        f"{big_sells_html}"
+        f"{users_html}"
+        f"{perf_html}"
+        f"<p class='note'>Markdown 브리프 파일: {html.escape(str(markdown_path or AI_DECISION_BRIEF_PATH))}</p>"
         "</div>"
     )
 
@@ -6707,8 +7591,8 @@ def unified_dashboard_report() -> dict[str, Any]:
     .analysis-hero h2 {{ margin:0; font-size:24px; line-height:1.32; }}
     .analysis-hero p {{ margin:9px 0 0; color:var(--muted); line-height:1.6; }}
     .analysis-strip {{ margin:0; box-shadow:none; align-content:stretch; }}
-    .analysis-table {{ display:block; width:100%; max-width:calc(100vw - 48px); overflow-x:auto; overflow-y:hidden; overscroll-behavior-x:contain; }}
-    .analysis-table table {{ min-width:1760px; width:1760px; }}
+    .analysis-table {{ display:block; width:100%; max-width:calc(100vw - 48px); overflow-x:auto; overflow-y:hidden; overscroll-behavior-x:contain; -webkit-overflow-scrolling:touch; }}
+    .analysis-table table {{ min-width:960px; width:100%; }}
     .analysis-table::-webkit-scrollbar, .x-scroll-proxy::-webkit-scrollbar {{ height:13px; }}
     .analysis-table::-webkit-scrollbar-track, .x-scroll-proxy::-webkit-scrollbar-track {{ background:#edf1f5; border-radius:999px; }}
     .analysis-table::-webkit-scrollbar-thumb, .x-scroll-proxy::-webkit-scrollbar-thumb {{ background:#9aa6b2; border-radius:999px; border:3px solid #edf1f5; }}
@@ -6721,7 +7605,7 @@ def unified_dashboard_report() -> dict[str, Any]:
     .analysis-summary strong {{ margin-top:5px; font-size:18px; }}
     .analysis-summary em {{ margin-top:3px; color:var(--muted); font-style:normal; font-size:12px; }}
     .x-scroll-proxy {{ display:block; width:100%; max-width:calc(100vw - 48px); overflow-x:auto; overflow-y:hidden; height:20px; padding:3px 0; background:#fff; border-bottom:1px solid var(--line2); }}
-    .x-scroll-proxy > div {{ width:1760px; height:1px; }}
+    .x-scroll-proxy > div {{ width:960px; height:1px; }}
     .secondary-details {{ background:#fff; border:1px solid var(--line2); border-radius:18px; box-shadow:var(--shadow); overflow:hidden; }}
     .secondary-details summary {{ cursor:pointer; padding:16px 18px; font-weight:850; color:var(--sub); }}
     .secondary-details[open] summary {{ border-bottom:1px solid var(--line2); }}
@@ -6857,27 +7741,16 @@ def unified_dashboard_report() -> dict[str, Any]:
   </header>
   <section class="workspace-tabs">
     <nav class="tab-nav" aria-label="대시보드 메뉴">
-      <span class="tab-group-label">Overview</span>
-      <button type="button" class="tab-button active" data-tab-target="overview">운영 개요</button>
-      <button type="button" class="tab-button" data-tab-target="today">장중 판단</button>
+      <button type="button" class="tab-button active" data-tab-target="today">장중 판단</button>
       <button type="button" class="tab-button" data-tab-target="brief">AI 브리핑</button>
-      <span class="tab-group-label">Models</span>
-      <button type="button" class="tab-button" data-tab-target="symbols">종목 모델</button>
-      <button type="button" class="tab-button" data-tab-target="confirm">종목 컨펌</button>
-      <button type="button" class="tab-button" data-tab-target="accumulation">수익권 보유</button>
       <button type="button" class="tab-button" data-tab-target="users">유저 모델</button>
-      <span class="tab-group-label">Operations</span>
-      <button type="button" class="tab-button" data-tab-target="ops">리포트 보관함</button>
-      <button type="button" class="tab-button" data-tab-target="data">데이터·서비스</button>
-      <button type="button" class="tab-button" data-tab-target="risk">리스크</button>
-      <button type="button" class="tab-button" data-tab-target="system">파이프라인</button>
     </nav>
 
-    <section id="tab-overview" class="tab-panel active">
+    <section id="tab-overview" class="tab-panel" hidden>
       {render_operating_overview(data)}
     </section>
 
-    <section id="tab-today" class="tab-panel">
+    <section id="tab-today" class="tab-panel active">
       <div class="section-stack">
         <div>
           {render_today_analysis_header(data)}
@@ -8155,6 +9028,9 @@ def main() -> None:
     parser.add_argument("--profile-html-report", action="store_true", help="write an HTML report for profile follow backtests")
     parser.add_argument("--daily-profile-scan", action="store_true", help="opt-in daily read-only scan for selected profile updates")
     parser.add_argument("--recent-buy-report", action="store_true", help="write recent 0-4h top-user buy recommendation report")
+    parser.add_argument("--recent-trade-timeline", action="store_true", help="write recent trade timeline (symbol-grouped, sorted by latest event)")
+    parser.add_argument("--fetch-user-holdings", action="store_true", help="fetch user's own Toss holdings from trade history (auto-populate USER_HOLDINGS)")
+    parser.add_argument("--user-price", default="", help="comma-separated symbol=price overrides, e.g. '삼성전자=282000,SK하이닉스=1850000'")
     parser.add_argument("--unified-dashboard", action="store_true", help="write one consolidated HTML dashboard and one consolidated JSON data file")
     parser.add_argument("--ai-brief", action="store_true", help="write Claude/AI decision brief markdown from the latest dashboard data")
     parser.add_argument("--market-prep", action="store_true", help="closed-market prep: expand user pool, recompute reliability, and update dashboard")
@@ -8165,9 +9041,13 @@ def main() -> None:
     parser.add_argument("--capital", type=int, default=10_000_000, help="capital used for PnL estimates")
     parser.add_argument("--profile-limit", type=int, default=100, help="profile candidates to discover or inspect")
     parser.add_argument("--profile-pages", type=int, default=2, help="max trade-history pages per profile in opt-in mode")
-    parser.add_argument("--profile-delay", type=float, default=2.5, help="seconds to wait between opt-in profile-history calls")
+    parser.add_argument("--profile-delay", type=float, default=0.3, help="seconds to wait between opt-in profile-history calls (per worker)")
+    parser.add_argument("--scan-workers", type=int, default=4, help="parallel workers for --daily-profile-scan (default 4)")
+    parser.add_argument("--scan-pages", type=int, default=10, help="max pages per profile (safety cap; default 10). With --scan-cutoff-hours stop earlier when oldest event passes cutoff.")
+    parser.add_argument("--scan-cutoff-hours", type=float, default=4.0, help="stop paging once oldest event is older than this many hours (0 = disable, fixed pages). Default 4h.")
     parser.add_argument("--incremental-profiles", action="store_true", help="skip profile ids already present in profile_history_report.json")
-    parser.add_argument("--profile-strategy-event-limit", type=int, default=600, help="recent profile BUY events to backtest; use 0 for all events")
+    parser.add_argument("--profile-strategy-event-limit", type=int, default=0, help="recent profile BUY events to backtest; 0 = ALL events (default)")
+    parser.add_argument("--strategy-half-life-days", type=float, default=30.0, help="half-life (days) for recency weight in reliability score (default 30)")
     parser.add_argument("--no-incremental-backtest", action="store_true", help="recompute profile backtest rows instead of reusing cached event results")
     parser.add_argument("--deep-profile-min-events", type=int, default=8, help="minimum existing events for --deep-profile-history-report")
     parser.add_argument("--daily-profile-limit", type=int, default=200, help="profiles to scan in --daily-profile-scan")
@@ -8238,6 +9118,7 @@ def main() -> None:
                 min_samples=args.min_samples,
                 event_limit=args.profile_strategy_event_limit or None,
                 incremental=not args.no_incremental_backtest,
+                half_life_days=args.strategy_half_life_days,
             )
         elif args.profile_html_report:
             output = profile_strategy_html_report(min_samples=args.min_samples)
@@ -8249,9 +9130,29 @@ def main() -> None:
                 profile_limit=args.daily_profile_limit,
                 delay_seconds=args.profile_delay,
                 include_holdings=not args.skip_daily_holdings,
+                max_workers=args.scan_workers,
+                max_pages=args.scan_pages,
+                cutoff_hours=args.scan_cutoff_hours if args.scan_cutoff_hours > 0 else None,
             )
         elif args.recent_buy_report:
-            output = recent_buy_html_report(hours=args.recent_hours, capital=args.capital)
+            user_prices: dict[str, float] = {}
+            if args.user_price:
+                for pair in args.user_price.split(","):
+                    if "=" not in pair:
+                        continue
+                    name_part, price_part = pair.split("=", 1)
+                    try:
+                        user_prices[name_part.strip()] = float(price_part.strip().replace(",", ""))
+                    except ValueError:
+                        continue
+            output = recent_buy_html_report(hours=args.recent_hours, capital=args.capital, user_prices=user_prices)
+        elif args.recent_trade_timeline:
+            output = build_recent_trade_timeline(hours=args.recent_hours)
+        elif args.fetch_user_holdings:
+            output = fetch_user_holdings_from_trades(
+                session_curl_file=args.session_curl_file,
+                session_headers_file=args.session_headers_file,
+            )
         elif args.unified_dashboard:
             output = unified_dashboard_report()
         elif args.ai_brief:

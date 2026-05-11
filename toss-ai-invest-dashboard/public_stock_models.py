@@ -3082,9 +3082,12 @@ def build_recent_buy_report(
             sum(seller_reliability_values) / len(seller_reliability_values)
             if seller_reliability_values else 0.0
         )
-        # Person-based scoring (옵션 C, 사람 수 기준 — 금액 점수 제거)
-        buyer_score = min(25.0, buyer_participation_rate / 0.05 * 25.0)
-        reliable_buyer_score = min(15.0, reliable_buyer_participation_rate / 0.03 * 15.0)
+        # Person-based scoring — 시간 윈도우 정규화 (4h 기준 5%/3%, 8h 기준 10%/6%, 12h 15%/9%)
+        hours_norm = max(0.5, hours / 4.0)  # 4h: 1.0, 8h: 2.0, 12h: 3.0
+        buyer_threshold = 0.05 * hours_norm
+        reliable_buyer_threshold = 0.03 * hours_norm
+        buyer_score = min(25.0, buyer_participation_rate / buyer_threshold * 25.0)
+        reliable_buyer_score = min(15.0, reliable_buyer_participation_rate / reliable_buyer_threshold * 15.0)
         reliability_score_part = min(30.0, avg_reliability * 0.30)
         # Holding bonus: 신뢰 유저들이 보유 중인 종목이면 + 점수 (사용자 요청)
         holding_bonus = 0.0
@@ -3300,8 +3303,9 @@ def build_recent_buy_report(
         "scoring": {
             "version": "person-based-v3-with-sell-consensus",
             "eligible_profile_count": eligible_profile_count,
-            "buyer_participation_full_score_pct": 5.0,
-            "reliable_buyer_participation_full_score_pct": 3.0,
+            "buyer_participation_full_score_pct": round(5.0 * max(0.5, hours / 4.0), 2),
+            "reliable_buyer_participation_full_score_pct": round(3.0 * max(0.5, hours / 4.0), 2),
+            "threshold_baseline_hours": 4.0,
             "score_weights": {
                 "buyer_participation": 25,
                 "reliable_buyer_participation": 15,
@@ -4962,6 +4966,17 @@ def build_ai_decision_brief(data: dict[str, Any]) -> dict[str, Any]:
         if target and stop:
             md.append(f"- 목표 {target:,.0f} / 손절 {stop:,.0f}")
         md.append(f"- **권장 사이즈: trading capital의 {size['pct']}%** — {size['note']}")
+        # 기술 종합 점수 (외부 시장 데이터 산식: 거래대금/외국인기관/백테스트/수익권보유 — LLM 호출 아님)
+        ai_score = top_pick.get("ai_composite_score")
+        ai_verdict = top_pick.get("ai_verdict")
+        ai_reason = top_pick.get("ai_reason")
+        if ai_score is not None or ai_verdict:
+            ai_line = f"- **📊 기술 종합 점수: {ai_score if ai_score is not None else '-'}점**"
+            if ai_verdict:
+                ai_line += f" ({ai_verdict})"
+            md.append(ai_line)
+            if ai_reason:
+                md.append(f"  - {ai_reason}")
         md.append("")
 
     md.extend([
@@ -5264,12 +5279,56 @@ def render_unified_recent_buys(recent_buy: dict[str, Any]) -> str:
         action_class = "decision-good" if action == "매수 후보" else "decision-bad" if action == "제외" else "decision-warn"
         tags = " ".join(f"<span class='chip'>{html.escape(str(tag))}</span>" for tag in item.get("risk_tags") or [])
         exit_plan = item.get("exit_plan") or {}
+        # 점수 breakdown — hover/tap 시 표시
+        sp = item.get("score_parts") or {}
+        score_tooltip = (
+            f"매수자 비율 {sp.get('buyer_participation', 0)} / "
+            f"신뢰 매수자 {sp.get('reliable_buyer_participation', 0)} / "
+            f"평균 신뢰도 {sp.get('user_reliability', 0)} / "
+            f"매수-매도 합의 {sp.get('consensus', 0)} / "
+            f"최신성 {sp.get('recency', 0)} / "
+            f"holding 보너스 {sp.get('holding_bonus', 0)} "
+            f"− 페널티 {sp.get('penalty_total', 0)}"
+        )
+        ai_composite = item.get("ai_composite_score")
+        ai_verdict = item.get("ai_verdict") or "-"
+        ai_score_parts = item.get("ai_score_parts") or {}
+        external_data_score = item.get("external_data_score")
+        ai_html = ""
+        if ai_composite is not None:
+            ai_html = (
+                "<span class='score-section-divider'></span>"
+                f"<span><strong>📊 기술 종합: {ai_composite}점 ({html.escape(str(ai_verdict))})</strong></span>"
+                f"<span>가격 타이밍: <b>{ai_score_parts.get('price_timing', '-')}</b></span>"
+                f"<span>시장 컨펌: <b>{ai_score_parts.get('market_confirmation', '-')}</b></span>"
+                f"<span>종목 모델: <b>{ai_score_parts.get('symbol_model', '-')}</b></span>"
+                f"<span>보유 축적: <b>{ai_score_parts.get('holding_accumulation', '-')}</b></span>"
+            )
+            if external_data_score is not None:
+                ai_html += f"<span>외부 데이터: <b>{external_data_score}</b></span>"
+        score_breakdown_html = (
+            "<span class='score-tooltip'>"
+            "<strong>점수 구성 (100점 + bonus)</strong>"
+            f"<span>매수자 비율: <b>{sp.get('buyer_participation', 0)}</b> / 25</span>"
+            f"<span>신뢰 매수자: <b>{sp.get('reliable_buyer_participation', 0)}</b> / 15</span>"
+            f"<span>평균 신뢰도: <b>{sp.get('user_reliability', 0)}</b> / 30</span>"
+            f"<span>매수-매도 합의: <b>{sp.get('consensus', 0)}</b> / 15</span>"
+            f"<span>최신성: <b>{sp.get('recency', 0)}</b> / 15</span>"
+            f"<span>holding 보너스: <b>+{sp.get('holding_bonus', 0)}</b></span>"
+            f"<span class='neg'>페널티: <b>−{sp.get('penalty_total', 0)}</b></span>"
+            f"{ai_html}"
+            "</span>"
+        )
+        ai_display = item.get("ai_composite_score")
+        ai_verdict_disp = item.get("ai_verdict") or "-"
+        ai_class = "decision-good" if ai_verdict_disp == "컨펌 강함" else "decision-bad" if ai_verdict_disp == "주의" else "decision-warn"
         rows.append(
             "<tr>"
             f"<td>{index}</td>"
             f"<td><button type='button' class='symbol-link' data-symbol-detail='{html.escape(symbol_key)}'>{html.escape(symbol_text)}</button><span class='muted'>{tags}</span></td>"
             f"<td><span class='decision {action_class}'>{html.escape(action)}</span><span class='muted'>{html.escape(str(item.get('chase_decision') or ''))}</span></td>"
-            f"<td><strong>{html.escape(str(item.get('score') or '-'))}</strong></td>"
+            f"<td class='score-cell' title='{html.escape(score_tooltip)}'><strong>{html.escape(str(item.get('score') or '-'))}</strong>{score_breakdown_html}</td>"
+            f"<td><strong>{html.escape(str(ai_display if ai_display is not None else '-'))}</strong><span class='decision {ai_class}'>{html.escape(ai_verdict_disp)}</span></td>"
             f"<td>매수 <strong>{html.escape(str(item.get('buyer_count') or 0))}</strong>명<span class='muted'>신뢰 {html.escape(str(item.get('reliable_buyer_count') or 0))}명</span><span class='muted'>매도 {html.escape(str(item.get('seller_count') or 0))} · rot {html.escape(str(item.get('rotation_count') or 0))}</span></td>"
             f"<td class='{return_class(item.get('price_move_since_buy'))}'>{html.escape(pct(item.get('price_move_since_buy')))}"
             f"<span class='muted'>현재 {html.escape(format_money(item.get('current_price'), currency))}</span><span class='muted'>평균 {html.escape(format_money(item.get('average_buy_price'), currency))}</span></td>"
@@ -5280,7 +5339,7 @@ def render_unified_recent_buys(recent_buy: dict[str, Any]) -> str:
     if not rows:
         return "<p class='empty'>현재 설정한 최근 시간창 안에서는 매수 후보가 없습니다. 8시간/12시간 창으로 넓혀 확인하세요.</p>"
     header = (
-        "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>점수</th><th>매수/매도</th>"
+        "<table><thead><tr><th>#</th><th>종목</th><th>판정</th><th>유저 점수</th><th>기술 종합</th><th>매수/매도</th>"
         "<th>현재가/매수가</th><th>목표/손절</th><th>유저 링크</th></tr></thead>"
     )
     return (
@@ -5543,7 +5602,7 @@ def today_candidate_reason(row: dict[str, Any]) -> str:
     reason = row.get("action_reason") or row.get("chase_rule") or ""
     ai_verdict = row.get("ai_verdict")
     ai_score = row.get("ai_composite_score")
-    ai_text = f" AI 종합 {ai_score}점/{ai_verdict}." if ai_score is not None else ""
+    ai_text = f" 기술 종합 {ai_score}점/{ai_verdict}." if ai_score is not None else ""
     return (
         f"신뢰유저 {reliable}명/{buyers}명, 평균 신뢰도 {reliability or '-'}점. "
         f"유저 평균가 대비 {gap}.{ai_text} {reason}"
@@ -5575,7 +5634,7 @@ def render_today_candidate_card(row: dict[str, Any], tone: str) -> str:
         f"<p>{html.escape(today_candidate_reason(row))}</p>"
         "<div class='signal-metrics'>"
         f"<div><span>유저신호</span><strong>{html.escape(str(row.get('score') or '-'))}</strong></div>"
-        f"<div><span>AI 종합</span><strong>{html.escape(str(row.get('ai_composite_score') if row.get('ai_composite_score') is not None else '-'))}</strong><em>{html.escape(str(row.get('ai_verdict') or '-'))}</em></div>"
+        f"<div><span>기술 종합</span><strong>{html.escape(str(row.get('ai_composite_score') if row.get('ai_composite_score') is not None else '-'))}</strong><em>{html.escape(str(row.get('ai_verdict') or '-'))}</em></div>"
         f"<div><span>괴리</span><strong class='{return_class(row.get('price_move_since_buy'))}'>{html.escape(pct(row.get('price_move_since_buy')))}</strong></div>"
         f"<div><span>시장/종목</span><strong>{html.escape(str(ai_parts.get('market_confirmation') if ai_parts.get('market_confirmation') is not None else '-'))}</strong><em>종목 {html.escape(str(ai_parts.get('symbol_model') if ai_parts.get('symbol_model') is not None else '-'))}</em></div>"
         f"<div><span>현재/평균</span><strong>{html.escape(format_money(row.get('current_price'), currency))}</strong><em>{html.escape(format_money(row.get('average_buy_price'), currency))}</em></div>"
@@ -5698,7 +5757,7 @@ def render_today_analysis_header(data: dict[str, Any]) -> str:
         "<div>"
         "<span class='brand-kicker'>Intraday Analyst Table</span>"
         "<h2>장중 판단은 이 테이블을 기준으로 봅니다</h2>"
-        f"<p>{html.escape(headline)}. 정렬은 판정 우선, 그 다음 AI 종합점수와 유저신호 점수 순입니다.</p>"
+        f"<p>{html.escape(headline)}. 정렬은 판정 우선, 그 다음 기술 종합점수와 유저신호 점수 순입니다.</p>"
         "</div>"
         f"<div class='operator-strip analysis-strip'>{metrics}</div>"
         "</section>"
@@ -6689,7 +6748,7 @@ function renderSymbol(row) {{
     <section class="detail-grid">
       ${{kv('장중 판정', recent.action || '-')}}
       ${{kv('유저신호 점수', fmtNum(recent.score))}}
-      ${{kv('AI 종합점수', `${{fmtNum(recent.ai_composite_score)}} / ${{recent.ai_verdict || '-'}}`)}}
+      ${{kv('기술 종합점수', `${{fmtNum(recent.ai_composite_score)}} / ${{recent.ai_verdict || '-'}}`)}}
       ${{kv('외부데이터 점수', fmtNum(recent.external_data_score))}}
       ${{kv('가격 괴리', fmtPct(recent.price_move_since_buy), Number(recent.price_move_since_buy || 0) >= 0 ? 'pos' : 'neg')}}
       ${{kv('매수 유저', `${{recent.reliable_buyer_count || 0}}/${{recent.buyer_count || 0}}명`)}}
@@ -6702,8 +6761,8 @@ function renderSymbol(row) {{
       ${{kv('축적 점수', fmtNum(accum.score))}}
       ${{kv('보유 수익권', `${{accum.positive_holder_count || 0}}명`)}}
     </section>
-    <section class="detail-section"><h4>AI 종합 판단</h4><p class="ai-box">${{escapeHtml(recent.ai_reason || recent.action_reason || recent.chase_rule || confirm.ai_reason || model.decision || '월요일 장중 재스캔으로 반복 매수 여부를 확인해야 합니다.')}}</p></section>
-    <section class="detail-section"><h4>AI 점수 구성</h4><div class="detail-grid">${{kv('가격 타이밍', fmtNum((recent.ai_score_parts || {{}}).price_timing))}}${{kv('시장 컨펌', fmtNum((recent.ai_score_parts || {{}}).market_confirmation))}}${{kv('종목 모델', fmtNum((recent.ai_score_parts || {{}}).symbol_model))}}${{kv('보유 축적', fmtNum((recent.ai_score_parts || {{}}).holding_accumulation))}}</div></section>
+    <section class="detail-section"><h4>기술 종합 판단</h4><p class="ai-box">${{escapeHtml(recent.ai_reason || recent.action_reason || recent.chase_rule || confirm.ai_reason || model.decision || '월요일 장중 재스캔으로 반복 매수 여부를 확인해야 합니다.')}}</p></section>
+    <section class="detail-section"><h4>기술 점수 구성</h4><div class="detail-grid">${{kv('가격 타이밍', fmtNum((recent.ai_score_parts || {{}}).price_timing))}}${{kv('시장 컨펌', fmtNum((recent.ai_score_parts || {{}}).market_confirmation))}}${{kv('종목 모델', fmtNum((recent.ai_score_parts || {{}}).symbol_model))}}${{kv('보유 축적', fmtNum((recent.ai_score_parts || {{}}).holding_accumulation))}}</div></section>
     <section class="detail-section"><h4>가격 판단</h4><p class="note">유저 평균가 대비 현재가가 너무 벌어졌으면 추격 금지로 봅니다. 목표/손절은 참고값이며, 장중 체결가 기준으로 다시 확인해야 합니다.</p><div class="detail-grid">${{kv('Toss 가격검토', price.status || '-')}}${{kv('컨펌 괴리', fmtPlainPct(price.gap_pct), Number(price.gap_pct || 0) >= 0 ? 'pos' : 'neg')}}${{kv('추격 판단', recent.chase_decision || '-')}}${{kv('허용 괴리', `${{recent.max_chase_gap_pct ?? '-'}}%`)}}</div></section>
     <section class="detail-section"><h4>매수 유저</h4><div>${{buyers}}</div><table><thead><tr><th>시간</th><th>유저</th><th>구분</th><th>금액</th><th>평단</th></tr></thead><tbody>${{events}}</tbody></table></section>
     <section class="detail-section"><h4>종목 모델</h4><div class="detail-grid">${{kv('평균 수익률', fmtPct(model.avg_return), Number(model.avg_return || 0) >= 0 ? 'pos' : 'neg')}}${{kv('승률', fmtPct(model.win_rate))}}${{kv('검증 샘플', fmtNum(model.tested_returns))}}${{kv('신뢰 유저', `${{model.trusted_author_count || 0}}명`)}}</div></section>
@@ -6847,6 +6906,17 @@ function bindHorizontalScrollProxies() {{
   }});
 }}
 bindHorizontalScrollProxies();
+// Score cell tap toggle (모바일: hover 없음)
+document.querySelectorAll('.score-cell').forEach(cell => {{
+  cell.addEventListener('click', (e) => {{
+    document.querySelectorAll('.score-cell.tap-open').forEach(c => {{ if (c !== cell) c.classList.remove('tap-open'); }});
+    cell.classList.toggle('tap-open');
+    e.stopPropagation();
+  }});
+}});
+document.addEventListener('click', () => {{
+  document.querySelectorAll('.score-cell.tap-open').forEach(c => c.classList.remove('tap-open'));
+}});
 function activateDashboardTab(name) {{
   document.querySelectorAll('.tab-button').forEach(button => {{
     button.classList.toggle('active', button.dataset.tabTarget === name);
@@ -7592,12 +7662,30 @@ def unified_dashboard_report() -> dict[str, Any]:
     .analysis-hero p {{ margin:9px 0 0; color:var(--muted); line-height:1.6; }}
     .analysis-strip {{ margin:0; box-shadow:none; align-content:stretch; }}
     .analysis-table {{ display:block; width:100%; max-width:calc(100vw - 48px); overflow-x:auto; overflow-y:hidden; overscroll-behavior-x:contain; -webkit-overflow-scrolling:touch; }}
-    .analysis-table table {{ min-width:960px; width:100%; }}
+    .analysis-table table {{ min-width:1080px; width:100%; }}
     .analysis-table::-webkit-scrollbar, .x-scroll-proxy::-webkit-scrollbar {{ height:13px; }}
     .analysis-table::-webkit-scrollbar-track, .x-scroll-proxy::-webkit-scrollbar-track {{ background:#edf1f5; border-radius:999px; }}
     .analysis-table::-webkit-scrollbar-thumb, .x-scroll-proxy::-webkit-scrollbar-thumb {{ background:#9aa6b2; border-radius:999px; border:3px solid #edf1f5; }}
     .analysis-table th:nth-child(2), .analysis-table td:nth-child(2) {{ position:sticky; left:0; z-index:2; background:#fff; box-shadow:1px 0 0 var(--line2); }}
     .analysis-table th:nth-child(2) {{ background:#fbfcfd; z-index:3; }}
+    /* Score breakdown tooltip — hover or focus 시 노출 */
+    .score-cell {{ position:relative; cursor:help; }}
+    .score-cell .score-tooltip {{
+        display:none; position:absolute; left:50%; top:100%; transform:translateX(-50%);
+        z-index:50; min-width:240px; padding:12px 14px; background:#1a1f2b; color:#fff;
+        border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,0.25); font-weight:500;
+        font-size:13px; line-height:1.6; white-space:normal;
+    }}
+    .score-cell .score-tooltip strong {{ display:block; margin-bottom:6px; color:#7bd3f7; font-size:12px; letter-spacing:0.3px; }}
+    .score-cell .score-tooltip .score-section-divider {{ display:block; border-top:1px solid rgba(255,255,255,0.18); margin:8px 0 6px; }}
+    .score-cell .score-tooltip span {{ display:flex; justify-content:space-between; gap:12px; }}
+    .score-cell .score-tooltip span.neg {{ color:#ff8585; }}
+    .score-cell .score-tooltip b {{ color:#fff; }}
+    .score-cell:hover .score-tooltip, .score-cell:focus-within .score-tooltip, .score-cell.tap-open .score-tooltip {{ display:block; }}
+    .score-cell:hover, .score-cell:focus-within {{ background:#f0f7ff; }}
+    @media (hover: none) {{ /* 모바일: tap-open class JS로 토글 */
+        .score-cell .score-tooltip {{ position:fixed; left:50%; top:auto; bottom:20px; transform:translateX(-50%); }}
+    }}
     .analysis-summary {{ display:grid; grid-template-columns:repeat(6, minmax(130px, 1fr)); gap:8px; padding:14px; border-bottom:1px solid var(--line2); background:#fff; }}
     .analysis-summary div {{ background:#f8fafc; border:1px solid #eef2f6; border-radius:14px; padding:12px; min-height:72px; }}
     .analysis-summary span, .analysis-summary strong, .analysis-summary em {{ display:block; }}
@@ -7605,7 +7693,7 @@ def unified_dashboard_report() -> dict[str, Any]:
     .analysis-summary strong {{ margin-top:5px; font-size:18px; }}
     .analysis-summary em {{ margin-top:3px; color:var(--muted); font-style:normal; font-size:12px; }}
     .x-scroll-proxy {{ display:block; width:100%; max-width:calc(100vw - 48px); overflow-x:auto; overflow-y:hidden; height:20px; padding:3px 0; background:#fff; border-bottom:1px solid var(--line2); }}
-    .x-scroll-proxy > div {{ width:960px; height:1px; }}
+    .x-scroll-proxy > div {{ width:1080px; height:1px; }}
     .secondary-details {{ background:#fff; border:1px solid var(--line2); border-radius:18px; box-shadow:var(--shadow); overflow:hidden; }}
     .secondary-details summary {{ cursor:pointer; padding:16px 18px; font-weight:850; color:var(--sub); }}
     .secondary-details[open] summary {{ border-bottom:1px solid var(--line2); }}
@@ -7743,6 +7831,7 @@ def unified_dashboard_report() -> dict[str, Any]:
     <nav class="tab-nav" aria-label="대시보드 메뉴">
       <button type="button" class="tab-button active" data-tab-target="today">장중 판단</button>
       <button type="button" class="tab-button" data-tab-target="brief">AI 브리핑</button>
+      <button type="button" class="tab-button" data-tab-target="confirm">종목 컨펌</button>
       <button type="button" class="tab-button" data-tab-target="users">유저 모델</button>
     </nav>
 
@@ -9044,14 +9133,14 @@ def main() -> None:
     parser.add_argument("--profile-delay", type=float, default=0.3, help="seconds to wait between opt-in profile-history calls (per worker)")
     parser.add_argument("--scan-workers", type=int, default=4, help="parallel workers for --daily-profile-scan (default 4)")
     parser.add_argument("--scan-pages", type=int, default=10, help="max pages per profile (safety cap; default 10). With --scan-cutoff-hours stop earlier when oldest event passes cutoff.")
-    parser.add_argument("--scan-cutoff-hours", type=float, default=4.0, help="stop paging once oldest event is older than this many hours (0 = disable, fixed pages). Default 4h.")
+    parser.add_argument("--scan-cutoff-hours", type=float, default=8.0, help="stop paging once oldest event is older than this many hours (0 = disable, fixed pages). Default 8h.")
     parser.add_argument("--incremental-profiles", action="store_true", help="skip profile ids already present in profile_history_report.json")
     parser.add_argument("--profile-strategy-event-limit", type=int, default=0, help="recent profile BUY events to backtest; 0 = ALL events (default)")
     parser.add_argument("--strategy-half-life-days", type=float, default=30.0, help="half-life (days) for recency weight in reliability score (default 30)")
     parser.add_argument("--no-incremental-backtest", action="store_true", help="recompute profile backtest rows instead of reusing cached event results")
     parser.add_argument("--deep-profile-min-events", type=int, default=8, help="minimum existing events for --deep-profile-history-report")
     parser.add_argument("--daily-profile-limit", type=int, default=200, help="profiles to scan in --daily-profile-scan")
-    parser.add_argument("--recent-hours", type=float, default=4.0, help="hours to include in --recent-buy-report")
+    parser.add_argument("--recent-hours", type=float, default=8.0, help="hours to include in --recent-buy-report")
     parser.add_argument("--stock-community-codes", default="", help="comma-separated Toss stock codes to include in public profile discovery")
     parser.add_argument("--stock-community-top", type=int, default=0, help="include top N non-leveraged realtime stocks' communities in profile discovery")
     parser.add_argument("--stock-community-pages", type=int, default=1, help="pages per stock community and sort type in profile discovery")

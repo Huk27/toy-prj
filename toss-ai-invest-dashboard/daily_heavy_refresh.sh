@@ -73,8 +73,8 @@ $PY public_stock_models.py --profile-strategy-report \
 
 # 3. 최신 reports 갱신
 echo "  [3/5] recent-buy + timeline..." | tee -a "$LOG_DIR/refresh.log"
-$PY public_stock_models.py --recent-buy-report --recent-hours 4 >> "$LOG" 2>&1
-$PY public_stock_models.py --recent-trade-timeline --recent-hours 4 >> "$LOG" 2>&1
+$PY public_stock_models.py --recent-buy-report --recent-hours 8 >> "$LOG" 2>&1
+$PY public_stock_models.py --recent-trade-timeline --recent-hours 8 >> "$LOG" 2>&1
 
 # 4. 통합 + brief
 echo "  [4/5] unified + brief..." | tee -a "$LOG_DIR/refresh.log"

@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 
 PROFILE_LIMIT="${PROFILE_LIMIT:-400}"
 SCAN_PAGES="${SCAN_PAGES:-10}"
-SCAN_CUTOFF_HOURS="${SCAN_CUTOFF_HOURS:-4}"
+SCAN_CUTOFF_HOURS="${SCAN_CUTOFF_HOURS:-8}"
 SESSION_FILE="session_curl.txt"
 SESSION_ALERT="public_model_data/_internal/session_expired.flag"
 LOCK_FILE="public_model_data/_internal/refresh.lock"
@@ -102,8 +102,8 @@ while true; do
         --session-curl-file "$SESSION_FILE" --i-understand-session-risk \
         >> "$LOG" 2>&1 || true
 
-    $PY public_stock_models.py --recent-buy-report --recent-hours 4 >> "$LOG" 2>&1
-    $PY public_stock_models.py --recent-trade-timeline --recent-hours 4 >> "$LOG" 2>&1
+    $PY public_stock_models.py --recent-buy-report --recent-hours 8 >> "$LOG" 2>&1
+    $PY public_stock_models.py --recent-trade-timeline --recent-hours 8 >> "$LOG" 2>&1
     $PY public_stock_models.py --unified-dashboard >> "$LOG" 2>&1
     $PY public_stock_models.py --ai-brief >> "$LOG" 2>&1
 

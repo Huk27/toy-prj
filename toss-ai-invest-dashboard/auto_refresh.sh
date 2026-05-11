@@ -9,9 +9,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-PROFILE_LIMIT="${PROFILE_LIMIT:-400}"
-SCAN_PAGES="${SCAN_PAGES:-10}"
-SCAN_CUTOFF_HOURS="${SCAN_CUTOFF_HOURS:-8}"
+FEED_PAGES="${FEED_PAGES:-20}"
+SCAN_CUTOFF_HOURS="${SCAN_CUTOFF_HOURS:-4}"
+RECENT_HOURS="${RECENT_HOURS:-8}"
 SESSION_FILE="session_curl.txt"
 SESSION_ALERT="public_model_data/_internal/session_expired.flag"
 LOCK_FILE="public_model_data/_internal/refresh.lock"
@@ -48,7 +48,7 @@ release_lock() {
 
 trap 'release_lock' EXIT
 
-echo "[auto_refresh] start — sync to :00 / :30 every 30 min, profiles ${PROFILE_LIMIT}, pages ${SCAN_PAGES}, cutoff ${SCAN_CUTOFF_HOURS}h"
+echo "[auto_refresh] start — sync to :00 / :30 every 30 min, feed_pages ${FEED_PAGES}, cutoff ${SCAN_CUTOFF_HOURS}h"
 
 # 다음 :00 또는 :30까지 초 계산
 wait_to_next_half_hour() {
@@ -85,8 +85,8 @@ while true; do
     TS=$(date +"%Y%m%d-%H%M%S")
     LOG="$LOG_DIR/refresh-$TS.log"
 
-    if ! $PY public_stock_models.py --daily-profile-scan \
-        --daily-profile-limit "$PROFILE_LIMIT" --scan-pages "$SCAN_PAGES" --scan-cutoff-hours "$SCAN_CUTOFF_HOURS" --skip-daily-holdings \
+    if ! $PY public_stock_models.py --following-feed-scan \
+        --feed-pages "$FEED_PAGES" --scan-cutoff-hours "$SCAN_CUTOFF_HOURS" \
         --session-curl-file "$SESSION_FILE" --i-understand-session-risk \
         > "$LOG" 2>&1; then
         echo "[auto_refresh $TS] scan failed (likely session expired)" | tee -a "$LOG_DIR/refresh.log"
@@ -102,8 +102,13 @@ while true; do
         --session-curl-file "$SESSION_FILE" --i-understand-session-risk \
         >> "$LOG" 2>&1 || true
 
-    $PY public_stock_models.py --recent-buy-report --recent-hours 8 >> "$LOG" 2>&1
-    $PY public_stock_models.py --recent-trade-timeline --recent-hours 8 >> "$LOG" 2>&1
+    # 활성 유저 holdings 업데이트 (~10명, ~5초)
+    $PY public_stock_models.py --active-holdings-update \
+        --session-curl-file "$SESSION_FILE" --i-understand-session-risk \
+        >> "$LOG" 2>&1 || true
+
+    $PY public_stock_models.py --recent-buy-report --recent-hours "$RECENT_HOURS" >> "$LOG" 2>&1
+    $PY public_stock_models.py --recent-trade-timeline --recent-hours "$RECENT_HOURS" >> "$LOG" 2>&1
     $PY public_stock_models.py --unified-dashboard >> "$LOG" 2>&1
     $PY public_stock_models.py --ai-brief >> "$LOG" 2>&1
 

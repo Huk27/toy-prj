@@ -1,14 +1,15 @@
 # Toss AI Invest Dashboard — Agent Guide
 
-Read-only research dashboard for tracking public TossInvest community signals + user's own holdings impact.
+Research dashboard for tracking public TossInvest community signals + user's own holdings impact.
 **This file guides AI coding agents (Claude Code) working on this codebase.**
 
 ---
 
 ## 🛡️ Safety — Hard Rules (Never Break)
 
-- **NO trading execution**: no `tossctl`, no order placement, no account mutation
-- **READ-ONLY API calls**: trade history, holdings, public quotes only
+- **NO trading execution**: no `tossctl`, no order placement, no financial account mutation
+- **READ-ONLY for financial data**: trade history, holdings, public quotes — no orders, no transfers
+- **Social actions allowed (opt-in)**: follow/unfollow via `relation/update` API is permitted with explicit rate limiting (≥1s delay, max 50/run) and `--i-understand-session-risk` flag
 - **Session cookie**: local-only via `session_curl.txt` (gitignored); never log/print cookie contents
 - **NO secrets to commits**: profile_id, cookies, tokens belong in gitignored files (`session_curl.txt`, `private_session_headers.json`)
 

@@ -61,6 +61,8 @@ DAILY_PROFILE_EVENTS_PATH = RAW_DATA_DIR / "daily_profile_events.json"
 RECENT_BUY_REPORT_PATH = RAW_DATA_DIR / "recent_buy_report.json"
 RECENT_BUY_HTML_PATH = RAW_DATA_DIR / "recent_buy_report.html"
 RECENT_BUY_LOG_PATH = RAW_DATA_DIR / "recent_buy_recommendations_log.jsonl"
+FOLLOW_HISTORY_PATH = RAW_DATA_DIR / "follow_history.json"
+FEED_WATERMARK_PATH = RAW_DATA_DIR / "feed_watermark.json"
 RECENT_BUY_PERFORMANCE_PATH = RAW_DATA_DIR / "recent_buy_performance.json"
 UNIFIED_DATA_PATH = DATA_DIR / "toss_ai_invest_data.json"
 UNIFIED_HTML_PATH = DATA_DIR / "toss_ai_invest_dashboard.html"
@@ -841,6 +843,18 @@ def stock_community_codes_from_realtime(realtime_rows: list[dict[str, Any]], lim
     return list(dict.fromkeys(codes))
 
 
+def stock_codes_from_hot_community(hot_result: dict[str, Any]) -> list[str]:
+    codes: list[str] = []
+    for section in hot_result.get("hotCommunityComments") or []:
+        board = section.get("board") or {}
+        if board.get("subjectType") != "STOCK":
+            continue
+        code = board.get("stockCode") or board.get("subjectId")
+        if code:
+            codes.append(str(code))
+    return list(dict.fromkeys(codes))
+
+
 def collect_stock_community_comments(stock_codes: list[str], pages_per_stock: int = 1) -> list[dict[str, Any]]:
     comments: list[dict[str, Any]] = []
     for stock_code in list(dict.fromkeys(code for code in stock_codes if code)):
@@ -966,6 +980,7 @@ def collect_public_data(
     stock_community_codes = list(stock_community_codes or [])
     if stock_community_top:
         stock_community_codes.extend(stock_community_codes_from_realtime((realtime or {}).get("data") or [], stock_community_top))
+    stock_community_codes.extend(stock_codes_from_hot_community(hot_community or {}))
     stock_community_codes = list(dict.fromkeys(stock_community_codes))
     stock_community_comments = collect_stock_community_comments(stock_community_codes, stock_community_pages) if stock_community_codes else []
 
@@ -1266,6 +1281,89 @@ def trade_event_from_activity(activity: dict[str, Any], profile: dict[str, Any])
     }
 
 
+def trade_event_from_feed_item(feed: dict[str, Any]) -> dict[str, Any] | None:
+    """following feed /api/v3/feed/subscription/posts 아이템을 표준 trade event로 변환.
+    profile history API와 필드 구조가 다르다: instrument, orderType, firstExecutedAt 등."""
+    instrument = feed.get("instrument") or {}
+    stock_name = instrument.get("name") or feed.get("stockName")
+    stock_code = instrument.get("code") or feed.get("stockCode")
+    if not stock_name and not stock_code:
+        return None
+
+    order_type = (feed.get("orderType") or "").upper()
+    if "BUY" in order_type:
+        side = "BUY"
+    elif "SELL" in order_type:
+        side = "SELL"
+    else:
+        side = order_type or None
+
+    author = feed.get("author") or {}
+    profile_id = str(author.get("userProfileId") or "")
+    nickname = author.get("nickname") or ""
+    acted_at = feed.get("firstExecutedAt") or feed.get("actedAt") or feed.get("createdAt")
+
+    return {
+        "profile_id": profile_id,
+        "author": nickname,
+        "symbol": stock_name,
+        "stock_name": stock_name,
+        "stock_code": stock_code,
+        "side": side,
+        "quantity": feed.get("quantity"),
+        "amount_krw": feed.get("amountKrw"),
+        "amount_usd": feed.get("amountUsd"),
+        "avg_krw": feed.get("averagePriceKrw"),
+        "avg_usd": feed.get("averagePriceUsd"),
+        "acted_at": acted_at,
+        "activity_id": feed.get("tradeHistoryId") or feed.get("id"),
+    }
+
+
+def trade_event_from_comment_item(feed: dict[str, Any]) -> dict[str, Any] | None:
+    """COMMENT feed item의 execution 첨부 거래를 표준 trade event로 변환.
+    execution 필드 없는 순수 의견 댓글은 None 반환."""
+    comment = feed.get("comment") or {}
+    execution = comment.get("execution")
+    if not execution:
+        return None
+
+    author = comment.get("author") or {}
+    profile_id = str(author.get("userProfileId") or "")
+    nickname = author.get("nickname") or ""
+    if not profile_id:
+        return None
+
+    order_side = (execution.get("orderSide") or "").upper()
+    if "BUY" in order_side:
+        side = "BUY"
+    elif "SELL" in order_side:
+        side = "SELL"
+    else:
+        side = order_side or None
+
+    stock_code = execution.get("stockCode") or ""
+    stock_name = execution.get("stockName") or ""
+    acted_at = execution.get("executedAt") or comment.get("createdAt")
+    comment_id = comment.get("commentId")
+
+    return {
+        "profile_id": profile_id,
+        "author": nickname,
+        "symbol": stock_name,
+        "stock_name": stock_name,
+        "stock_code": stock_code,
+        "side": side,
+        "quantity": execution.get("quantity"),
+        "amount_krw": execution.get("amountKrw"),
+        "amount_usd": execution.get("amountUsd"),
+        "avg_krw": execution.get("averageExecutionPriceKrw"),
+        "avg_usd": execution.get("averageExecutionPriceUsd"),
+        "acted_at": acted_at,
+        "activity_id": f"cmt{comment_id}" if comment_id else None,
+    }
+
+
 def profile_history_url(profile_id: str) -> str:
     return f"https://wts-info-api.tossinvest.com/api/v2/user-profiles/details/{profile_id}/recent-activities/TRADE_HISTORY"
 
@@ -1382,6 +1480,462 @@ def fetch_profile_trade_history(
     }
 
 
+def read_feed_watermark() -> dict[str, str | None]:
+    """마지막으로 본 피드 timestamp 읽기. 없으면 None.
+    삭제/누락된 trade ID 매칭 실패에 안전하도록 timestamp 기반."""
+    if not FEED_WATERMARK_PATH.exists():
+        return {"trade_history": None, "comment": None}
+    try:
+        data = json.loads(FEED_WATERMARK_PATH.read_text(encoding="utf-8"))
+        return {
+            "trade_history": data.get("trade_history"),
+            "comment": data.get("comment"),
+        }
+    except Exception:
+        return {"trade_history": None, "comment": None}
+
+
+def write_feed_watermark(trade_history_ts: str | None, comment_ts: str | None) -> None:
+    """피드별 최신 timestamp 저장. 5분 backoff 적용 (시계 동기화 + 늦게 들어오는 피드 보호)."""
+    existing = read_feed_watermark()
+    payload = {
+        "trade_history": trade_history_ts or existing.get("trade_history"),
+        "comment": comment_ts or existing.get("comment"),
+        "updated_at": now_kst().isoformat(),
+    }
+    FEED_WATERMARK_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def fetch_following_trade_feed(
+    headers: dict[str, str],
+    pages: int = 5,
+    delay_seconds: float = 0.3,
+    watermark_ts: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """TRADE_HISTORY 피드 fetch.
+    watermark_ts가 있으면 incremental scan: 그 시각보다 오래된 페이지 만나면 일찍 break.
+    Returns: (trades, latest_ts_seen). 안전 장치:
+    - max pages 캡으로 무한 루프 방지
+    - 시간 비교 (ID 매칭 아님) → 거래 삭제/언팔로우에도 안전
+    - 5분 backoff: watermark에서 5분 빼서 경계 시각 늦은 피드 누락 방지."""
+    base_url = "https://wts-cert-api.tossinvest.com/api/v3/feed/subscription/posts"
+    trades: list[dict[str, Any]] = []
+    last_trade_history_id: str | None = None
+    last_acted_at: str | None = None
+    latest_ts: dt.datetime | None = None
+
+    # 5분 backoff
+    watermark_dt: dt.datetime | None = None
+    if watermark_ts:
+        parsed = parse_dt(watermark_ts)
+        if parsed:
+            watermark_dt = parsed - dt.timedelta(minutes=5)
+
+    for _ in range(max(1, pages)):
+        params: dict[str, str] = {"filterType": "TRADE_HISTORY"}
+        if last_trade_history_id:
+            params["lastTradeHistoryId"] = last_trade_history_id
+        if last_acted_at:
+            params["actedAt"] = last_acted_at
+
+        url = base_url + "?" + urllib.parse.urlencode(params)
+        page = fetch_json_with_headers(url, headers)
+        if not isinstance(page, dict):
+            break
+
+        feeds = (page.get("result") or {}).get("feeds") or []
+        page_oldest: dt.datetime | None = None
+        for feed in feeds:
+            if feed.get("type") != "TRADE_HISTORY":
+                continue
+            trades.append(feed)
+            ts = parse_dt(feed.get("firstExecutedAt") or feed.get("actedAt") or feed.get("createdAt"))
+            if ts:
+                if latest_ts is None or ts > latest_ts:
+                    latest_ts = ts
+                if page_oldest is None or ts < page_oldest:
+                    page_oldest = ts
+
+        key = (page.get("result") or {}).get("key") or {}
+        last_trade_history_id = key.get("lastTradeHistoryId")
+        last_acted_at = key.get("actedAt")
+
+        if not last_trade_history_id or not feeds:
+            break
+        # incremental break: 페이지 가장 오래된 거래가 watermark 이전이면 다음 페이지는 모두 본 거래
+        if watermark_dt and page_oldest and page_oldest <= watermark_dt:
+            break
+        time.sleep(delay_seconds)
+
+    return trades, (latest_ts.isoformat() if latest_ts else None)
+
+
+def fetch_following_comment_feed(
+    headers: dict[str, str],
+    pages: int = 5,
+    delay_seconds: float = 0.3,
+    watermark_ts: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """COMMENT 피드에서 거래 첨부(execution 존재) 댓글만 수집. fetch_following_trade_feed와 동일한 watermark 안전 패턴."""
+    base_url = "https://wts-cert-api.tossinvest.com/api/v3/feed/subscription/posts"
+    comments: list[dict[str, Any]] = []
+    last_comment_id: str | None = None
+    last_acted_at: str | None = None
+    latest_ts: dt.datetime | None = None
+
+    watermark_dt: dt.datetime | None = None
+    if watermark_ts:
+        parsed = parse_dt(watermark_ts)
+        if parsed:
+            watermark_dt = parsed - dt.timedelta(minutes=5)
+
+    for _ in range(max(1, pages)):
+        params: dict[str, str] = {"filterType": "COMMENT"}
+        if last_comment_id:
+            params["lastCommentId"] = last_comment_id
+        if last_acted_at:
+            params["actedAt"] = last_acted_at
+
+        url = base_url + "?" + urllib.parse.urlencode(params)
+        page = fetch_json_with_headers(url, headers)
+        if not isinstance(page, dict):
+            break
+
+        feeds = (page.get("result") or {}).get("feeds") or []
+        page_oldest: dt.datetime | None = None
+        for feed in feeds:
+            if feed.get("type") != "COMMENT":
+                continue
+            comment = feed.get("comment") or {}
+            execution = comment.get("execution")
+            # page_oldest는 댓글 timestamp 기준 (execution 없는 일반 댓글도 시간 진행에 포함)
+            ts = parse_dt((execution or {}).get("executedAt") or comment.get("createdAt"))
+            if ts:
+                if page_oldest is None or ts < page_oldest:
+                    page_oldest = ts
+            if execution:
+                comments.append(feed)
+                if ts and (latest_ts is None or ts > latest_ts):
+                    latest_ts = ts
+
+        key = (page.get("result") or {}).get("key") or {}
+        last_comment_id = key.get("lastCommentId")
+        last_acted_at = key.get("actedAt")
+
+        if not last_comment_id or not feeds:
+            break
+        if watermark_dt and page_oldest and page_oldest <= watermark_dt:
+            break
+        time.sleep(delay_seconds)
+
+    return comments, (latest_ts.isoformat() if latest_ts else None)
+
+
+def profiles_from_following_trade_feed(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    profiles: list[dict[str, Any]] = []
+    for trade in trades:
+        author = trade.get("author") or {}
+        profile_id = str(author.get("userProfileId") or "")
+        if not profile_id or profile_id in seen:
+            continue
+        seen.add(profile_id)
+        profiles.append({
+            "profile_id": profile_id,
+            "nickname": author.get("nickname"),
+            "description": author.get("description") or author.get("shortDescription"),
+            "badge": author.get("badge"),
+            "profile_picture_url": author.get("profilePictureUrl"),
+        })
+    return profiles
+
+
+def discover_following_traders(
+    session_headers_file: str | None,
+    session_curl_file: str | None,
+    acknowledged: bool,
+    pages: int = 5,
+    delay_seconds: float = 0.3,
+) -> dict[str, Any]:
+    headers = load_session_headers(session_headers_file, session_curl_file)
+    trades = fetch_following_trade_feed(headers, pages=pages, delay_seconds=delay_seconds)
+    new_profiles = profiles_from_following_trade_feed(trades)
+
+    existing = read_json_file(PROFILE_CANDIDATES_PATH, {})
+    existing_candidates: list[dict[str, Any]] = list(existing.get("candidates") or [])
+    existing_ids = {p["profile_id"] for p in existing_candidates if p.get("profile_id")}
+
+    added: list[dict[str, Any]] = []
+    for p in new_profiles:
+        if p["profile_id"] not in existing_ids:
+            p["discovery_score"] = 0.0
+            p["reasons"] = ["following_trade_feed"]
+            existing_candidates.append(p)
+            added.append(p)
+
+    output = {
+        **(existing or {}),
+        "generated_at": now_kst().isoformat(),
+        "candidates": existing_candidates,
+        "candidate_count": len(existing_candidates),
+    }
+    PROFILE_CANDIDATES_PATH.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {
+        "generated_at": now_kst().isoformat(),
+        "trade_feed_count": len(trades),
+        "new_profiles_found": len(added),
+        "total_candidates": len(existing_candidates),
+        "new_profiles": added,
+    }
+
+
+def following_feed_scan(
+    session_headers_file: str | None,
+    session_curl_file: str | None,
+    acknowledged: bool,
+    pages: int = 20,
+    delay_seconds: float = 0.3,
+    cutoff_hours: float = 4.0,
+) -> dict[str, Any]:
+    """following feed를 풀로 긁어서 daily_profile_scan 과 동일한 파일 포맷으로 저장.
+    개별 400회 API 호출 대신 팔로잉 피드 ~20페이지로 대체한다."""
+    if not acknowledged:
+        raise ValueError("--i-understand-session-risk is required")
+    headers = load_session_headers(session_headers_file, session_curl_file)
+
+    existing_events_report = (
+        json.loads(DAILY_PROFILE_EVENTS_PATH.read_text(encoding="utf-8"))
+        if DAILY_PROFILE_EVENTS_PATH.exists()
+        else {"events": []}
+    )
+    existing_events: list[dict[str, Any]] = existing_events_report.get("events") or []
+    existing_keys = {profile_event_key(e) for e in existing_events}
+
+    cutoff_dt = (
+        now_kst().astimezone(dt.timezone.utc) - dt.timedelta(hours=cutoff_hours)
+        if cutoff_hours and cutoff_hours > 0
+        else None
+    )
+
+    watermark = read_feed_watermark()
+    feeds, latest_trade_ts = fetch_following_trade_feed(
+        headers, pages=pages, delay_seconds=delay_seconds,
+        watermark_ts=watermark.get("trade_history"),
+    )
+    comment_feeds, latest_comment_ts = fetch_following_comment_feed(
+        headers, pages=pages, delay_seconds=delay_seconds,
+        watermark_ts=watermark.get("comment"),
+    )
+    if latest_trade_ts or latest_comment_ts:
+        write_feed_watermark(latest_trade_ts, latest_comment_ts)
+
+    new_events: list[dict[str, Any]] = []
+    seen_profiles: dict[str, str] = {}  # profile_id → nickname
+
+    def _process_event(event: dict[str, Any] | None, pid: str, nick: str) -> None:
+        if not event:
+            return
+        if pid and pid not in seen_profiles:
+            seen_profiles[pid] = nick
+        key = profile_event_key(event)
+        if key in existing_keys:
+            return
+        if cutoff_dt:
+            ts = parse_dt(event.get("acted_at"))
+            if ts and ts < cutoff_dt:
+                return
+        existing_keys.add(key)
+        new_events.append(event)
+
+    for feed in feeds:
+        author = feed.get("author") or {}
+        _process_event(
+            trade_event_from_feed_item(feed),
+            str(author.get("userProfileId") or ""),
+            author.get("nickname") or "",
+        )
+
+    for feed in comment_feeds:
+        author = (feed.get("comment") or {}).get("author") or {}
+        _process_event(
+            trade_event_from_comment_item(feed),
+            str(author.get("userProfileId") or ""),
+            author.get("nickname") or "",
+        )
+
+    merged_events = dedupe_profile_events(existing_events + new_events)
+    events_output = {
+        "generated_at": now_kst().isoformat(),
+        "mode": "following-feed-scan",
+        "event_count": len(merged_events),
+        "events": merged_events,
+    }
+    DAILY_PROFILE_EVENTS_PATH.write_text(json.dumps(events_output, ensure_ascii=False, indent=2), encoding="utf-8")
+    merge_events_into_profile_history(new_events)
+
+    history = read_json_file(FOLLOW_HISTORY_PATH, {"followed_ids": []})
+    total_followed = max(1, len(history.get("followed_ids") or []))
+
+    # 참여율 분모 = 최근 7일 활성 유저 수 (total_followed 전체는 비활성 포함으로 왜곡)
+    cutoff_7d = now_kst().astimezone(dt.timezone.utc) - dt.timedelta(days=7)
+    active_7d_ids: set[str] = set()
+    for e in (existing_events + new_events):
+        pid = str(e.get("profile_id") or "")
+        if not pid:
+            continue
+        ts = parse_dt(e.get("acted_at"))
+        if ts and ts >= cutoff_7d:
+            active_7d_ids.add(pid)
+    active_universe = max(1, len(active_7d_ids))
+
+    new_buys = [e for e in new_events if e.get("side") == "BUY"]
+    new_buys.sort(
+        key=lambda e: parse_dt(e.get("acted_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+        reverse=True,
+    )
+
+    # per-profile summary (daily_profile_scan 호환)
+    profile_events: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for e in new_events:
+        profile_events[str(e.get("profile_id") or "")].append(e)
+    scanned_rows = []
+    for pid, nickname in seen_profiles.items():
+        events_for = profile_events.get(pid, [])
+        scanned_rows.append({
+            "profile_id": pid,
+            "nickname": nickname,
+            "latest_event_count": len(events_for),
+            "new_event_count": len(events_for),
+            "selection_source": "following_feed",
+            "selection_score": None,
+            "selection_score_after_holdings": None,
+            "selection_reason": None,
+            "holding_risk": None,
+            "tested_returns": None,
+            "avg_return": None,
+            "win_rate": None,
+            "latest_trade_at": events_for[0].get("acted_at") if events_for else None,
+            "symbol_concentration": None,
+        })
+
+    output = {
+        "generated_at": now_kst().isoformat(),
+        "mode": "following-feed-scan",
+        "feed_pages": pages,
+        "cutoff_hours": cutoff_hours,
+        "total_followed": total_followed,
+        "scanned_profile_count": active_universe,
+        "active_profile_count": len(seen_profiles),
+        "active_universe_7d": active_universe,
+        "new_event_count": len(new_events),
+        "new_buy_count": len(new_buys),
+        "error_count": 0,
+        "profiles": scanned_rows,
+        "new_buys": new_buys[:80],
+        "holdings": {"included": False, "profile_count": 0, "holding_profile_count": 0, "profiles": []},
+    }
+    DAILY_PROFILE_SCAN_PATH.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+    return output
+
+
+def xsrf_token_from_headers(headers: dict[str, str]) -> str | None:
+    cookie = headers.get("cookie") or ""
+    for part in cookie.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key.strip().upper() == "XSRF-TOKEN":
+            return value.strip()
+    return None
+
+
+def follow_user(
+    headers: dict[str, str],
+    profile_id: str,
+    nickname: str,
+) -> dict[str, Any]:
+    follow_headers = dict(headers)
+    xsrf = xsrf_token_from_headers(headers)
+    if xsrf:
+        follow_headers["x-xsrf-token"] = xsrf
+    payload = {
+        "nickname": nickname or "",
+        "type": "FOLLOW",
+        "userProfileId": int(profile_id),
+    }
+    return fetch_json_with_headers(
+        "https://wts-info-api.tossinvest.com/api/v2/user-profiles/relation/update",
+        follow_headers,
+        method="POST",
+        payload=payload,
+    )
+
+
+def bulk_follow_candidates(
+    session_headers_file: str | None,
+    session_curl_file: str | None,
+    acknowledged: bool,
+    max_follows: int = 50,
+    delay_seconds: float = 1.5,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    if delay_seconds < 1.0:
+        delay_seconds = 1.0
+    headers = load_session_headers(session_headers_file, session_curl_file)
+
+    # load_daily_scan_profiles가 strategy_report > history_report > candidates 순으로 통합
+    scan_profiles = load_daily_scan_profiles(limit=9999)
+    scan_ids = {str(p["profile_id"]): p for p in scan_profiles if p.get("profile_id")}
+
+    # candidates에서 scan에 없는 프로필도 추가
+    candidates_data = read_json_file(PROFILE_CANDIDATES_PATH, {})
+    for c in (candidates_data.get("candidates") or []):
+        pid = str(c.get("profile_id") or "")
+        if pid and pid not in scan_ids:
+            scan_ids[pid] = c
+    candidates = list(scan_ids.values())
+
+    history = read_json_file(FOLLOW_HISTORY_PATH, {"followed_ids": []})
+    already_followed: set[str] = set(str(pid) for pid in (history.get("followed_ids") or []))
+
+    to_follow = [c for c in candidates if str(c["profile_id"]) not in already_followed][:max_follows]
+
+    followed: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for candidate in to_follow:
+        profile_id = str(candidate["profile_id"])
+        nickname = candidate.get("nickname") or ""
+        if dry_run:
+            followed.append({"profile_id": profile_id, "nickname": nickname, "status": "dry_run"})
+            continue
+        try:
+            resp = follow_user(headers, profile_id, nickname)
+            followed.append({"profile_id": profile_id, "nickname": nickname, "status": "ok", "response": resp})
+            already_followed.add(profile_id)
+        except RuntimeError as exc:
+            errors.append({"profile_id": profile_id, "nickname": nickname, "error": str(exc)[:200]})
+        time.sleep(delay_seconds)
+
+    if not dry_run and followed:
+        RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        FOLLOW_HISTORY_PATH.write_text(
+            json.dumps({"followed_ids": sorted(already_followed), "updated_at": now_kst().isoformat()}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    return {
+        "generated_at": now_kst().isoformat(),
+        "dry_run": dry_run,
+        "total_candidates": len(candidates),
+        "already_followed": len(candidates) - len(to_follow),
+        "attempted": len(to_follow),
+        "followed": len(followed),
+        "errors": len(errors),
+        "results": followed,
+        "error_details": errors,
+    }
+
+
 def profile_history_report(
     session_headers_file: str | None,
     session_curl_file: str | None,
@@ -1394,18 +1948,24 @@ def profile_history_report(
     stock_community_codes: list[str] | None = None,
     stock_community_top: int = 0,
     stock_community_pages: int = 1,
+    from_follow_history: bool = False,
 ) -> dict[str, Any]:
     if not acknowledged:
         raise ValueError("--i-understand-session-risk is required before using a logged-in browser session")
     headers = load_session_headers(session_headers_file, session_curl_file)
-    data = collect_public_data(
-        pages=pages,
-        stock_community_codes=stock_community_codes,
-        stock_community_top=stock_community_top,
-        stock_community_pages=stock_community_pages,
-    )
-    discovery = discover_profiles(data, limit=profile_limit)
-    candidates = discovery["candidates"][:profile_limit]
+    if from_follow_history:
+        fh = read_json_file(FOLLOW_HISTORY_PATH, {"followed_ids": []})
+        followed_ids = [str(x) for x in (fh.get("followed_ids") or [])]
+        candidates = [{"profile_id": pid, "nickname": "", "discovery_score": 0.0, "reasons": ["follow_history"]} for pid in followed_ids[:profile_limit]]
+    else:
+        data = collect_public_data(
+            pages=pages,
+            stock_community_codes=stock_community_codes,
+            stock_community_top=stock_community_top,
+            stock_community_pages=stock_community_pages,
+        )
+        discovery = discover_profiles(data, limit=profile_limit)
+        candidates = discovery["candidates"][:profile_limit]
 
     def dedupe_profile_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_profile_id: dict[str, dict[str, Any]] = {}
@@ -2033,6 +2593,52 @@ def profile_holdings_report(
     }
     PROFILE_HOLDINGS_REPORT_PATH.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
     return output
+
+
+def active_profile_holdings_update(
+    session_headers_file: str | None,
+    session_curl_file: str | None,
+    acknowledged: bool,
+    delay_seconds: float = 0.3,
+) -> dict[str, Any]:
+    """피드 스캔에서 최근 활성 유저들의 holdings만 빠르게 업데이트해서 profile_holdings_report.json에 머지.
+    light refresh용 — 전체 624명 대신 활성 10~20명만 대상."""
+    if not acknowledged:
+        raise ValueError("--i-understand-session-risk is required")
+    headers = load_session_headers(session_headers_file, session_curl_file)
+
+    scan = read_json_file(DAILY_PROFILE_SCAN_PATH, {})
+    active_profiles = [
+        {"profile_id": str(p["profile_id"]), "nickname": p.get("nickname", "")}
+        for p in (scan.get("profiles") or [])
+        if p.get("profile_id")
+    ]
+    if not active_profiles:
+        return {"updated": 0, "active_profiles": 0}
+
+    existing = read_json_file(PROFILE_HOLDINGS_REPORT_PATH, {"profiles": []})
+    by_id = {str(r["profile_id"]): r for r in (existing.get("profiles") or []) if r.get("profile_id")}
+
+    updated, errors = 0, 0
+    for profile in active_profiles:
+        try:
+            row = fetch_profile_holdings(profile, headers)
+            by_id[profile["profile_id"]] = row
+            updated += 1
+        except RuntimeError:
+            errors += 1
+        time.sleep(delay_seconds)
+
+    merged_profiles = list(by_id.values())
+    output = {
+        **existing,
+        "generated_at": now_kst().isoformat(),
+        "profile_count": len(merged_profiles),
+        "holding_profile_count": len([r for r in merged_profiles if r.get("holding_count", 0) > 0]),
+        "profiles": merged_profiles,
+    }
+    PROFILE_HOLDINGS_REPORT_PATH.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"updated": updated, "errors": errors, "active_profiles": len(active_profiles)}
 
 
 def profile_history_events(report: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2740,8 +3346,12 @@ def reliability_by_author() -> dict[str, dict[str, Any]]:
     if not PROFILE_STRATEGY_REPORT_PATH.exists():
         return {}
     report = json.loads(PROFILE_STRATEGY_REPORT_PATH.read_text(encoding="utf-8"))
-    summaries = author_horizon_summary(report.get("rows") or [], report.get("horizons_hours") or [])
-    return {row["author"]: row for row in summaries if row.get("author")}
+    if report.get("rows"):
+        summaries = author_horizon_summary(report["rows"], report.get("horizons_hours") or [])
+        return {row["author"]: row for row in summaries if row.get("author")}
+    # pre-computed authors format (restored from unified dashboard)
+    authors = report.get("authors") or []
+    return {a["author"]: a for a in authors if a.get("author")}
 
 
 def weighted_average_buy_price(events: list[dict[str, Any]], price_key: str) -> float | None:
@@ -3083,7 +3693,8 @@ def build_recent_buy_report(
             if seller_reliability_values else 0.0
         )
         # Person-based scoring — 시간 윈도우 정규화 (4h 기준 5%/3%, 8h 기준 10%/6%, 12h 15%/9%)
-        hours_norm = max(0.5, hours / 4.0)  # 4h: 1.0, 8h: 2.0, 12h: 3.0
+        # 상한 6 (=24h)에서 캡: 같은 사람 dedup 때문에 시간 더 늘려도 buyer 수가 비례 증가하지 않아 점수 깨지므로
+        hours_norm = max(0.5, min(hours / 4.0, 6.0))  # 4h: 1.0, 8h: 2.0, 24h+: 6.0 캡
         buyer_threshold = 0.05 * hours_norm
         reliable_buyer_threshold = 0.03 * hours_norm
         buyer_score = min(25.0, buyer_participation_rate / buyer_threshold * 25.0)
@@ -3094,16 +3705,16 @@ def build_recent_buy_report(
         try:
             for h_row in (holding_accumulation_data or []):
                 if str(h_row.get("symbol") or "").upper() == str(symbol).upper():
-                    h_count = h_row.get("holder_count") or 0
+                    h_ratio = h_row.get("holder_ratio") or 0
                     pos_ratio = h_row.get("positive_holder_ratio") or 0
                     avg_user = h_row.get("avg_user_score") or 0
-                    # 보유자 수 + 수익권 비율 + 보유자 신뢰도
-                    if h_count >= 20 and pos_ratio >= 0.7 and avg_user >= 55:
-                        holding_bonus = 10.0   # 강한 보강
-                    elif h_count >= 10 and pos_ratio >= 0.6:
-                        holding_bonus = 5.0    # 중간 보강
-                    elif h_count >= 5:
-                        holding_bonus = 2.0    # 약한 보강
+                    # 보유자 비율(universe 대비) + 수익권 비율 + 보유자 신뢰도
+                    if h_ratio >= 0.08 and pos_ratio >= 0.7 and avg_user >= 55:
+                        holding_bonus = 10.0   # 강한 보강 (8%+ 보유, 수익권 70%+, 신뢰 55+)
+                    elif h_ratio >= 0.04 and pos_ratio >= 0.6:
+                        holding_bonus = 5.0    # 중간 보강 (4%+ 보유, 수익권 60%+)
+                    elif h_ratio >= 0.02:
+                        holding_bonus = 2.0    # 약한 보강 (2%+ 보유)
                     break
         except Exception:
             pass
@@ -4719,44 +5330,41 @@ def build_ai_decision_brief(data: dict[str, Any]) -> dict[str, Any]:
     actionable.sort(key=lambda r: (r.get("score") or 0, r.get("reliable_buyer_count") or 0), reverse=True)
     top_pick = actionable[0] if actionable else None
 
-    # 보유 종목용 24시간 윈도우 매수/매도 집계 (사용자 우려 반영: 4h 너무 짧음, 미국 정규장 + KRX 모두 잡힘)
+    # 보유 종목용 14일 거래 내역 집계 (profile_history_report 기반, 신뢰 유저 only)
     reliability = reliability_by_author()
-    holdings_24h_buy: dict[str, dict[str, Any]] = {}
-    holdings_24h_sell: dict[str, dict[str, Any]] = {}
+    # symbol → list of {author, side, avg_krw, avg_usd, acted_at, reliability_score}
+    hist_14d_by_symbol: dict[str, list[dict[str, Any]]] = {}
     try:
-        events_data = read_json_file(DAILY_PROFILE_EVENTS_PATH, {"events": []})
-        cutoff_24h = now_kst().astimezone(dt.timezone.utc) - dt.timedelta(hours=24)
-        # 보유 종목 alias 모음
-        alias_to_ticker = {}
-        for tk, meta in load_user_holdings().items():
-            for al in (meta.get("aliases") or [tk]):
-                alias_to_ticker[al.upper()] = tk
-        for ev in events_data.get("events", []):
-            sym_up = (ev.get("symbol") or "").upper()
-            tk = alias_to_ticker.get(sym_up)
-            if not tk:
-                continue
-            acted = parse_dt(ev.get("acted_at"))
-            if not acted or acted < cutoff_24h:
-                continue
-            side = (ev.get("side") or "").upper()
-            author = ev.get("author") or ""
-            user_score = (reliability.get(author) or {}).get("reliability_score") or 0.0
-            if user_score < 50:
-                continue  # 신뢰 유저만
-            bucket = holdings_24h_sell if side == "SELL" else holdings_24h_buy if side == "BUY" else None
-            if bucket is None:
-                continue
-            entry = bucket.setdefault(tk, {"profiles": set(), "amount_krw": 0.0, "events": [], "max_amount_krw": 0.0, "latest_at": None})
-            entry["profiles"].add(str(ev.get("profile_id")))
-            amt = float(ev.get("amount_krw") or 0.0)
-            entry["amount_krw"] += amt
-            entry["max_amount_krw"] = max(entry["max_amount_krw"], amt)
-            entry["events"].append(ev)
-            if entry["latest_at"] is None or acted > entry["latest_at"]:
-                entry["latest_at"] = acted
+        hist_data = read_json_file(PROFILE_HISTORY_REPORT_PATH, {"profiles": []})
+        cutoff_14d = now_kst().astimezone(dt.timezone.utc) - dt.timedelta(days=14)
+        for profile in hist_data.get("profiles") or []:
+            for ev in profile.get("events") or []:
+                acted = parse_dt(ev.get("acted_at"))
+                if not acted or acted < cutoff_14d:
+                    continue
+                author = ev.get("author") or ""
+                user_score = (reliability.get(author) or {}).get("reliability_score") or 0.0
+                if user_score < 50:
+                    continue
+                sym = (ev.get("symbol") or "").upper()
+                if not sym:
+                    continue
+                hist_14d_by_symbol.setdefault(sym, []).append({
+                    "author": author,
+                    "side": (ev.get("side") or "").upper(),
+                    "avg_krw": ev.get("avg_krw"),
+                    "avg_usd": ev.get("avg_usd"),
+                    "reliability_score": user_score,
+                })
     except Exception:
         pass
+
+    # accumulation by symbol (대소문자 통일)
+    accum_by_symbol: dict[str, dict[str, Any]] = {}
+    for _acc_row in accumulation:
+        _sym = (str(_acc_row.get("symbol") or "")).upper()
+        if _sym:
+            accum_by_symbol[_sym] = _acc_row
 
     # 사용자 보유 종목 — dedicated 상태 (수량/평가손익/시그널)
     holdings_status: list[dict[str, Any]] = []
@@ -4791,83 +5399,64 @@ def build_ai_decision_brief(data: dict[str, Any]) -> dict[str, Any]:
         unrealized_pnl = (market_value - cost_basis) if market_value is not None else None
         unrealized_pct = ((current_price / avg_price - 1.0) * 100) if (current_price and avg_price) else None
 
-        # severity — 4h 매수/매도 비율 + 24h 보유 종목 큰 매도 (사용자 우려 반영)
-        buyer_count = (matched or {}).get("buyer_count") or 0
-        seller_count = (matched or {}).get("seller_count") or (matched or {}).get("reliable_seller_count") or 0
-        reliable_sellers = (matched or {}).get("reliable_seller_count") or 0
-        net = buyer_count - seller_count
-        # 24h 큰 매도 체크 (보유 종목 한정)
-        h24_sell = holdings_24h_sell.get(ticker)
-        h24_buy = holdings_24h_buy.get(ticker)
-        has_24h_signal = bool(h24_sell or h24_buy)
-        # 4h에 신호 없어도 24h 매도 큰 거 있으면 알림
-        if matched is None and h24_sell:
-            sellers_24h = len(h24_sell["profiles"])
-            amt_24h = h24_sell["amount_krw"]
-            max_amt = h24_sell["max_amount_krw"]
-            # 종목별 임계 (B): holdings 보유자 수로 종목 카테고리 추정
-            # 신뢰 유저 보유자 많은 종목 = 대형주 → 큰 매도 임계 ↑
-            h_count_for_sym = 0
-            for h_row in (accumulation or []):
-                if str(h_row.get("symbol") or "").upper() in {a.upper() for a in (meta.get("aliases") or [ticker])}:
-                    h_count_for_sym = h_row.get("holder_count") or 0
-                    break
-            if h_count_for_sym >= 30:
-                big_thr, mid_thr = 200_000_000, 80_000_000  # 대형주: 2억+ / 8천만+
-                cat = "대형"
-            elif h_count_for_sym >= 10:
-                big_thr, mid_thr = 80_000_000, 30_000_000   # 중형주: 8천만+ / 3천만+
-                cat = "중형"
-            else:
-                big_thr, mid_thr = 30_000_000, 10_000_000   # 소형주: 3천만+ / 1천만+
-                cat = "소형"
-            if max_amt >= big_thr:
-                signal = f"🚨 24h 큰 매도 [{cat}] — {amt_24h/10000:,.0f}만원 ({sellers_24h}명, 단일 max {max_amt/10000:,.0f}만)"
-                severity = "🚨"
-            elif sellers_24h >= 3 or amt_24h >= mid_thr:
-                signal = f"⚠️ 24h 매도 [{cat}] {sellers_24h}명 ({amt_24h/10000:,.0f}만원)"
-                severity = "⚠️"
-            else:
-                signal = f"🟡 24h 매도 [{cat}] {sellers_24h}명 ({amt_24h/10000:,.0f}만원)"
-                severity = "🟡"
-            match_type = "sell_24h"
-        elif matched is None and h24_buy:
-            buyers_24h = len(h24_buy["profiles"])
-            signal = f"🟢 24h 매수 {buyers_24h}명"
+        # 14일 시그널: profile_history_report 기반 신뢰 유저 매수/매도 + accumulation 현재 보유자
+        sym_aliases_up = {a.upper() for a in (meta.get("aliases") or [ticker])}
+        sym_aliases_up.add(ticker.upper())
+
+        # 신뢰 유저별 14일 매수/매도 집계 (같은 유저 중복 제거 — 마지막 방향 우선)
+        hist_buyer_evs: dict[str, dict[str, Any]] = {}
+        hist_seller_evs: dict[str, dict[str, Any]] = {}
+        for _sym_up in sym_aliases_up:
+            for _ev in hist_14d_by_symbol.get(_sym_up) or []:
+                _author = _ev["author"]
+                if _ev["side"] == "BUY":
+                    hist_buyer_evs[_author] = _ev
+                elif _ev["side"] == "SELL":
+                    hist_seller_evs[_author] = _ev
+
+        def _avg_px_str(evs: dict, cur: str) -> str:
+            prices = [ev["avg_usd"] if cur == "USD" else ev["avg_krw"] for ev in evs.values() if (ev.get("avg_usd") if cur == "USD" else ev.get("avg_krw"))]
+            if not prices:
+                return ""
+            avg = sum(prices) / len(prices)
+            return f"${avg:,.0f}" if cur == "USD" else f"{avg:,.0f}원"
+
+        n_buyers_14d = len(hist_buyer_evs)
+        n_sellers_14d = len(hist_seller_evs)
+        buy_px_str = _avg_px_str(hist_buyer_evs, currency)
+        sell_px_str = _avg_px_str(hist_seller_evs, currency)
+
+        # accumulation 현재 보유자 현황
+        acc_row = next((accum_by_symbol[s] for s in sym_aliases_up if s in accum_by_symbol), None)
+        holder_count = int((acc_row or {}).get("holder_count") or 0)
+        pos_ratio = float((acc_row or {}).get("positive_holder_ratio") or 0.0)
+
+        # 시그널 텍스트 조각 조합
+        buy_info = (f"매수 {n_buyers_14d}명" + (f"@{buy_px_str}" if buy_px_str else "")) if n_buyers_14d else ""
+        sell_info = (f"매도 {n_sellers_14d}명" + (f"@{sell_px_str}" if sell_px_str else "")) if n_sellers_14d else ""
+        holder_info = f"보유 {holder_count}명(수익권{pos_ratio*100:.0f}%)" if holder_count > 0 else ""
+        stats_str = " / ".join(p for p in [buy_info, sell_info, holder_info] if p) or "14일 신호 없음"
+
+        net_14d = n_buyers_14d - n_sellers_14d
+        if n_sellers_14d >= 3 and n_sellers_14d > n_buyers_14d:
+            signal = f"🚨 강한 매도압력 — {stats_str}"
+            severity = "🚨"
+        elif n_sellers_14d >= 2 and n_sellers_14d >= n_buyers_14d:
+            signal = f"⚠️ 매도 주의 — {stats_str}"
+            severity = "⚠️"
+        elif n_buyers_14d >= 3 and net_14d >= 2:
+            signal = f"🟢 매수 우세 — {stats_str}"
             severity = "🟢"
-            match_type = "buy_24h"
-        elif matched is None:
+        elif n_buyers_14d >= 1 and net_14d > 0:
+            signal = f"🟡 매수 우위 — {stats_str}"
+            severity = "🟡"
+        elif holder_count > 0:
+            signal = f"조용 — {holder_info}" if holder_info else "조용"
+            severity = "—"
+        else:
             signal = "조용"
             severity = "—"
-        elif match_type == "sell_only" or buyer_count == 0:
-            # 매도만 (매수 0)
-            if reliable_sellers >= 3 or seller_count >= 5:
-                signal = f"🚨 강한 매도 (매도 {seller_count}명)"
-                severity = "🚨"
-            elif reliable_sellers >= 2:
-                signal = f"⚠️ 매도 주의 (매도 {seller_count}명)"
-                severity = "⚠️"
-            else:
-                signal = f"🟡 매도자 출현 ({seller_count}명)"
-                severity = "🟡"
-        elif buyer_count >= seller_count * 3 and buyer_count >= 5:
-            signal = f"🟢 강한 매수 (매수 {buyer_count} vs 매도 {seller_count})"
-            severity = "🟢"
-        elif net >= 3:
-            signal = f"🟢 매수 우세 (매수 {buyer_count} vs 매도 {seller_count})"
-            severity = "🟢"
-        elif net > 0:
-            signal = f"🟢 매수 약우세 (매수 {buyer_count} vs 매도 {seller_count})"
-            severity = "🟢"
-        elif net == 0:
-            signal = f"🟡 균형 (매수 {buyer_count} vs 매도 {seller_count})"
-            severity = "🟡"
-        elif reliable_sellers >= 3 or seller_count >= 5:
-            signal = f"🚨 강한 매도 (매수 {buyer_count} vs 매도 {seller_count})"
-            severity = "🚨"
-        else:
-            signal = f"⚠️ 매도 우세 (매수 {buyer_count} vs 매도 {seller_count})"
-            severity = "⚠️"
+        match_type = "hist_14d" if (n_buyers_14d or n_sellers_14d) else ("holder" if holder_count > 0 else None)
 
         holdings_status.append({
             "ticker": ticker,
@@ -5021,10 +5610,30 @@ def build_ai_decision_brief(data: dict[str, Any]) -> dict[str, Any]:
                 f"- **{u.get('author')}** {freq_str} — 최종 신뢰도 {u.get('final_reliability_score')}, 단타 {u.get('short_term_score') or '-'}{link}"
             )
 
+    # 보유 중 + 신규 매수 교집합 (오늘 신뢰 유저가 이미 들고 있으면서 추가 매수한 종목)
+    recent_buy_symbols = {(r.get("symbol") or "").upper(): r for r in recent}
+    holding_and_buy = []
+    for row in accumulation:
+        sym = (row.get("symbol") or "").upper()
+        rec = recent_buy_symbols.get(sym)
+        if rec and (rec.get("buy_count") or 0) >= 1:
+            holding_and_buy.append((row, rec))
+    if holding_and_buy:
+        md.extend(["", "## 🔥 보유 중 + 오늘 신규 매수 (강한 확신 신호)"])
+        for h_row, r_row in sorted(holding_and_buy, key=lambda x: x[1].get("score") or 0, reverse=True)[:5]:
+            holders = h_row.get("holder_count", 0)
+            pos_ratio = (h_row.get("positive_holder_ratio") or 0) * 100
+            avg_ret = (h_row.get("avg_unrealized_return") or 0) * 100
+            score = r_row.get("score") or 0
+            buyers = r_row.get("buy_count") or 0
+            md.append(
+                f"- **{h_row.get('symbol')}** — 보유 {holders}명({pos_ratio:.0f}% 수익권, 평균 {avg_ret:+.1f}%) | 오늘 신규매수 {buyers}명 | 점수 {score:.1f}"
+            )
+
     # 신뢰 유저 보유 인기 종목 TOP 5 (중기 관심 종목)
     accumulation_top = [
         row for row in accumulation
-        if (row.get("holder_count") or 0) >= 10 and (row.get("positive_holder_ratio") or 0) >= 0.6
+        if (row.get("holder_ratio") or 0) >= 0.04 and (row.get("positive_holder_ratio") or 0) >= 0.6
     ][:5]
     if accumulation_top:
         md.extend(["", "## 📈 신뢰 유저들이 들고 있는 인기 종목 TOP 5"])
@@ -5650,6 +6259,7 @@ def render_today_command_center(data: dict[str, Any]) -> str:
     summary = data.get("summary") or {}
     recent_buy = data.get("recent_buy") or {}
     daily_scan = data.get("daily_profile_scan") or {}
+    _rel_by_author = reliability_by_author()
     recommendations = recent_buy.get("recommendations") or []
     ai_buy_count = len([row for row in recommendations if row.get("ai_verdict") == "매수검토"])
     buy_candidates = [
@@ -5692,10 +6302,20 @@ def render_today_command_center(data: dict[str, Any]) -> str:
     blocked_html = "".join(render_today_candidate_card(row, "blocked") for row in blocked_candidates[:3]) or "<p class='empty'>추격 금지 후보 없음</p>"
     new_buy_rows = []
     for event in new_buys[:6]:
+        author = str(event.get("author") or "-")
+        profile_id = str(event.get("profile_id") or "")
+        profile_url = f"https://www.tossinvest.com/community/profile/{profile_id}" if profile_id else "#"
+        rel = _rel_by_author.get(author) or {}
+        rel_score = rel.get("final_reliability_score") or rel.get("reliability_score")
+        rel_html = f"<em class='rel-badge'>신뢰 {rel_score:.0f}</em>" if rel_score else ""
         new_buy_rows.append(
             "<li>"
             f"<strong>{html.escape(str(event.get('symbol') or event.get('stock_name') or '-'))}</strong>"
-            f"<span>{html.escape(str(event.get('author') or '-'))} · {html.escape(format_trade_time(event.get('acted_at')))}</span>"
+            f"<span>"
+            f"<a href='{html.escape(profile_url)}' target='_blank' rel='noopener'>{html.escape(author)}</a>"
+            f"{rel_html}"
+            f" · {html.escape(format_trade_time(event.get('acted_at')))}"
+            f"</span>"
             "</li>"
         )
     new_buy_html = "".join(new_buy_rows) or "<li><span class='muted'>이번 스캔 신규 매수 없음</span></li>"
@@ -6339,6 +6959,7 @@ def build_holding_accumulation_rankings(
     target_ids = {str(row.get("profile_id") or "") for row in scan_targets if row.get("profile_id")}
     if not target_ids:
         target_ids = {str(row.get("profile_id") or "") for row in user_rankings[:200] if row.get("profile_id")}
+    universe_size = max(1, len(target_ids))
     user_by_id = {str(row.get("profile_id") or ""): row for row in user_rankings if row.get("profile_id")}
     grouped: dict[str, dict[str, Any]] = {}
     for profile in holdings_report.get("profiles") or []:
@@ -6428,6 +7049,7 @@ def build_holding_accumulation_rankings(
             decision = "보유 관찰"
         else:
             decision = "수익권 약함"
+        holder_ratio = row["holder_count"] / universe_size
         ranked.append({
             "symbol": row["symbol"],
             "name": row["name"],
@@ -6435,6 +7057,8 @@ def build_holding_accumulation_rankings(
             "decision": decision,
             "score": round(accumulation_score, 1),
             "holder_count": row["holder_count"],
+            "holder_ratio": round(holder_ratio, 4),
+            "universe_size": universe_size,
             "positive_holder_count": len(positive_holders),
             "negative_holder_count": len(negative_holders),
             "positive_holder_ratio": round(positive_ratio, 4),
@@ -7733,6 +8357,9 @@ def unified_dashboard_report() -> dict[str, Any]:
     .new-buy-list li {{ border:1px solid var(--line2); border-radius:14px; padding:11px 12px; }}
     .new-buy-list strong, .new-buy-list span {{ display:block; }}
     .new-buy-list span {{ color:var(--muted); font-size:12px; margin-top:4px; }}
+    .new-buy-list a {{ color:var(--accent); text-decoration:none; }}
+    .new-buy-list a:hover {{ text-decoration:underline; }}
+    .rel-badge {{ display:inline-block; background:var(--accent); color:#fff; border-radius:6px; font-size:10px; padding:1px 5px; margin:0 4px; font-style:normal; }}
     .status-band {{ display:flex; gap:14px; flex-wrap:wrap; align-items:center; background:#fff; border:1px solid var(--line2); border-radius:16px; padding:15px; margin:14px 0; box-shadow:var(--shadow); }}
     .status-band span {{ color:var(--muted); }}
     .todo-grid {{ display:grid; grid-template-columns:repeat(4, minmax(160px, 1fr)); gap:10px; margin-top:10px; }}
@@ -9110,6 +9737,13 @@ def main() -> None:
     parser.add_argument("--strategy-report", action="store_true", help="rank strategies from backtest and produce current candidates")
     parser.add_argument("--user-report", action="store_true", help="rank public authors by historical public signal performance")
     parser.add_argument("--discover-profiles", action="store_true", help="discover public profile ids for later user-based strategies")
+    parser.add_argument("--discover-following-traders", action="store_true", help="fetch trade history from following feed and merge new profiles into candidates")
+    parser.add_argument("--following-feed-scan", action="store_true", help="replace --daily-profile-scan: fetch all followed users' trades via subscription feed")
+    parser.add_argument("--feed-pages", type=int, default=20, help="pages to fetch from following trade feed (default 20)")
+    parser.add_argument("--follow-candidates", action="store_true", help="follow top candidates from profile_candidates.json (dry-run by default)")
+    parser.add_argument("--follow-limit", type=int, default=50, help="max follows per run (default 50, hard cap per CLAUDE.md)")
+    parser.add_argument("--follow-delay", type=float, default=1.0, help="seconds between follow requests (default 1.0)")
+    parser.add_argument("--no-dry-run", action="store_true", help="actually execute follow requests (default is dry-run)")
     parser.add_argument("--profile-history-report", action="store_true", help="opt-in logged-in read-only profile trade-history collection")
     parser.add_argument("--deep-profile-history-report", action="store_true", help="deepen selected accessible profiles with more trade-history pages")
     parser.add_argument("--profile-holdings-report", action="store_true", help="opt-in logged-in read-only profile holdings collection")
@@ -9135,6 +9769,8 @@ def main() -> None:
     parser.add_argument("--scan-pages", type=int, default=10, help="max pages per profile (safety cap; default 10). With --scan-cutoff-hours stop earlier when oldest event passes cutoff.")
     parser.add_argument("--scan-cutoff-hours", type=float, default=8.0, help="stop paging once oldest event is older than this many hours (0 = disable, fixed pages). Default 8h.")
     parser.add_argument("--incremental-profiles", action="store_true", help="skip profile ids already present in profile_history_report.json")
+    parser.add_argument("--from-follow-history", action="store_true", help="use follow_history.json profile ids as candidates instead of community discovery")
+    parser.add_argument("--active-holdings-update", action="store_true", help="update holdings only for active profiles in last feed scan (light refresh use)")
     parser.add_argument("--profile-strategy-event-limit", type=int, default=0, help="recent profile BUY events to backtest; 0 = ALL events (default)")
     parser.add_argument("--strategy-half-life-days", type=float, default=30.0, help="half-life (days) for recency weight in reliability score (default 30)")
     parser.add_argument("--no-incremental-backtest", action="store_true", help="recompute profile backtest rows instead of reusing cached event results")
@@ -9157,6 +9793,32 @@ def main() -> None:
             output = generate_strategy_report(top_n=args.top, pages=args.pages, capital=args.capital)
         elif args.user_report:
             output = user_performance_report(author=args.author, min_samples=args.min_samples, capital=args.capital)
+        elif args.follow_candidates:
+            output = bulk_follow_candidates(
+                session_headers_file=args.session_headers_file,
+                session_curl_file=args.session_curl_file,
+                acknowledged=args.i_understand_session_risk,
+                max_follows=min(args.follow_limit, 50),
+                delay_seconds=args.follow_delay,
+                dry_run=not args.no_dry_run,
+            )
+        elif args.discover_following_traders:
+            output = discover_following_traders(
+                session_headers_file=args.session_headers_file,
+                session_curl_file=args.session_curl_file,
+                acknowledged=args.i_understand_session_risk,
+                pages=args.profile_pages,
+                delay_seconds=args.profile_delay,
+            )
+        elif args.following_feed_scan:
+            output = following_feed_scan(
+                session_headers_file=args.session_headers_file,
+                session_curl_file=args.session_curl_file,
+                acknowledged=args.i_understand_session_risk,
+                pages=args.feed_pages,
+                delay_seconds=args.profile_delay,
+                cutoff_hours=args.scan_cutoff_hours,
+            )
         elif args.discover_profiles:
             stock_community_codes = [code.strip() for code in args.stock_community_codes.split(",") if code.strip()]
             output = discover_profiles(
@@ -9182,6 +9844,14 @@ def main() -> None:
                 stock_community_codes=stock_community_codes,
                 stock_community_top=args.stock_community_top,
                 stock_community_pages=args.stock_community_pages,
+                from_follow_history=args.from_follow_history,
+            )
+        elif args.active_holdings_update:
+            output = active_profile_holdings_update(
+                session_headers_file=args.session_headers_file,
+                session_curl_file=args.session_curl_file,
+                acknowledged=args.i_understand_session_risk,
+                delay_seconds=args.profile_delay,
             )
         elif args.profile_holdings_report:
             output = profile_holdings_report(

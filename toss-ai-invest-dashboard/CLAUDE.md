@@ -1,175 +1,280 @@
 # Toss AI Invest Dashboard — Agent Guide
 
 Research dashboard for tracking public TossInvest community signals + user's own holdings impact.
-**This file guides AI coding agents (Claude Code) working on this codebase.**
+**This file guides AI coding agents working on this codebase.**
 
 ---
 
-## 🛡️ Safety — Hard Rules (Never Break)
+## 🛡️ Safety — Hard Rules
 
 - **NO trading execution**: no `tossctl`, no order placement, no financial account mutation
 - **READ-ONLY for financial data**: trade history, holdings, public quotes — no orders, no transfers
-- **Social actions allowed (opt-in)**: follow/unfollow via `relation/update` API is permitted with explicit rate limiting (≥1s delay, max 50/run) and `--i-understand-session-risk` flag
-- **Session cookie**: local-only via `session_curl.txt` (gitignored); never log/print cookie contents
-- **NO secrets to commits**: profile_id, cookies, tokens belong in gitignored files (`session_curl.txt`, `private_session_headers.json`)
+- **Session cookie**: local-only via `session_curl.txt` (gitignored); never log/print contents
+- **NO secrets in commits**: profile_id, cookies, tokens belong in gitignored files
 
-## Karpathy 4 Principles (from forrestchang/andrej-karpathy-skills)
+## Karpathy 4 Principles (apply to every change)
 
-Apply these to every code change:
+1. **Think Before Coding** — state assumptions explicitly, push back on suboptimal, ask for clarification
+2. **Simplicity First** — only what's requested, no speculative abstractions, validate at boundaries
+3. **Surgical Changes** — touch only what's necessary, match existing style
+4. **Goal-Driven Execution** — transform tasks into verifiable success criteria
 
-### 1. Think Before Coding
-- State assumptions explicitly. Don't silently guess intent.
-- Present multiple interpretations when ambiguity exists.
-- Push back on suboptimal solutions instead of executing.
-- Ask for clarification rather than making invisible decisions.
+## 🚨 Critical feedback rules
 
-### 2. Simplicity First
-- Build only what is requested. No speculative features.
-- No single-use abstractions, no unasked-for flexibility.
-- No error handling for impossible cases. Validate at system boundaries only.
-- Standard: would a senior engineer call this overcomplicated?
-
-### 3. Surgical Changes
-- Touch only what's necessary. Match existing style.
-- Don't refactor adjacent code that's working.
-- Remove only imports/functions made unused by your change.
-- Pre-existing dead code stays unless explicitly requested.
-
-### 4. Goal-Driven Execution
-- Transform tasks into verifiable success criteria.
-- "Add validation" → "create tests for invalid inputs, make them pass."
-- Loop toward clear goals; let the system check itself.
+- **Always check sector overlap** before recommending buy candidates. User's portfolio is tech/semi-heavy; system recs are biased toward Korean retail trader picks (momentum/tech). Don't dump pool-recs blindly — first verify against user's existing exposure.
+- **Don't market-time winners**. When user proposes taking profit on strong-hold positions (composite ≥45, 매도점수 ≤15), push back with data — locking gains on smart-money-still-buying positions is usually losing trade.
+- **Verify external data structure before parsing**. Fetch a real sample first, confirm schema, then implement.
+- **Show before/after on scoring changes**. When tweaking score formulas/thresholds, show sample diffs on representative records before broad rollout.
 
 ---
 
-## 📐 Architecture (3 layers)
+## 📐 Current Architecture (V1, Flask-driven)
 
 ```
-Layer 1 — Data collection
-  Toss API (wts-cert-api, wts-info-api)  ← session cookie required
-    - profile trade history
-    - profile holdings
-    - product search / meta
-  Yahoo Finance (query1.finance.yahoo.com) ← anonymous
-    - historical chart (backtest)
-    - current quote
-
-Layer 2 — Models / scoring
-  - Profile candidate discovery
-  - Trade history backtest (1h/4h/24h/72h returns, recency-weighted half-life 30d)
-  - User reliability score (sample + win + drawdown + diversification + recency)
-  - Recent buy/sell person-based scoring (rotation detected, consensus)
-  - Holding bonus for symbols held by trusted users
-  - User own holdings tracking (auto from trade history)
-
-Layer 3 — User outputs
-  - ai_decision_brief.md (TL;DR + 1순위 + 보유종목 + 신뢰유저 + 인기보유)
-  - toss_ai_invest_dashboard.html (3 tabs: 장중판단 / AI브리핑 / 유저모델)
-  - recent_buy_report.json, recent_trade_timeline.json (raw)
+[Browser]  http://localhost:8080
+   ↓
+[Flask serve.py]
+   ├─ GET /                    → multi_horizon_dashboard.html
+   ├─ GET /api/status          → file mtimes + generated_at per stage
+   ├─ GET /api/refresh-progress→ in-flight refresh progress log
+   ├─ GET /api/refresh-prices  → ~45s: force_refresh quotes + recs + dashboard
+   ├─ GET /api/refresh-holdings→ ~10s: 본인 보유 net 재계산
+   ├─ GET /api/full-refresh    → ~5-9min: holdings + scan + reliability + recs + dashboard
+   └─ GET /api/expand-pool     → ~30-40min: community discovery + history pull + recompute
+   ↓ (all endpoints update files in public_model_data/_internal/)
+[Files] — single source of truth
 ```
 
-## 🔄 Operations — Two Refresh Modes
-
-### Light Refresh — `auto_refresh.sh`
-- Cadence: every :00 / :30 KST (30-min)
-- Scope: top 400 trusted users, 4h trade window, 10 page safety cap, cutoff-based pagination
-- Duration: ~2 minutes
-- Steps: `--fetch-user-holdings` → `--daily-profile-scan` → `--recent-buy-report` → `--recent-trade-timeline` → `--unified-dashboard` → `--ai-brief`
-- Lock-protected (`refresh.lock`); macOS notification on session expiry
-- Updates: recent signals, user holdings, brief
-
-### Heavy Refresh — `daily_heavy_refresh.sh`
-- Cadence: daily 1x (recommend 06:00 KST via cron)
-- Scope: full backtest (all events), recency weighted half-life 30d
-- Duration: ~5–10 minutes
-- Steps: `--fetch-user-holdings` → `--profile-holdings-report` → `--profile-strategy-report` (event-limit 0) → `--recent-buy-report` → `--recent-trade-timeline` → `--unified-dashboard` → `--ai-brief`
-- Updates: reliability rankings, holding accumulation rankings, full pipeline
-
-## 🎯 Scoring Formula (current, 100 + bonus)
+### Data flow (V1)
 
 ```
-buyer participation rate     25
-reliable buyer (score≥50)    15
-avg user reliability         30   (recency-weighted)
-consensus (B-S)/(B+S+1)      15
-recency                      15
-─────────────────────────
-holding bonus                +0~10  (trusted-user holding count)
-─────────────────────────
-penalty                       -∞   (chase / leverage / unknown reliability)
+profile_history_report.json (누적 trade events, 1500+ profiles, 33K+ events)
+    ↑ daily_profile_scan (Toss API per-profile fetch, dedup by event_key)
+    ↑ profile_history_report --incremental (community discovery, new profile IDs)
 
-TL;DR threshold:
-  80+: 🟢 strong buy (hold 4h+)
-  70-79: 🟡 medium signal (small entry)
-  <70: 🟡 weak / 🔴 watch
+profile_reliability_multi.json (4 horizon win rates per profile, 454 measurable)
+    ↑ compute_multi_horizon_reliability (Yahoo chart_cache backtest)
+
+recommendations_multi.json (per-symbol scores, 7-day window of trusted pool)
+    ↑ compute_multi_horizon_recommendations (per-symbol aggregation + force_refresh quotes)
+
+multi_horizon_dashboard.html (5 tabs)
+    ↑ multi_horizon_dashboard_report (render from above + user_holdings_cache)
+
+rec_performance_log.jsonl (append-only snapshots for tracking actual returns)
+    ↑ append_rec_performance_log (auto, after each compute_multi_horizon_recommendations)
+    ↑ evaluate_rec_performance (fill in horizon prices when matured)
 ```
 
-## 🛡️ Filters
+## 🎯 Scoring formula (per symbol, per horizon)
 
-- Leveraged/inverse auto-excluded: `LEVERAGED_SYMBOLS` set + keywords (`2X`, `3X`, `레버리지`, `인버스`)
-- Rotation detected: same user BUY+SELL in window → excluded from both counts
-- Holding-tier sell threshold: symbol category by trusted-holder count (large/mid/small)
-- 24h window for user-held-symbol sell alerts (HOOD-style early-day sells caught)
+```python
+# 7-day window of trusted pool's BUY/SELL events (micro-trades filtered out)
+buy_sum  = Σ (buyer_win × price_weight)   # buyer_win = trusted user's h-horizon win rate
+sell_sum = Σ (seller_win × price_weight)
+price_weight = max(0.6, min(1.4, avg_p / current_price))  # symmetric reward/penalty
+score[h] = (buy_sum - sell_sum) / max(buy_count, sell_count, 3)
+composite = mean(score[4h, 24h, 72h, 144h])
 
-## 🗂️ Key Files
+# Entry label by gap (current vs trusted avg buy price)
+gap = (current_price / avg_buy_price - 1) * 100
+gap < -3%: 진입가능+ (좋은 진입가)
+gap -3 ~ +3%: 진입가능
+gap +3 ~ +10%: 소액진입
+gap > +10%: 추격금지
+```
+
+### Trusted pool filter (used in recommendations)
+- `RECOMMENDATION_MIN_TRUSTED_WIN = 50.0` — any horizon win rate ≥50
+- Pool size typically ~280-360 of 454 measurable profiles
+
+### Micro-trade filter (excludes 자동 적립식)
+- `MIN_TRADE_AMOUNT_KRW = 10000` / `MIN_TRADE_AMOUNT_USD = 7.0`
+- Excludes ~12% of BUY events (Toss "3천원씩 모으기", "1주씩 모으기" — automated DCA)
+- Applied in: `compute_multi_horizon_reliability`, `compute_multi_horizon_recommendations`
+
+## 📦 Holdings 매도 판단 매트릭스
+
+Each held symbol scored 0-100 "sell pressure" + verdict label:
 
 ```
-public_stock_models.py     ← single-file script with all commands
-auto_refresh.sh            ← light loop (background)
-daily_heavy_refresh.sh     ← heavy one-shot
-session_curl.txt           ← user session (GITIGNORED)
+1. data < 3 trades → "⏸ 데이터 부족"
+2. PnL < -3% AND seller_avg < my_avg × 0.98 → "🔴 손절 검토" (loss + smart money bearish)
+3. PnL > +10% AND sell_count ≥1 AND seller_vs_me ≤1.02 → "🟠 차익실현 검토"
+4. buyer_vs_me > 1.03 AND worst ≥30 → "🟢 강한 보유"
+5. worst ≥30 → "🟢 보유 유지"
+6. sell_count ≥ max(3, buy_count × 1.5) → "🟠 매도 우세 주의"
+7. worst ≥0 → "🟡 약한 신호"
+8. else → "🔴 매도 검토"
+```
+
+매도점수 = combined weighted score (h-score weakness + sell ratio + PnL adjustments + buyer position offset).
+
+---
+
+## 🗂️ Key files (V1 only)
+
+```
+public_stock_models.py         ← single-file V1 logic (~11K lines, large legacy too)
+serve.py                       ← Flask server, all 5 endpoints
+.claude/commands/insight.md    ← slash command for ad-hoc decisions
+session_curl.txt               ← Toss session (gitignored, per-machine)
+
 public_model_data/
-  ai_decision_brief.md     ← markdown brief (output)
-  toss_ai_invest_dashboard.html ← single HTML (output)
-  toss_ai_invest_data.json ← consolidated JSON (output)
-  _internal/               ← raw caches, all gitignored
+  multi_horizon_dashboard.html ← generated (gitignored)
+  _internal/                   ← all caches/data (gitignored)
+    profile_history_report.json     ← MAIN: 1500+ profiles, 33K+ events
+    profile_reliability_multi.json  ← 454 measurable profiles, 4h/24h/72h/144h win rates
+    recommendations_multi.json      ← per-symbol scores + buyer/seller lists
+    rec_performance_log.jsonl       ← snapshot-and-evaluate log for performance tracking
+    daily_profile_scan.json         ← last scan metadata
+    chart_cache.json (~38MB)        ← Yahoo historical chart cache
+    toss_product_search_cache.json  ← Toss product price cache (1h TTL)
+    user_holdings_cache.json        ← user's net positions
+    profile_strategy_report.json    ← used by load_daily_scan_profiles (ranking input)
+    profile_backtest_row_cache.json ← backtest row cache
 ```
 
-## 🧭 Common Commands
+## 🚀 Workflow
 
+### New machine setup
 ```bash
-# Generate latest dashboard from existing local data
-python3.12 public_stock_models.py --unified-dashboard
-
-# Generate brief markdown
-python3.12 public_stock_models.py --ai-brief
-
-# Light refresh (one iteration manually)
-python3.12 public_stock_models.py --daily-profile-scan \
-  --daily-profile-limit 400 --scan-pages 10 --scan-cutoff-hours 4 \
-  --skip-daily-holdings \
-  --session-curl-file session_curl.txt --i-understand-session-risk
-
-# Recalculate reliability (recency-weighted, all events)
-python3.12 public_stock_models.py --profile-strategy-report \
-  --profile-strategy-event-limit 0 --strategy-half-life-days 30
-
-# Fetch user's own holdings from trade history
-python3.12 public_stock_models.py --fetch-user-holdings \
-  --session-curl-file session_curl.txt --i-understand-session-risk
-
-# Override current price for judgment (one-off)
-python3.12 public_stock_models.py --recent-buy-report --recent-hours 4 \
-  --user-price "삼성전자=282000,SK하이닉스=1850000"
+git pull
+pip install flask
+# Make session_curl.txt from a fresh Toss browser curl (bash format, not CMD)
+python serve.py
+# Browser: http://localhost:8080
+# First time: click 🆕 신규 유저 발굴 once (~30min) to populate _internal/
 ```
 
-## ⚙️ Configuration
+### Daily use
+- Open `localhost:8080` in browser
+- Click 💱 가격만 갱신 to refresh quotes (45s)
+- Click 🔄 전체 재계산 before key decisions (~7min: holdings + scan + reliability + recs + dashboard)
+- Click 📦 내 보유 갱신 right after manual trades on Toss (10s)
+- Click 🆕 신규 유저 발굴 weekly (~30-40min: grow trusted pool)
 
-- `USER_TOSS_PROFILE_ID` — owner's Toss profile id (currently hardcoded; consider externalizing)
-- `USER_HOLDINGS_SYMBOLS_STATIC` — fallback when cache is empty
-- session file path, scan pages/cutoff/workers — CLI flags or env
+### Dashboard tabs (5)
+1. **매수 추천** — recommendations, sortable by composite/h-horizon, filterable by entry/grade/currency/recent-trade
+2. **내 보유 매도 판단** — per-holding 매도점수 + verdict + click-to-open detail dialog
+3. **신뢰 유저** — pool of 357+ trusted profiles, sorted by composite (4 horizon avg) desc
+4. **📈 추천 성과** — performance tracking: snap_at, symbol, +4h/+24h/+72h/+144h returns
+5. (filter buttons in 매수 추천 tab: 등급, 변동, 통화, 최근 4h/1h)
 
-## 🚧 Known Improvement Areas
+## ⚙️ Constants worth knowing
 
-- `USER_TOSS_PROFILE_ID` hardcoded → externalize to env or `user_profile_id.txt` (gitignored)
-- 1h backtest win rate ~16% (lag, slippage) — favor 4h+ horizon
-- Per-symbol big-sell threshold uses holder-count proxy; consider daily turnover from Yahoo/Toss
-- Heavy refresh first run is slow (~5 min); subsequent are cached
+```python
+RECOMMENDATION_WINDOW_HOURS = 7 * 24       # 7-day window for buyer/seller aggregation
+TOSS_TRADE_LAG_HOURS = 1.5                 # Toss API exposes trades with ~1.5h lag
+RECOMMENDATION_MIN_TRUSTED_WIN = 50.0      # pool entry threshold
+RECOMMENDATION_SCORE_CUTOFF = 30.0         # recommendation visibility threshold
+RECOMMENDATION_MIN_DENOMINATOR = 3         # score denominator floor
+MIN_TRADE_AMOUNT_KRW = 10000.0             # exclude < ₩10K (auto 적립식)
+MIN_TRADE_AMOUNT_USD = 7.0                 # exclude < $7
+TOSS_PRODUCT_CACHE_TTL_SECONDS = 3600      # Toss price cache 1h
+RELIABILITY_HORIZONS_HOURS = [4, 24, 72, 144]
+RELIABILITY_HALF_LIFE_DAYS = 30.0          # recency-weighted backtest
+```
 
-## 📌 When Editing
+## 🚧 Known caveats
 
-- Keep `--recent-buy-report` deterministic — no hidden side effects
-- Never call Yahoo Finance faster than 6 concurrent (ThreadPoolExecutor max_workers=6)
-- Toss API: respect rate (delay 0.3s, parallel ≤ 4 workers); session can expire mid-scan — catch RuntimeError
-- Brief MD format: keep it scannable (≤ 1 screen)
-- Holdings table is dynamic from cache; don't reintroduce hardcoded `USER_HOLDINGS_SYMBOLS`
+- `profile_strategy_report.json` (27MB) is still consumed by `load_daily_scan_profiles` for ranking. Not regenerated automatically anymore — stale rankings just mean older profile ordering. Not catastrophic.
+- `auto_refresh.sh` / `daily_heavy_refresh.sh` were removed — Flask endpoints replace them.
+- Old dashboard functions (`unified_dashboard_report`, `recent_buy_html_report`, etc.) still exist in `public_stock_models.py` but unused. Can be pruned in future cleanup (~5500 lines).
+- Toss `close.usd` for US stocks during US off-hours can show pre-market estimates that differ from Yahoo `regularMarketPrice`. KRW stocks use `close.krw` which is accurate.
+- Recommendations skew tech/semi (trusted pool bias toward Korean momentum traders). Always sector-check before recommending.
+
+## 🤖 Cross-machine git workflow
+
+User works on 회사 PC + 집 PC, code synced via git.
+
+**Synced via git** (commit + push to sync):
+- `public_stock_models.py`, `serve.py`, `.claude/commands/*.md`, `CLAUDE.md`, `README.md`, `.gitignore`
+
+**Per-machine (gitignored)**:
+- `session_curl.txt` — fresh Toss session each machine
+- `public_model_data/_internal/*` — data caches, regenerated locally
+- `public_model_data/multi_horizon_dashboard.html` — generated
+
+Slash command `/insight` available — composed workflow: data snapshot + macro news + sector-aware advice.
+
+---
+
+## 📋 Recent decision log
+
+Most recent first. Read these before making structural changes.
+
+### Performance log (B option)
+- `rec_performance_log.jsonl` captures snapshot per `compute_multi_horizon_recommendations` call
+- `evaluate_rec_performance` fills `horizon_prices` / `horizon_returns` when target_time (snap_at + h) ≤ now
+- Both auto-run on every refresh that recomputes recs
+- New 5th tab "📈 추천 성과" — table + aggregate stats per horizon (matured count, win rate, avg return)
+
+### Refresh model — 4 buttons
+- 💱 refresh-prices: just compute_multi_horizon_recommendations + dashboard (~45s)
+- 📦 refresh-holdings: fetch_user_holdings_from_trades + dashboard (~10s)
+- 🔄 full-refresh: holdings + daily_profile_scan + reliability + recs + dashboard (~7min)
+- 🆕 expand-pool: profile_history_report (community discovery) + above 3 + dashboard (~30-40min)
+- `_refresh_lock` (threading.Lock) prevents concurrent execution (returns HTTP 429 "busy")
+
+### Pool expansion (option B from earlier session)
+- profile_history_report with `stock_community_top=200, pages=4, incremental=True`
+- Adds ~375 profiles per run, ~25% become measurable, ~20% enter trusted pool
+- 1207 → 1582 profiles, 282 → 357 trusted pool size in last run
+
+### Sector overlap awareness
+- User pushed back when AMAT (semi) was recommended despite their tech-heavy portfolio
+- Lesson: filter system recs by user's existing exposure before suggesting
+- Saved as feedback memory
+
+### Price weight — symmetric
+- Was: `min(1.0, avg_p / current_price)` (cap at 1.0, penalty only)
+- Now: `max(0.6, min(1.4, avg_p / current_price))` (boost when current < trusted avg)
+- Effect: 케이뱅크 (gap -6.4%) score 70 → 74.7 (+4.7); AIS unchanged (already in penalty zone)
+
+### Toss product cache TTL
+- Was: no TTL (Samsung price stale at 285K instead of 272K)
+- Now: 1h TTL + `force_refresh` parameter for dashboard quote fetches
+
+### Holdings tab live quote
+- Holdings tab calls `fetch_public_quote(force_refresh=True)` for each user-held symbol
+- Ensures PnL is from real-time prices even if symbol isn't in recommendation pool
+
+### Display TZ fix
+- Trader detail `latest_at` was rendered in UTC (displayed "12:34" instead of "21:34" KST)
+- Now: `.astimezone(KST)` before strftime in `_trader_detail_rows`
+
+### File cleanup
+- Removed: `auto_refresh.sh`, `daily_heavy_refresh.sh`, 3 old dashboard outputs (~66MB from git)
+- Many functions in `public_stock_models.py` are unused (old dashboard) — kept for safety, ~5500 lines could be pruned later
+
+---
+
+## 🧪 Where to inspect first when something breaks
+
+1. **Session expired** (Toss API 401/403):
+   - Check `public_model_data/_internal/session_expired.flag`
+   - Refresh `session_curl.txt` from browser curl (bash format)
+   - Restart `serve.py`
+2. **Refresh hangs / not completing**:
+   - Check `ps -ef | grep python` for Python PID
+   - Look at file mtimes under `_internal/` — recently updated files = active stage
+   - Check Flask log (the background bash output for serve.py)
+   - `_refresh_lock` may be held if previous run crashed — restart `serve.py`
+3. **Score looks wrong / stale**:
+   - Check `/api/status` `recommendations.generated_at` — is it fresh?
+   - Click 💱 (just recompute) or 🔄 (full incremental update)
+4. **Holdings show stale positions**:
+   - Click 📦 내 보유 갱신 (user's Toss must reflect the trade — Toss API has up to 1.5h lag)
+5. **Recommendations empty / sparse**:
+   - Run 🆕 expand-pool (could be pool degradation over time)
+   - Check `profile_history_report.json` event_count (should be 20K+)
+
+## 🎯 Default response style
+
+- 한국어로 응답 (technical terms English OK)
+- Data-grounded: show actual numbers from files before recommending
+- Sector-aware: always check user's overlap
+- Macro-aware: WebSearch for breaking news when stakes are high
+- Direct: explicit recommendation + reasoning + alternatives
+- Tables for comparison, code for commands, headers for navigation

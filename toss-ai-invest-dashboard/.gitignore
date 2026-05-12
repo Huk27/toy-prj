@@ -14,9 +14,8 @@ __pycache__/
 tossinvest-js/
 public_model_data/_internal/
 public_model_data/*.json
-!public_model_data/toss_ai_invest_data.json
 public_model_data/*.html
-!public_model_data/toss_ai_invest_dashboard.html
+public_model_data/*.md
 
 # Misc local logs
 debug.log

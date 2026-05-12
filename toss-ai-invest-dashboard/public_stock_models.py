@@ -70,8 +70,16 @@ RECENT_BUY_HORIZON_GRACE_HOURS = 2.0
 BEAR_MARKET_BACKTEST_2022_PATH = RAW_DATA_DIR / "bear_market_backtest_2022.json"
 PROFILE_RELIABILITY_MULTI_PATH = RAW_DATA_DIR / "profile_reliability_multi.json"
 RECOMMENDATIONS_MULTI_PATH = RAW_DATA_DIR / "recommendations_multi.json"
+REC_PERFORMANCE_LOG_PATH = RAW_DATA_DIR / "rec_performance_log.jsonl"
+# Toss "3천원씩 모으기" / "1주씩 모으기" 같은 자동 적립식 추정 거래 필터
+# 금액이 임계값 미만이면 의식적 결정이 아닐 가능성이 커서 신뢰도/추천 산정에서 제외
+MIN_TRADE_AMOUNT_KRW = 10000.0   # ₩10K 미만 (대략 $7)
+MIN_TRADE_AMOUNT_USD = 7.0       # $7 미만
 MULTI_HORIZON_DASHBOARD_HTML_PATH = DATA_DIR / "multi_horizon_dashboard.html"
 RECOMMENDATION_WINDOW_HOURS = 7 * 24
+# Toss API의 거래내역 노출 lag (실제 거래 vs Toss API 노출 시점 차이)
+# scan 시점은 항상 이 만큼 앞 시점까지만 신뢰할 수 있음
+TOSS_TRADE_LAG_HOURS = 1.5
 RECOMMENDATION_MIN_TRUSTED_WIN = 50.0
 RECOMMENDATION_SCORE_CUTOFF = 30.0
 RECOMMENDATION_MIN_DENOMINATOR = 3
@@ -82,6 +90,181 @@ RECOMMENDATION_ENTRY_BANDS = [
     (0.10, "소액진입"),
     (float("inf"), "추격금지"),
 ]
+
+
+def is_micro_trade(event: dict[str, Any]) -> bool:
+    """자동 적립식 / 극소액 거래 추정.
+
+    Toss "3천원씩 모으기" 또는 "1주씩 모으기" 같이 의식적 결정이 아닌 거래는
+    신뢰도/추천 점수에서 노이즈를 만들 수 있어서 필터.
+    KRW < MIN_TRADE_AMOUNT_KRW 또는 (KRW 없고) USD < MIN_TRADE_AMOUNT_USD 이면 True.
+    """
+    try:
+        amt_krw = float(event.get("amount_krw") or 0)
+        amt_usd = float(event.get("amount_usd") or 0)
+    except (TypeError, ValueError):
+        return False
+    if amt_krw > 0:
+        return amt_krw < MIN_TRADE_AMOUNT_KRW
+    if amt_usd > 0:
+        return amt_usd < MIN_TRADE_AMOUNT_USD
+    return False
+
+
+def append_rec_performance_log(rec_output: dict[str, Any]) -> int:
+    """Append snapshot of each recommendation to performance log (JSONL).
+
+    Used to track 4h/24h/72h/144h returns AFTER recommendation was made.
+    Each refresh appends a new batch with that refresh's generated_at as snap_at.
+
+    Returns the number of lines appended.
+    """
+    snap_at = rec_output.get("generated_at")
+    recs = rec_output.get("recommendations") or []
+    if not snap_at or not recs:
+        return 0
+    REC_PERFORMANCE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Dedup guard: don't append if last line has same snap_at (multiple writers safety)
+    last_snap = None
+    if REC_PERFORMANCE_LOG_PATH.exists():
+        try:
+            with REC_PERFORMANCE_LOG_PATH.open("rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                if size > 0:
+                    f.seek(max(0, size - 4096))
+                    tail = f.read().decode("utf-8", errors="ignore").splitlines()
+                    if tail:
+                        last_obj = json.loads(tail[-1])
+                        last_snap = last_obj.get("snap_at")
+        except (OSError, json.JSONDecodeError, ValueError):
+            last_snap = None
+    if last_snap == snap_at:
+        return 0   # already logged this batch
+
+    lines_added = 0
+    with REC_PERFORMANCE_LOG_PATH.open("a", encoding="utf-8") as f:
+        for r in recs:
+            er = r.get("expected_returns") or {}
+            record = {
+                "snap_at": snap_at,
+                "symbol": r.get("symbol"),
+                "stock_code": r.get("stock_code"),
+                "currency": r.get("currency"),
+                "snap_price": r.get("current_price"),
+                "composite_score": r.get("composite_score"),
+                "scores": r.get("scores"),
+                "expected_returns": {
+                    h: {
+                        "avg_return": (er.get(h) or {}).get("avg_return"),
+                        "grade": (er.get(h) or {}).get("grade"),
+                    }
+                    for h in ("h4", "h24", "h72", "h144")
+                },
+                "entry_label": r.get("entry_label"),
+                "buy_count": r.get("buy_count"),
+                "sell_count": r.get("sell_count"),
+                "avg_buy_price": r.get("avg_buy_price"),
+                "price_gap_pct": r.get("price_gap_pct"),
+                "horizon_prices": {"h4": None, "h24": None, "h72": None, "h144": None},
+                "horizon_returns": {"h4": None, "h24": None, "h72": None, "h144": None},
+                "evaluated_at": None,
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            lines_added += 1
+    return lines_added
+
+
+REC_PERFORMANCE_HORIZONS = [("h4", 4), ("h24", 24), ("h72", 72), ("h144", 144)]
+
+
+def evaluate_rec_performance() -> dict[str, Any]:
+    """rec_performance_log.jsonl의 각 snapshot에 대해 만료된 horizon의
+    historical 가격을 chart_cache에서 lookup해서 horizon_prices/returns 채움.
+
+    Returns 요약 통계."""
+    if not REC_PERFORMANCE_LOG_PATH.exists():
+        return {"status": "no_log", "evaluated_records": 0, "new_horizon_fills": 0}
+
+    text = REC_PERFORMANCE_LOG_PATH.read_text(encoding="utf-8")
+    records = [json.loads(line) for line in text.splitlines() if line.strip()]
+    if not records:
+        return {"status": "empty", "evaluated_records": 0, "new_horizon_fills": 0}
+
+    now_dt = now_kst().astimezone(dt.timezone.utc)
+    chart_cache = chart_cache_load()
+    n_records_changed = 0
+    n_new_fills = 0
+
+    for rec in records:
+        snap_at = parse_dt(rec.get("snap_at"))
+        snap_price = rec.get("snap_price")
+        if not snap_at or not snap_price or float(snap_price) <= 0:
+            continue
+        # 만료되었는데 아직 안 채워진 horizon 식별
+        pending = []
+        for h_key, h_hours in REC_PERFORMANCE_HORIZONS:
+            existing = (rec.get("horizon_prices") or {}).get(h_key)
+            if existing is not None:
+                continue
+            target = snap_at + dt.timedelta(hours=h_hours)
+            if target.astimezone(dt.timezone.utc) <= now_dt:
+                pending.append((h_key, h_hours, target))
+        if not pending:
+            continue
+
+        symbol = rec.get("symbol")
+        stock_code = rec.get("stock_code")
+        ticks = yahoo_symbols(symbol, stock_code)
+        if not ticks:
+            continue
+
+        # chart 확보 — cache에 있는 거 먼저, 없거나 범위 부족하면 fetch
+        max_h_hours = max(h for _, h, _ in pending)
+        chart_start = snap_at - dt.timedelta(hours=2)
+        chart_end = snap_at + dt.timedelta(hours=max_h_hours + 24)
+        chart = None
+        for ticker in ticks:
+            chart = cached_historical_chart_persistent(
+                ticker, chart_start, chart_end, None, chart_cache
+            )
+            if chart:
+                break
+        if not chart:
+            continue
+
+        rec.setdefault("horizon_prices", {})
+        rec.setdefault("horizon_returns", {})
+        any_filled = False
+        for h_key, _, target in pending:
+            target_price = price_at_or_after(chart, target)
+            if target_price is None or float(target_price) <= 0:
+                continue
+            rec["horizon_prices"][h_key] = round(float(target_price), 4)
+            rec["horizon_returns"][h_key] = round(
+                float(target_price) / float(snap_price) - 1, 6
+            )
+            n_new_fills += 1
+            any_filled = True
+        if any_filled:
+            rec["evaluated_at"] = now_kst().isoformat()
+            n_records_changed += 1
+
+    chart_cache_write(chart_cache)
+
+    # JSONL 다시 쓰기 (atomic via temp + rename)
+    tmp = REC_PERFORMANCE_LOG_PATH.with_suffix(".jsonl.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    tmp.replace(REC_PERFORMANCE_LOG_PATH)
+
+    return {
+        "status": "ok",
+        "records_total": len(records),
+        "evaluated_records": n_records_changed,
+        "new_horizon_fills": n_new_fills,
+    }
 
 
 def _entry_label_for_gap(gap: float | None) -> str:
@@ -517,14 +700,27 @@ def toss_product_cache_write(cache: dict[str, Any]) -> None:
     TOSS_PRODUCT_SEARCH_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def fetch_toss_product_search(query: str | None) -> list[dict[str, Any]]:
+TOSS_PRODUCT_CACHE_TTL_SECONDS = 3600
+
+
+def fetch_toss_product_search(query: str | None, force_refresh: bool = False) -> list[dict[str, Any]]:
     normalized = str(query or "").strip()
     if len(normalized) < 2:
         return []
     cache = toss_product_cache_load()
     cached = cache.get(normalized)
-    if isinstance(cached, dict) and isinstance(cached.get("items"), list):
-        return cached["items"]
+    if not force_refresh and isinstance(cached, dict) and isinstance(cached.get("items"), list):
+        fetched_at = cached.get("fetched_at")
+        fresh = False
+        if fetched_at:
+            try:
+                fetched_dt = dt.datetime.fromisoformat(fetched_at)
+                age = (now_kst() - fetched_dt).total_seconds()
+                fresh = 0 <= age < TOSS_PRODUCT_CACHE_TTL_SECONDS
+            except (TypeError, ValueError):
+                fresh = False
+        if fresh:
+            return cached["items"]
     payload = json.dumps(
         {"query": normalized, "sections": [{"type": "PRODUCT"}]},
         ensure_ascii=False,
@@ -584,7 +780,7 @@ def score_toss_product_item(item: dict[str, Any], symbol: str | None, stock_code
     return score
 
 
-def resolve_toss_product(symbol: str | None, stock_code: str | None = None) -> dict[str, Any] | None:
+def resolve_toss_product(symbol: str | None, stock_code: str | None = None, force_refresh: bool = False) -> dict[str, Any] | None:
     if is_option_like_name(symbol):
         return None
     queries = []
@@ -593,7 +789,7 @@ def resolve_toss_product(symbol: str | None, stock_code: str | None = None) -> d
             queries.append(str(value).strip())
     best: tuple[float, dict[str, Any]] | None = None
     for query in queries:
-        for item in fetch_toss_product_search(query):
+        for item in fetch_toss_product_search(query, force_refresh=force_refresh):
             score = score_toss_product_item(item, symbol, stock_code, query)
             if score <= 0:
                 continue
@@ -658,10 +854,13 @@ def quote_from_toss_product(product: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
-def fetch_public_quote(symbol: str | None, stock_code: str | None = None) -> dict[str, Any] | None:
+def fetch_public_quote(symbol: str | None, stock_code: str | None = None, force_refresh: bool = False) -> dict[str, Any] | None:
     """Fetch a public quote. Tries Toss first (real-time via toss-info-api),
-    falls back to Yahoo (delayed 15-20 min for free tier)."""
-    toss_product = resolve_toss_product(symbol, stock_code)
+    falls back to Yahoo (delayed 15-20 min for free tier).
+
+    When force_refresh=True, the Toss product search cache is bypassed so the
+    returned price reflects the most recent Toss feed snapshot."""
+    toss_product = resolve_toss_product(symbol, stock_code, force_refresh=force_refresh)
     if toss_product:
         toss_quote = quote_from_toss_product(toss_product)
         if toss_quote and toss_quote.get("price"):
@@ -2005,19 +2204,39 @@ def profile_history_report(
     if not acknowledged:
         raise ValueError("--i-understand-session-risk is required before using a logged-in browser session")
     headers = load_session_headers(session_headers_file, session_curl_file)
+    t_start = time.monotonic()
     if from_follow_history:
         fh = read_json_file(FOLLOW_HISTORY_PATH, {"followed_ids": []})
         followed_ids = [str(x) for x in (fh.get("followed_ids") or [])]
         candidates = [{"profile_id": pid, "nickname": "", "discovery_score": 0.0, "reasons": ["follow_history"]} for pid in followed_ids[:profile_limit]]
+        print(
+            f"[profile_history_report] follow_history mode — {len(candidates)} candidates",
+            flush=True,
+        )
     else:
+        print(
+            f"[profile_history_report] collect_public_data(pages={pages}, "
+            f"stock_community_top={stock_community_top}, "
+            f"stock_community_pages={stock_community_pages})...",
+            flush=True,
+        )
         data = collect_public_data(
             pages=pages,
             stock_community_codes=stock_community_codes,
             stock_community_top=stock_community_top,
             stock_community_pages=stock_community_pages,
         )
+        print(
+            f"[profile_history_report] collect done in {time.monotonic()-t_start:.1f}s — "
+            f"discover_profiles(limit={profile_limit})...",
+            flush=True,
+        )
         discovery = discover_profiles(data, limit=profile_limit)
         candidates = discovery["candidates"][:profile_limit]
+        print(
+            f"[profile_history_report] discovery: {len(candidates)} candidates",
+            flush=True,
+        )
 
     def dedupe_profile_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_profile_id: dict[str, dict[str, Any]] = {}
@@ -2085,6 +2304,16 @@ def profile_history_report(
             "profiles": deduped_rows,
         }
 
+    total_pending = len(pending_profiles)
+    log_interval = max(10, total_pending // 20 or 1)  # ~5% step, 최소 10
+    print(
+        f"[profile_history_report] existing={len(existing_rows)} "
+        f"pending={total_pending} (log every {log_interval}, delay={delay_seconds}s, "
+        f"max_pages={max_pages_per_profile})",
+        flush=True,
+    )
+    t_loop = time.monotonic()
+    error_count = 0
     for profile in pending_profiles:
         try:
             row = fetch_profile_trade_history(
@@ -2101,13 +2330,33 @@ def profile_history_report(
                 "event_count": 0,
                 "error": str(exc).split(":", 1)[-1].strip()[:240],
             }
+            error_count += 1
         profile_rows.append(row)
         fetched_profile_count += 1
         if fetched_profile_count % 10 == 0:
             PROFILE_HISTORY_REPORT_PATH.write_text(json.dumps(build_output(), ensure_ascii=False, indent=2), encoding="utf-8")
+        if fetched_profile_count % log_interval == 0 or fetched_profile_count == total_pending:
+            elapsed = time.monotonic() - t_loop
+            rate = fetched_profile_count / max(elapsed, 0.001) * 60
+            remaining = total_pending - fetched_profile_count
+            eta_min = remaining / rate if rate > 0 else 0
+            print(
+                f"[profile_history_report] {fetched_profile_count}/{total_pending} "
+                f"({fetched_profile_count*100//max(total_pending,1)}%) "
+                f"elapsed={elapsed:.0f}s rate={rate:.1f}/min "
+                f"errors={error_count} eta={eta_min:.1f}min",
+                flush=True,
+            )
         time.sleep(delay_seconds)
     output = build_output()
     PROFILE_HISTORY_REPORT_PATH.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+    total_elapsed = time.monotonic() - t_start
+    print(
+        f"[profile_history_report] done in {total_elapsed:.1f}s — "
+        f"profile_count={output['profile_count']} event_count={output['event_count']} "
+        f"errors={output['error_count']}",
+        flush=True,
+    )
     return output
 
 
@@ -2573,8 +2822,12 @@ def daily_profile_scan(
         if event.get("side") == "BUY"
     ]
     new_buys.sort(key=lambda row: parse_dt(row.get("acted_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)
+    gen_at = now_kst()
+    effective_until = gen_at - dt.timedelta(hours=TOSS_TRADE_LAG_HOURS)
     output = {
-        "generated_at": now_kst().isoformat(),
+        "generated_at": gen_at.isoformat(),
+        "effective_data_until": effective_until.isoformat(),
+        "toss_lag_hours_applied": TOSS_TRADE_LAG_HOURS,
         "mode": "daily-profile-scan-read-only",
         "risk_note": "Uses the user's logged-in browser session. It cannot be made invisible to the service.",
         "profile_limit": profile_limit,
@@ -5349,10 +5602,302 @@ def _grade_label(grade: int | None) -> str:
     return {100: "★★★★★", 75: "★★★★", 50: "★★★", 25: "★★", 0: "★"}.get(grade, "-")
 
 
-def _render_recommendation_rows(recs: list[dict[str, Any]]) -> str:
-    """Build <tr> rows for the recommendation table."""
+def _compute_sell_score(
+    *,
+    pnl: float | None,
+    worst: float | None,
+    buy_count: int,
+    sell_count: int,
+    buyer_vs_me: float | None,
+    seller_vs_me: float | None,
+) -> tuple[int | None, list[str]]:
+    """Sell pressure score 0~100 (higher = stronger sell). Returns (score, components).
+
+    None if total trades < 3 (데이터 부족)."""
+    total = (buy_count or 0) + (sell_count or 0)
+    if total < 3:
+        return None, []
+    score = 0.0
+    breakdown: list[str] = []
+
+    if worst is not None:
+        comp = max(0.0, 30.0 - worst * 0.5)
+        score += comp
+        breakdown.append(f"h-score 약함(worst {worst:.1f}) +{comp:.0f}")
+
+    ratio = (sell_count or 0) / total
+    comp = ratio * 30.0
+    score += comp
+    breakdown.append(f"매도 비율 {ratio*100:.0f}% +{comp:.0f}")
+
+    if pnl is not None and pnl < -0.03 and seller_vs_me is not None and seller_vs_me < 0.98:
+        score += 20
+        breakdown.append("손실 중 + 신뢰자 매도 평단 내 평단 아래 +20")
+    elif pnl is not None and pnl > 0.10 and seller_vs_me is not None and seller_vs_me <= 1.02:
+        score += 15
+        breakdown.append("수익 +10% + 매도 시작 +15")
+
+    if buyer_vs_me is not None and buyer_vs_me > 1.03:
+        score -= 15
+        breakdown.append("신뢰자가 내 평단 위에서 매수 -15")
+
+    final = max(0, min(100, round(score)))
+    return final, breakdown
+
+
+def _toss_stock_cell(symbol: str, stock_code: Any) -> str:
+    """Render <td class="sym"> linking to the Toss stock page when stock_code exists."""
+    if stock_code:
+        href = f"https://www.tossinvest.com/stocks/{urllib.parse.quote(str(stock_code))}"
+        return (
+            f'<td class="sym"><a href="{href}" target="_blank" rel="noopener">'
+            f'{html.escape(symbol)}</a></td>'
+        )
+    return f'<td class="sym">{html.escape(symbol)}</td>'
+
+
+def _toss_profile_link(profile_id: Any, label: str) -> str:
+    """Render an anchor to a Toss profile when profile_id exists."""
+    if profile_id:
+        href = f"https://www.tossinvest.com/community/profile/{urllib.parse.quote(str(profile_id))}"
+        return (
+            f'<a href="{href}" target="_blank" rel="noopener">'
+            f'{html.escape(label)}</a>'
+        )
+    return html.escape(label)
+
+
+def _trader_detail_rows(traders: list[dict[str, Any]], currency: str | None) -> str:
+    """Build <tr> rows for the buyer/seller detail mini-table."""
+    if not traders:
+        return '<tr><td colspan="6" class="bs-empty">기록 없음</td></tr>'
+    parts: list[str] = []
+    for t in traders:
+        author = t.get("author") or t.get("profile_id") or "?"
+        pid = t.get("profile_id")
+        avg_p = t.get("avg_price")
+        amt = t.get("total_amount") or 0
+        ev_n = t.get("event_count") or 0
+        when_raw = t.get("latest_at") or ""
+        rel_val = t.get("composite_win")
+        if rel_val is None:
+            rel_val = t.get("h4_win")
+        try:
+            if when_raw:
+                when_dt = dt.datetime.fromisoformat(when_raw)
+                if when_dt.tzinfo is not None:
+                    when_dt = when_dt.astimezone(dt.timezone(dt.timedelta(hours=9)))
+                when = when_dt.strftime("%m-%d %H:%M")
+            else:
+                when = "-"
+        except (ValueError, TypeError):
+            when = when_raw[:16] if when_raw else "-"
+        rel_str = f"{rel_val:.0f}" if isinstance(rel_val, (int, float)) else "-"
+        parts.append(
+            "<tr>"
+            f"<td>{_toss_profile_link(pid, str(author))}</td>"
+            f"<td>{rel_str}</td>"
+            f"<td>{_format_money_simple(avg_p, currency)}</td>"
+            f"<td>{_format_money_simple(amt, 'KRW') if amt else '-'}</td>"
+            f"<td>{ev_n}회</td>"
+            f"<td>{html.escape(when)}</td>"
+            "</tr>"
+        )
+    return "".join(parts)
+
+
+def _buy_sell_cell(r: dict[str, Any]) -> str:
+    """Render the buy/sell count cell with a <details> dropdown listing per-trader info."""
+    buy_n = r.get("buy_count", 0)
+    sell_n = r.get("sell_count", 0)
+    buyers = r.get("buyers") or []
+    sellers = r.get("sellers") or []
+    cur = r.get("currency")
+    if not buyers and not sellers:
+        return f'<td>{buy_n} / {sell_n}</td>'
+    detail = (
+        '<table class="bs-table">'
+        '<thead><tr><th>유저</th><th>종합신뢰도</th><th>평단</th><th>금액(원)</th><th>거래</th><th>최근</th></tr></thead>'
+        f'<tbody class="bs-buy-rows"><tr class="bs-section"><td colspan="6">매수 ({buy_n}명)</td></tr>'
+        f'{_trader_detail_rows(buyers, cur)}'
+        f'<tr class="bs-section"><td colspan="6">매도 ({sell_n}명)</td></tr>'
+        f'{_trader_detail_rows(sellers, cur)}'
+        '</tbody></table>'
+    )
+    return (
+        '<td class="bs-cell"><details><summary>'
+        f'<span class="bs-counts">{buy_n} / {sell_n}</span>'
+        '</summary>'
+        f'{detail}'
+        '</details></td>'
+    )
+
+
+def _build_rec_verdict(r: dict[str, Any]) -> str:
+    """Plain-text explanation paragraph for a recommendation card."""
+    composite = r.get("composite_score") or 0
+    entry_label = r.get("entry_label") or "-"
+    gap = r.get("price_gap_pct")
+    buy_n = r.get("buy_count") or 0
+    sell_n = r.get("sell_count") or 0
+    avg_buyer_h4 = r.get("avg_buyer_h4_win")
+    er = r.get("expected_returns") or {}
+
+    lines: list[str] = []
+    if composite >= 50:
+        lines.append(f"종합 점수 {composite:.1f} — 강한 매수 신호 (매수자 우세 + 신뢰도 양호).")
+    elif composite >= 30:
+        lines.append(f"종합 점수 {composite:.1f} — 양호한 매수 신호.")
+    elif composite >= 15:
+        lines.append(f"종합 점수 {composite:.1f} — 약한 신호. 매수/매도 비슷한 강도이거나 거래량 적음.")
+    else:
+        lines.append(f"종합 점수 {composite:.1f} — 매우 약함 또는 매도 우세.")
+
+    gap_pct_str = f"{gap:+.1f}%" if gap is not None else "-"
+    if entry_label == "진입가능+":
+        lines.append(
+            f"진입 판단: 진입가능+ — 현재가가 신뢰자 평단 대비 {gap_pct_str} (3%+ 낮음). "
+            "좋은 진입가 → 점수에 가격 보너스 반영됨."
+        )
+    elif entry_label == "진입가능":
+        lines.append(
+            f"진입 판단: 진입가능 — 현재가가 신뢰자 평단과 비슷 ({gap_pct_str}). 무리없이 진입."
+        )
+    elif entry_label == "소액진입":
+        lines.append(
+            f"진입 판단: 소액진입 — 현재가가 신뢰자 평단보다 {gap_pct_str} 비쌈. 추격 위험, 소액만."
+        )
+    elif entry_label == "추격금지":
+        lines.append(
+            f"진입 판단: 추격금지 — 현재가가 신뢰자 평단보다 {gap_pct_str} 비쌈. "
+            "추격 보류 → 점수에 가격 페널티 반영됨."
+        )
+
+    rel_str = f"{avg_buyer_h4:.1f}" if isinstance(avg_buyer_h4, (int, float)) else "-"
+    lines.append(
+        f"7일 윈도우 활동: 매수 {buy_n}명 vs 매도 {sell_n}명 / 매수자 평균 4h 승률 {rel_str}."
+    )
+
+    h24_er = er.get("h24") or {}
+    h72_er = er.get("h72") or {}
+    if h24_er.get("avg_return") is not None and (h24_er.get("n_samples") or 0) >= 3:
+        pct_v = h24_er["avg_return"] * 100
+        n = h24_er.get("n_samples") or 0
+        lines.append(
+            f"이 종목 신뢰자 historical 24h 평균 수익률: {pct_v:+.2f}% (샘플 {n}건)."
+        )
+    elif h72_er.get("avg_return") is not None and (h72_er.get("n_samples") or 0) >= 3:
+        pct_v = h72_er["avg_return"] * 100
+        n = h72_er.get("n_samples") or 0
+        lines.append(
+            f"이 종목 신뢰자 historical 72h 평균 수익률: {pct_v:+.2f}% (샘플 {n}건)."
+        )
+
+    return "\n".join(lines)
+
+
+def _render_recommendation_dialog(idx: int, r: dict[str, Any]) -> str:
+    """Build a <dialog> with full breakdown for one recommendation."""
+    sym = r.get("symbol") or "-"
+    composite = r.get("composite_score") or 0
+    entry_label = r.get("entry_label") or "-"
+    cur_price = r.get("current_price")
+    currency = r.get("currency")
+    avg_buy_price = r.get("avg_buy_price")
+    gap = r.get("price_gap_pct")
+    scores = r.get("scores") or {}
+    er = r.get("expected_returns") or {}
+
+    horizon_rows = []
+    for h_key, h_label in (("h4", "4h"), ("h24", "24h"), ("h72", "72h"), ("h144", "144h")):
+        s = scores.get(h_key)
+        e = er.get(h_key) or {}
+        avg_ret = e.get("avg_return")
+        grade = e.get("grade")
+        n = e.get("n_samples")
+        avg_str = f"{avg_ret*100:+.2f}%" if isinstance(avg_ret, (int, float)) else "-"
+        grade_str = _grade_label(grade) if grade is not None else "-"
+        n_str = f"n={n}" if n else "n=0"
+        horizon_rows.append(
+            "<tr>"
+            f"<th>{h_label}</th>"
+            f'<td class="{_score_color_class(s)}">{s if s is not None else "-"}</td>'
+            f'<td class="grade-{grade}">{grade_str}</td>'
+            f'<td>{avg_str}</td>'
+            f'<td class="muted">{n_str}</td>'
+            "</tr>"
+        )
+
+    verdict = _build_rec_verdict(r)
+    buyers_top = (r.get("buyers") or [])[:15]
+    sellers_top = (r.get("sellers") or [])[:15]
+    gap_str = f"{gap:+.2f}%" if gap is not None else "-"
+
+    return (
+        f'<dialog id="rec-dlg-{idx}" class="judge-dialog">'
+        f'<header><h3>{html.escape(sym)} — 종합 {composite:.1f} · {html.escape(entry_label)}</h3>'
+        f'<button class="close-btn" type="button">✕</button></header>'
+        f'<section><h4>📊 시그널 요약</h4><table>'
+        f'<tr><th>현재가</th><td>{_format_money_simple(cur_price, currency)}</td></tr>'
+        f'<tr><th>신뢰자 평균 매수가</th><td>{_format_money_simple(avg_buy_price, currency)}</td></tr>'
+        f'<tr><th>현재가 갭</th><td>{gap_str}</td></tr>'
+        f'<tr><th>종합 점수</th><td class="{_score_color_class(composite)}">{composite:.1f}</td></tr>'
+        f'<tr><th>진입 판단</th><td>{html.escape(entry_label)}</td></tr>'
+        f'</table></section>'
+        f'<section><h4>🎯 4 Horizon — 점수 · 등급 · historical 평균 수익률</h4>'
+        f'<table class="horizon-table"><thead><tr>'
+        f'<th>기간</th><th>점수</th><th>수익 등급</th><th>평균</th><th>샘플</th>'
+        f'</tr></thead><tbody>{"".join(horizon_rows)}</tbody></table>'
+        f'<div class="hint">점수: ≥50 강매수 / 30~50 양호 / 0~30 약함 / &lt;0 매도 우세 · '
+        f'등급: 100=강수익, 75=수익, 50=중립, 25=손실, 0=강한손실</div></section>'
+        f'<section class="why-section"><h4>💡 판단 근거</h4>'
+        f'<p class="why-text">{html.escape(verdict)}</p></section>'
+        f'<section><h4>🛒 매수자 Top {len(buyers_top)} (최근순)</h4>'
+        f'<table class="trader-list"><thead><tr>'
+        f'<th>유저</th><th>종합신뢰도</th><th>평단</th><th>금액</th><th>거래</th><th>최근</th>'
+        f'</tr></thead><tbody>{_trader_detail_rows(buyers_top, currency)}</tbody></table></section>'
+        f'<section><h4>📤 매도자 Top {len(sellers_top)} (최근순)</h4>'
+        f'<table class="trader-list"><thead><tr>'
+        f'<th>유저</th><th>종합신뢰도</th><th>평단</th><th>금액</th><th>거래</th><th>최근</th>'
+        f'</tr></thead><tbody>{_trader_detail_rows(sellers_top, currency)}</tbody></table></section>'
+        f'</dialog>'
+    )
+
+
+def _render_recommendation_rows(recs: list[dict[str, Any]], generated_at: str | None = None) -> tuple[str, str]:
+    """Build <tr> rows + per-row <dialog> elements for the recommendation table."""
     rows_html: list[str] = []
-    for r in recs:
+    dialogs_html: list[str] = []
+    KST = dt.timezone(dt.timedelta(hours=9))
+    cutoff_4h: dt.datetime | None = None
+    if generated_at:
+        try:
+            gen_dt = dt.datetime.fromisoformat(generated_at)
+            if gen_dt.tzinfo is None:
+                gen_dt = gen_dt.replace(tzinfo=KST)
+            cutoff_4h = gen_dt - dt.timedelta(hours=4)
+        except (TypeError, ValueError):
+            cutoff_4h = None
+
+    def _count_recent(traders: list[dict[str, Any]] | None) -> int:
+        if not traders or cutoff_4h is None:
+            return 0
+        n = 0
+        for t in traders:
+            ts = t.get("latest_at")
+            if not ts:
+                continue
+            try:
+                tdt = dt.datetime.fromisoformat(ts)
+                if tdt.tzinfo is None:
+                    tdt = tdt.replace(tzinfo=KST)
+                if tdt >= cutoff_4h:
+                    n += 1
+            except (TypeError, ValueError):
+                pass
+        return n
+
+    for idx, r in enumerate(recs):
         sym = r.get("symbol") or "-"
         cp = r.get("current_price")
         cur = r.get("currency") or ""
@@ -5378,14 +5923,22 @@ def _render_recommendation_rows(recs: list[dict[str, Any]]) -> str:
         for v in [h4_r, h24_r, h72_r, h144_r]:
             if v is not None and abs(v) * 100 > max_abs_return_pct:
                 max_abs_return_pct = abs(v) * 100
+        latest_trade_at = ""
+        for t in (r.get("buyers") or []) + (r.get("sellers") or []):
+            ts = t.get("latest_at") or ""
+            if ts and ts > latest_trade_at:
+                latest_trade_at = ts
         rows_html.append(
             f'<tr data-composite="{composite}" data-h4="{h4_s or 0}" data-h24="{h24_s or 0}" '
             f'data-h72="{h72_s or 0}" data-h144="{h144_s or 0}" '
             f'data-max-grade="{max_grade}" data-max-abs-return="{max_abs_return_pct:.2f}" '
-            f'data-currency="{html.escape(cur or "")}">'
-            f'<td class="sym">{html.escape(sym)}</td>'
+            f'data-currency="{html.escape(cur or "")}" '
+            f'data-latest-at="{html.escape(latest_trade_at)}">'
+            f'{_toss_stock_cell(sym, r.get("stock_code"))}'
             f'<td>{_format_money_simple(cp, cur)}</td>'
-            f'<td class="composite {_score_color_class(composite)}"><b>{composite:.1f}</b></td>'
+            f'<td class="composite {_score_color_class(composite)}">'
+            f'<button type="button" class="judge-btn rec-judge-btn" data-judge="rec-dlg-{idx}">'
+            f'<b>{composite:.1f}</b></button></td>'
             f'<td class="{_score_color_class(h4_s)}">{h4_s if h4_s is not None else "-"}</td>'
             f'<td class="{_score_color_class(h24_s)}">{h24_s if h24_s is not None else "-"}</td>'
             f'<td class="{_score_color_class(h72_s)}">{h72_s if h72_s is not None else "-"}</td>'
@@ -5394,24 +5947,32 @@ def _render_recommendation_rows(recs: list[dict[str, Any]]) -> str:
             f'<td class="ret">{_format_pct(h24_r)}</td>'
             f'<td class="ret">{_format_pct(h72_r)}</td>'
             f'<td class="ret">{_format_pct(h144_r)}</td>'
-            f'<td>{r.get("buy_count", 0)} / {r.get("sell_count", 0)}</td>'
-            f'<td>{_format_money_simple(r.get("avg_buy_price"), cur)}</td>'
+            f'{_buy_sell_cell(r)}'
+            + (lambda rb, rs: (
+                '<td class="recent-cell empty">—</td>' if (rb == 0 and rs == 0)
+                else f'<td class="recent-cell {"buy-dominant" if rb > rs else "sell-dominant" if rs > rb else "neutral"}" '
+                     f'data-recent-buy="{rb}" data-recent-sell="{rs}">'
+                     f'<span class="rb">{rb}↑</span> <span class="rs">{rs}↓</span></td>'
+            ))(_count_recent(r.get("buyers")), _count_recent(r.get("sellers")))
+            + f'<td>{_format_money_simple(r.get("avg_buy_price"), cur)}</td>'
             f'<td>{_format_pct(r.get("price_gap_pct")/100 if r.get("price_gap_pct") is not None else None)}</td>'
             f'<td class="lbl-{html.escape(r.get("entry_label","-"))}">{html.escape(r.get("entry_label","-"))}</td>'
             f'</tr>'
         )
-    return "".join(rows_html)
+        dialogs_html.append(_render_recommendation_dialog(idx, r))
+    return "".join(rows_html), "".join(dialogs_html)
 
 
 def _render_my_holdings_rows(
     recs_by_symbol: dict[str, dict[str, Any]],
-) -> tuple[str, int]:
-    """Render <tr> rows for 'my holdings sell judgment' table.
+) -> tuple[str, str, int]:
+    """Render <tr> rows + per-row <dialog> elements for 'my holdings sell judgment' table.
     Looks up each held symbol in recommendations data."""
     holdings = load_user_holdings()
     rows: list[str] = []
+    dialogs: list[str] = []
     alert_count = 0
-    for sym, info in holdings.items():
+    for idx, (sym, info) in enumerate(holdings.items()):
         my_avg = info.get("avg_price")
         currency = info.get("currency") or "USD"
         shares = info.get("shares")
@@ -5419,6 +5980,13 @@ def _render_my_holdings_rows(
         # Find score from recommendations
         rec = recs_by_symbol.get(sym) or recs_by_symbol.get(stock_code or "")
         cur_price = rec.get("current_price") if rec else None
+        if cur_price is None:
+            # Holdings not in recommendation pool — fetch live quote directly.
+            quote = fetch_public_quote(sym, stock_code, force_refresh=True)
+            if quote and quote.get("price"):
+                cur_price = float(quote["price"])
+                if quote.get("currency"):
+                    currency = quote["currency"]
         composite = rec.get("composite_score") if rec else None
         scores = (rec or {}).get("scores") or {}
         h4 = scores.get("h4")
@@ -5431,22 +5999,175 @@ def _render_my_holdings_rows(
                 pnl = float(cur_price) / float(my_avg) - 1.0
             except (TypeError, ValueError, ZeroDivisionError):
                 pnl = None
-        # Sell alert label
+
+        # Sell judgment matrix: 내 평단 + PnL + 신뢰자 매수/매도 평단 결합
+        rec_data = rec or {}
+        buy_count = rec_data.get("buy_count") or 0
+        sell_count = rec_data.get("sell_count") or 0
+        buyer_avg = rec_data.get("avg_buy_price")
+        seller_prices = [
+            t.get("avg_price")
+            for t in (rec_data.get("sellers") or [])
+            if t.get("avg_price")
+        ]
+        seller_avg = sum(seller_prices) / len(seller_prices) if seller_prices else None
+
+        buyer_vs_me = (buyer_avg / my_avg) if (buyer_avg and my_avg) else None
+        seller_vs_me = (seller_avg / my_avg) if (seller_avg and my_avg) else None
         worst = min([s for s in [h4, h24, h72, h144] if s is not None] or [0])
-        if worst <= -50:
-            alert = "강한 매도 ⚠⚠"
+        total_trades = buy_count + sell_count
+
+        pnl_pct = f"{pnl*100:+.2f}%" if pnl is not None else "-"
+        bvm_pct = f"{(buyer_vs_me-1)*100:+.1f}%" if buyer_vs_me is not None else "-"
+        svm_pct = f"{(seller_vs_me-1)*100:+.1f}%" if seller_vs_me is not None else "-"
+
+        sell_score, sell_breakdown = _compute_sell_score(
+            pnl=pnl, worst=worst,
+            buy_count=buy_count, sell_count=sell_count,
+            buyer_vs_me=buyer_vs_me, seller_vs_me=seller_vs_me,
+        )
+
+        if total_trades < 3:
+            alert = "⏸ 데이터 부족"
+            reason = (
+                f"7일 윈도우 신뢰자 거래 {total_trades}건 (매수 {buy_count}/매도 {sell_count}).\n"
+                "거래량이 너무 적어 매도 신호를 산정할 수 없음."
+            )
+        elif (
+            pnl is not None
+            and pnl < -0.03
+            and seller_vs_me is not None
+            and seller_vs_me < 0.98
+        ):
+            alert = "🔴 손절 검토"
             alert_count += 1
-        elif worst <= -30:
-            alert = "매도 검토 ⚠"
+            reason = (
+                f"내 PnL {pnl_pct} (손실 중).\n"
+                f"신뢰자 매도 평단이 내 진입가 대비 {svm_pct} = 내 평단 아래에서 던지는 중.\n"
+                "스마트머니가 내가 산 가격보다 싸게 정리 → 추가 하락 가능성."
+            )
+        elif (
+            pnl is not None
+            and pnl > 0.10
+            and sell_count >= 1
+            and seller_vs_me is not None
+            and seller_vs_me <= 1.02
+        ):
+            alert = "🟠 차익실현 검토"
             alert_count += 1
-        elif worst <= 0:
-            alert = "주의"
+            reason = (
+                f"내 PnL {pnl_pct} (충분히 수익권).\n"
+                f"신뢰자 매도 {sell_count}명, 매도 평단이 내 평단 {svm_pct} 근처/이하.\n"
+                "이미 수익 + 스마트머니도 정리 시작 → 차익실현 검토 시점."
+            )
+        elif buyer_vs_me is not None and buyer_vs_me > 1.03 and worst >= 30:
+            alert = "🟢 강한 보유"
+            reason = (
+                f"신뢰자 매수 평단이 내 평단 대비 {bvm_pct} = 더 비싸게 들어오는 중.\n"
+                f"4 horizon 최저 점수 {worst:.1f} (≥30, 양호).\n"
+                "스마트머니가 위에서 매수 + 점수도 양호 = 추세 강세."
+            )
+        elif worst >= 30:
+            alert = "🟢 보유 유지"
+            reason = (
+                f"4 horizon 최저 점수 {worst:.1f} (≥30).\n"
+                f"매수 {buy_count} / 매도 {sell_count}.\n"
+                "양호한 매수 신호. 현 추세 유지 판단."
+            )
+        elif sell_count >= max(3, buy_count * 1.5):
+            alert = "🟠 매도 우세 주의"
+            alert_count += 1
+            reason = (
+                f"매수 {buy_count}명 vs 매도 {sell_count}명.\n"
+                "매도자가 매수 대비 1.5배 이상 = 매도 압력 강함. 추가 손실 전 점검 필요."
+            )
+        elif worst >= 0:
+            alert = "🟡 약한 신호"
+            reason = (
+                f"4 horizon 최저 점수 {worst:.1f} (0~30 약함).\n"
+                f"매수 {buy_count} vs 매도 {sell_count} — 양측 비슷한 강도 또는 거래량 적음.\n"
+                "명확한 방향 없음. 다른 종목 후보 확인."
+            )
         else:
-            alert = "보유 유지"
+            alert = "🔴 매도 검토"
+            alert_count += 1
+            reason = (
+                f"4 horizon 최저 점수 {worst:.1f} (음수).\n"
+                f"매수 {buy_count} vs 매도 {sell_count}.\n"
+                "매도자의 신뢰도×규모가 매수자를 압도 = 매도 시그널."
+            )
+
+        dlg_id = f"judge-dlg-{idx}"
+        gain_money = None
+        if cur_price is not None and my_avg is not None and shares is not None:
+            try:
+                gain_money = (float(cur_price) - float(my_avg)) * float(shares)
+            except (TypeError, ValueError):
+                gain_money = None
+        buyer_event_count = rec_data.get("buy_event_count") or 0
+        seller_event_count = rec_data.get("sell_event_count") or 0
+        buyer_avg_str = (
+            f"{_format_money_simple(buyer_avg, currency)} "
+            f"<span class='delta'>({bvm_pct} vs 내 평단)</span>"
+            if buyer_avg is not None
+            else "-"
+        )
+        seller_avg_str = (
+            f"{_format_money_simple(seller_avg, currency)} "
+            f"<span class='delta'>({svm_pct} vs 내 평단)</span>"
+            if seller_avg is not None
+            else "-"
+        )
+        buyers_top = (rec_data.get("buyers") or [])[:10]
+        sellers_top = (rec_data.get("sellers") or [])[:10]
+
+        dialogs.append(
+            f'<dialog id="{dlg_id}" class="judge-dialog">'
+            f'<header><h3>{html.escape(sym)} — {html.escape(alert)}</h3>'
+            f'<button class="close-btn" type="button">✕</button></header>'
+            f'<section><h4>📊 내 보유</h4><table>'
+            f'<tr><th>수량</th><td>{html.escape(str(shares))}</td></tr>'
+            f'<tr><th>내 평단</th><td>{_format_money_simple(my_avg, currency)}</td></tr>'
+            f'<tr><th>현재가</th><td>{_format_money_simple(cur_price, currency) if cur_price else "-"}</td></tr>'
+            f'<tr><th>PnL</th><td class="{_score_color_class((pnl or 0)*100 + 50)}">{pnl_pct}</td></tr>'
+            f'<tr><th>평가손익</th><td class="{_score_color_class((pnl or 0)*100 + 50)}">{_format_money_simple(gain_money, currency) if gain_money is not None else "-"}</td></tr>'
+            f'<tr><th>매도 점수</th><td class="{_score_color_class(100 - (sell_score or 0))}">'
+            f'{sell_score if sell_score is not None else "-"} / 100</td></tr>'
+            f'</table></section>'
+            + (
+                f'<section><h4>📈 매도 점수 분해 ({sell_score}/100)</h4><table>'
+                + "".join(f'<tr><th>•</th><td>{html.escape(b)}</td></tr>' for b in sell_breakdown)
+                + '</table><div class="hint">높을수록 매도 신호 강함 (0=강한 보유 / 100=강한 매도)</div></section>'
+                if sell_score is not None else ''
+            )
+            + f'<section><h4>🎯 4 Horizon 점수 (worst {worst:.1f})</h4><table>'
+            f'<tr><th>4h</th><td class="{_score_color_class(h4)}">{h4 if h4 is not None else "-"}</td></tr>'
+            f'<tr><th>24h</th><td class="{_score_color_class(h24)}">{h24 if h24 is not None else "-"}</td></tr>'
+            f'<tr><th>72h</th><td class="{_score_color_class(h72)}">{h72 if h72 is not None else "-"}</td></tr>'
+            f'<tr><th>144h</th><td class="{_score_color_class(h144)}">{h144 if h144 is not None else "-"}</td></tr>'
+            f'</table><div class="hint">기준 — ≥50 강한 매수 / 30~50 양호 / 0~30 약함 / &lt;0 매도 우세</div></section>'
+            f'<section><h4>👥 신뢰자 활동 (지난 7일)</h4><table>'
+            f'<tr><th>매수자</th><td>{buy_count}명 (총 {buyer_event_count}회 매수)</td></tr>'
+            f'<tr><th>매도자</th><td>{sell_count}명 (총 {seller_event_count}회 매도)</td></tr>'
+            f'<tr><th>매수 평단</th><td>{buyer_avg_str}</td></tr>'
+            f'<tr><th>매도 평단</th><td>{seller_avg_str}</td></tr>'
+            f'</table></section>'
+            f'<section class="why-section"><h4>💡 판단 근거</h4>'
+            f'<p class="why-text">{html.escape(reason)}</p></section>'
+            f'<section><h4>🛒 매수자 Top (최근순)</h4>'
+            f'<table class="trader-list"><thead><tr>'
+            f'<th>유저</th><th>종합신뢰도</th><th>평단</th><th>금액</th><th>거래</th><th>최근</th>'
+            f'</tr></thead><tbody>{_trader_detail_rows(buyers_top, currency)}</tbody></table></section>'
+            f'<section><h4>📤 매도자 Top (최근순)</h4>'
+            f'<table class="trader-list"><thead><tr>'
+            f'<th>유저</th><th>종합신뢰도</th><th>평단</th><th>금액</th><th>거래</th><th>최근</th>'
+            f'</tr></thead><tbody>{_trader_detail_rows(sellers_top, currency)}</tbody></table></section>'
+            f'</dialog>'
+        )
 
         rows.append(
             f'<tr>'
-            f'<td class="sym">{html.escape(sym)}</td>'
+            f'{_toss_stock_cell(sym, stock_code)}'
             f'<td>{html.escape(str(shares))}</td>'
             f'<td>{_format_money_simple(my_avg, currency)}</td>'
             f'<td>{_format_money_simple(cur_price, currency) if cur_price else "-"}</td>'
@@ -5455,20 +6176,134 @@ def _render_my_holdings_rows(
             f'<td class="{_score_color_class(h24)}">{h24 if h24 is not None else "-"}</td>'
             f'<td class="{_score_color_class(h72)}">{h72 if h72 is not None else "-"}</td>'
             f'<td class="{_score_color_class(h144)}">{h144 if h144 is not None else "-"}</td>'
-            f'<td>{html.escape(alert)}</td>'
+            f'<td class="sell-score {_score_color_class(100 - (sell_score or 0))}">'
+            f'{sell_score if sell_score is not None else "-"}</td>'
+            f'<td class="judge">'
+            f'<button type="button" class="judge-btn" data-judge="{dlg_id}">{html.escape(alert)}</button>'
+            f'</td>'
             f'</tr>'
         )
-    return "".join(rows), alert_count
+    return "".join(rows), "".join(dialogs), alert_count
+
+
+def _render_performance_rows(limit: int = 500) -> tuple[str, dict[str, Any]]:
+    """추천 성과 탭의 <tr> rows + 집계 통계 반환."""
+    if not REC_PERFORMANCE_LOG_PATH.exists():
+        return "", {"total": 0, "by_horizon": {}}
+    text = REC_PERFORMANCE_LOG_PATH.read_text(encoding="utf-8")
+    records = [json.loads(line) for line in text.splitlines() if line.strip()]
+    # 최신 snap_at 우선 정렬
+    records.sort(key=lambda r: r.get("snap_at") or "", reverse=True)
+
+    rows: list[str] = []
+    horizons = ["h4", "h24", "h72", "h144"]
+
+    # 집계 (전체 기준, limit 안 받음)
+    stats: dict[str, Any] = {"total": len(records), "by_horizon": {}}
+    for h in horizons:
+        returns = [r.get("horizon_returns", {}).get(h) for r in records]
+        returns = [v for v in returns if v is not None]
+        if returns:
+            stats["by_horizon"][h] = {
+                "matured": len(returns),
+                "avg_return": sum(returns) / len(returns),
+                "win_rate": sum(1 for v in returns if v > 0) / len(returns),
+                "median_return": sorted(returns)[len(returns) // 2],
+            }
+        else:
+            stats["by_horizon"][h] = {"matured": 0, "avg_return": None, "win_rate": None}
+
+    # 표시는 limit개
+    for rec in records[:limit]:
+        snap_at_raw = rec.get("snap_at") or ""
+        try:
+            snap_dt = dt.datetime.fromisoformat(snap_at_raw)
+            if snap_dt.tzinfo is None:
+                snap_dt = snap_dt.replace(tzinfo=dt.timezone(dt.timedelta(hours=9)))
+            snap_dt = snap_dt.astimezone(dt.timezone(dt.timedelta(hours=9)))
+            snap_display = snap_dt.strftime("%m-%d %H:%M")
+        except (ValueError, TypeError):
+            snap_display = snap_at_raw[:16]
+        sym = rec.get("symbol") or "-"
+        code = rec.get("stock_code")
+        cur = rec.get("currency") or ""
+        snap_price = rec.get("snap_price")
+        composite = rec.get("composite_score") or 0
+        entry = rec.get("entry_label") or "-"
+        cells_per_horizon = []
+        for h in horizons:
+            ret = rec.get("horizon_returns", {}).get(h)
+            price = rec.get("horizon_prices", {}).get(h)
+            if ret is None:
+                # 아직 만료 안 됨 or 데이터 없음
+                cells_per_horizon.append('<td class="perf-pending">⏳</td>')
+            else:
+                cls = "pos2" if ret >= 0.03 else "pos1" if ret > 0 else "neg2" if ret <= -0.03 else "neg1"
+                cells_per_horizon.append(
+                    f'<td class="perf-ret {cls}" title="실제가 {price}">{ret*100:+.2f}%</td>'
+                )
+        rows.append(
+            "<tr>"
+            f'<td>{html.escape(snap_display)}</td>'
+            f'{_toss_stock_cell(sym, code)}'
+            f'<td>{_format_money_simple(snap_price, cur)}</td>'
+            f'<td class="composite {_score_color_class(composite)}"><b>{composite:.1f}</b></td>'
+            f'<td class="lbl-{html.escape(entry)}">{html.escape(entry)}</td>'
+            + "".join(cells_per_horizon)
+            + f'<td>{rec.get("buy_count", 0)}/{rec.get("sell_count", 0)}</td>'
+            + "</tr>"
+        )
+    return "".join(rows), stats
+
+
+def _render_performance_summary(stats: dict[str, Any]) -> str:
+    """집계 통계 HTML."""
+    total = stats.get("total", 0)
+    horizons = [("h4", "4h"), ("h24", "24h"), ("h72", "72h"), ("h144", "144h")]
+    cells = []
+    for h_key, h_label in horizons:
+        h_stat = (stats.get("by_horizon") or {}).get(h_key) or {}
+        matured = h_stat.get("matured", 0)
+        avg = h_stat.get("avg_return")
+        win = h_stat.get("win_rate")
+        med = h_stat.get("median_return")
+        if matured == 0:
+            cells.append(
+                f'<div class="perf-stat-card"><div class="ph">{h_label}</div>'
+                f'<div class="pv muted">아직 만료된 추천 없음</div></div>'
+            )
+        else:
+            avg_cls = "pos" if (avg or 0) > 0 else "neg"
+            win_pct = win * 100 if win is not None else 0
+            cells.append(
+                f'<div class="perf-stat-card">'
+                f'<div class="ph">{h_label} <span class="muted">({matured}건 만료)</span></div>'
+                f'<div class="pv {avg_cls}">평균 {avg*100:+.2f}%</div>'
+                f'<div class="psub">중앙 {med*100:+.2f}% · 승률 {win_pct:.0f}%</div>'
+                f'</div>'
+            )
+    return (
+        f'<div class="perf-summary"><div class="perf-summary-title">'
+        f'📈 집계 (전체 {total} 스냅샷)</div>'
+        f'<div class="perf-cards">{"".join(cells)}</div></div>'
+    )
 
 
 def _render_trusted_pool_rows() -> tuple[str, int]:
-    """Render <tr> rows for the trusted user pool table."""
+    """Render <tr> rows for the trusted user pool table, sorted by composite (avg of horizons) descending."""
     if not PROFILE_RELIABILITY_MULTI_PATH.exists():
         return "", 0
     data = json.loads(PROFILE_RELIABILITY_MULTI_PATH.read_text(encoding="utf-8"))
     profs = data.get("profiles") or {}
+
+    def _composite_of(rec: dict[str, Any]) -> float:
+        wins = [rec.get(f"h{h}_win") for h in (4, 24, 72, 144)]
+        valid = [w for w in wins if w is not None]
+        return sum(valid) / len(valid) if valid else 0.0
+
+    sorted_entries = sorted(profs.items(), key=lambda kv: -_composite_of(kv[1]))
     rows: list[str] = []
-    for pid, r in profs.items():
+    for pid, r in sorted_entries:
         h4_w = r.get("h4_win")
         h24_w = r.get("h24_win")
         h72_w = r.get("h72_win")
@@ -5477,17 +6312,18 @@ def _render_trusted_pool_rows() -> tuple[str, int]:
         h24_g = r.get("h24_return_grade")
         h72_g = r.get("h72_return_grade")
         h144_g = r.get("h144_return_grade")
-        avg_win = sum(w for w in [h4_w, h24_w, h72_w, h144_w] if w is not None) / max(
-            1, sum(1 for w in [h4_w, h24_w, h72_w, h144_w] if w is not None)
-        )
+        valid_wins = [w for w in [h4_w, h24_w, h72_w, h144_w] if w is not None]
+        avg_win = sum(valid_wins) / len(valid_wins) if valid_wins else 0
+        avg_display = f"{avg_win:.1f}" if valid_wins else "-"
         rows.append(
             f'<tr data-h4="{h4_w or 0}" data-h24="{h24_w or 0}" '
             f'data-h72="{h72_w or 0}" data-h144="{h144_w or 0}" '
             f'data-avg="{avg_win:.2f}">'
-            f'<td class="sym">{html.escape(r.get("nickname") or "?")}</td>'
-            f'<td>{html.escape(pid)}</td>'
+            f'<td class="sym">{_toss_profile_link(pid, r.get("nickname") or "?")}</td>'
+            f'<td>{_toss_profile_link(pid, pid)}</td>'
             f'<td>{r.get("buy_event_count", 0)}</td>'
             f'<td>{r.get("unique_symbols", 0)}</td>'
+            f'<td class="composite {_score_color_class(avg_win if valid_wins else None)}"><b>{avg_display}</b></td>'
             f'<td class="{_score_color_class(h4_w)}">{h4_w if h4_w is not None else "-"}</td>'
             f'<td class="grade-{h4_g}">{_grade_label(h4_g)}</td>'
             f'<td class="{_score_color_class(h24_w)}">{h24_w if h24_w is not None else "-"}</td>'
@@ -5510,9 +6346,11 @@ def multi_horizon_dashboard_report() -> dict[str, Any]:
     all_scored = data.get("all_scored") or recs
     recs_by_symbol = {r["symbol"]: r for r in all_scored if r.get("symbol")}
 
-    rec_rows = _render_recommendation_rows(recs)
-    holdings_rows, holdings_alert = _render_my_holdings_rows(recs_by_symbol)
+    rec_rows, rec_dialogs = _render_recommendation_rows(recs, generated_at=data.get("generated_at"))
+    holdings_rows, holdings_dialogs, holdings_alert = _render_my_holdings_rows(recs_by_symbol)
     pool_rows, pool_size = _render_trusted_pool_rows()
+    perf_rows, perf_stats = _render_performance_rows()
+    perf_summary = _render_performance_summary(perf_stats)
 
     generated = data.get("generated_at") or now_kst().isoformat()
     summary = (
@@ -5530,7 +6368,57 @@ def multi_horizon_dashboard_report() -> dict[str, Any]:
         'body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Pretendard,sans-serif;'
         'background:#0d1117;color:#e6edf3;margin:0;padding:20px;}'
         'h1{font-size:22px;margin:0 0 8px;}'
-        '.meta{color:#8b949e;font-size:13px;margin-bottom:14px;}'
+        '.meta{color:#8b949e;font-size:13px;margin-bottom:8px;}'
+        '.refresh-bar{display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap;}'
+        '.refresh-bar button{background:#21262d;color:#e6edf3;border:1px solid #30363d;'
+        'padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12.5px;}'
+        '.refresh-bar button:hover:not(:disabled){background:#30363d;border-color:#58a6ff;color:#58a6ff;}'
+        '.refresh-bar button:disabled{opacity:0.5;cursor:not-allowed;}'
+        '.refresh-bar button.heavy{border-color:#d29922;color:#d29922;}'
+        '.refresh-bar button.heavy:hover:not(:disabled){background:rgba(210,153,34,0.12);border-color:#d29922;color:#d29922;}'
+        '.refresh-divider{display:inline-block;width:1px;height:18px;background:#30363d;margin:0 4px;}'
+        '#refresh-status{font-size:12px;color:#8b949e;}'
+        '#refresh-status.busy{color:#d29922;}'
+        '#refresh-status.ok{color:#3fb950;}'
+        '#refresh-status.err{color:#f85149;}'
+        '.status-panel{display:flex;gap:6px;align-items:center;flex-wrap:wrap;'
+        'font-size:11.5px;color:#8b949e;background:#0d1117;border:1px solid #21262d;'
+        'border-radius:6px;padding:6px 10px;margin-bottom:14px;}'
+        '.status-panel .status-sep{color:#30363d;}'
+        '.status-panel .ago{color:#e6edf3;font-weight:500;}'
+        '.status-panel .ago.stale-1{color:#d29922;}'   # 30분 ~ 2시간
+        '.status-panel .ago.stale-2{color:#f85149;}'   # 2시간+
+        '.status-panel .muted-extra{color:#484f58;}'
+        '.status-panel .cutoff-hint{color:#8b949e;font-size:10.5px;}'
+        '.perf-summary{background:#0d1117;border:1px solid #30363d;border-radius:6px;'
+        'padding:12px 14px;margin-bottom:14px;}'
+        '.perf-summary-title{color:#e6edf3;font-size:13.5px;font-weight:600;margin-bottom:8px;}'
+        '.perf-cards{display:flex;gap:10px;flex-wrap:wrap;}'
+        '.perf-stat-card{flex:1 1 180px;background:#161b22;border:1px solid #30363d;'
+        'border-radius:5px;padding:10px 12px;}'
+        '.perf-stat-card .ph{color:#8b949e;font-size:11.5px;margin-bottom:4px;}'
+        '.perf-stat-card .pv{font-size:15px;font-weight:600;}'
+        '.perf-stat-card .pv.pos{color:#3fb950;}'
+        '.perf-stat-card .pv.neg{color:#f85149;}'
+        '.perf-stat-card .pv.muted{color:#484f58;font-size:12px;font-weight:400;}'
+        '.perf-stat-card .psub{color:#8b949e;font-size:11px;margin-top:3px;}'
+        '.perf-stat-card .muted{color:#484f58;}'
+        'td.perf-ret{text-align:right;font-weight:500;}'
+        'td.perf-ret.pos2{color:#3fb950;}'
+        'td.perf-ret.pos1{color:#8ddc8c;}'
+        'td.perf-ret.neg1{color:#f0883e;}'
+        'td.perf-ret.neg2{color:#f85149;}'
+        'td.perf-pending{color:#484f58;text-align:center;}'
+        '.perf-footnote{color:#8b949e;font-size:11.5px;margin-top:10px;}'
+        '.progress-panel{background:#0d1117;border:1px solid #d29922;border-radius:6px;'
+        'padding:10px 14px;margin-bottom:14px;}'
+        '.progress-header{display:flex;align-items:center;gap:10px;margin-bottom:6px;font-size:12.5px;}'
+        '.progress-title{color:#d29922;font-weight:600;}'
+        '.progress-stage{color:#e6edf3;}'
+        '.progress-elapsed{color:#8b949e;margin-left:auto;}'
+        '.progress-log{font-family:Consolas,Menlo,monospace;font-size:11.5px;'
+        'background:#161b22;color:#8ddc8c;border-radius:4px;padding:8px 10px;margin:0;'
+        'max-height:200px;overflow-y:auto;white-space:pre-wrap;}'
         '.sort-bar{margin-bottom:12px;}'
         '.sort-bar button{background:#21262d;color:#e6edf3;border:1px solid #30363d;'
         'padding:6px 12px;margin-right:6px;border-radius:4px;cursor:pointer;font-size:13px;}'
@@ -5541,6 +6429,64 @@ def multi_horizon_dashboard_report() -> dict[str, Any]:
         'position:sticky;top:0;cursor:pointer;}'
         'th:first-child,td:first-child{text-align:left;}'
         'td.sym{font-weight:600;}'
+        'td.sym a, td.bs-cell a{color:#58a6ff;text-decoration:none;}'
+        'td.sym a:hover, td.bs-cell a:hover{text-decoration:underline;}'
+        'td.bs-cell details{cursor:pointer;}'
+        'td.bs-cell summary{list-style:none;outline:none;}'
+        'td.bs-cell summary::-webkit-details-marker{display:none;}'
+        'td.bs-cell summary::before{content:"\\25B8";margin-right:4px;color:#8b949e;font-size:10px;}'
+        'td.bs-cell details[open] summary::before{content:"\\25BE";}'
+        'td.bs-cell .bs-counts{font-weight:500;}'
+        'td.bs-cell .bs-table{width:100%;margin-top:6px;border-collapse:collapse;font-size:11.5px;background:#0d1117;}'
+        'td.bs-cell .bs-table th, td.bs-cell .bs-table td{padding:3px 6px;border:1px solid #21262d;text-align:right;}'
+        'td.bs-cell .bs-table th{background:#161b22;color:#8b949e;font-weight:500;}'
+        'td.bs-cell .bs-table tr.bs-section td{background:#161b22;color:#8b949e;text-align:left;font-weight:600;border-color:#30363d;}'
+        'td.bs-cell .bs-table td:first-child{text-align:left;}'
+        'td.bs-cell .bs-empty{color:#484f58;text-align:center;font-style:italic;}'
+        'th .th-sub{font-size:10px;color:#8b949e;font-weight:400;}'
+        'td.recent-cell{font-size:12px;text-align:center;white-space:nowrap;}'
+        'td.recent-cell.buy-dominant{color:#3fb950;font-weight:600;}'
+        'td.recent-cell.buy-dominant .rs{color:#8b949e;font-weight:400;}'
+        'td.recent-cell.sell-dominant{color:#f85149;font-weight:600;}'
+        'td.recent-cell.sell-dominant .rb{color:#8b949e;font-weight:400;}'
+        'td.recent-cell.neutral{color:#d29922;}'
+        'td.recent-cell.empty{color:#484f58;}'
+        'td.judge{padding:4px;}'
+        'button.judge-btn{background:transparent;color:inherit;border:1px solid transparent;'
+        'border-bottom:1px dashed #8b949e;cursor:pointer;font:inherit;padding:2px 6px;border-radius:4px;}'
+        'button.judge-btn:hover{border-color:#58a6ff;color:#58a6ff;background:rgba(88,166,255,0.08);}'
+        'button.rec-judge-btn{border-bottom:1px dashed #58a6ff;padding:0 4px;}'
+        'dialog.judge-dialog table.horizon-table th:first-child{color:#8b949e;width:50px;text-align:left;}'
+        'dialog.judge-dialog table.horizon-table td{text-align:right;}'
+        'dialog.judge-dialog .muted{color:#8b949e;}'
+        'dialog.judge-dialog{background:#161b22;color:#e6edf3;border:1px solid #30363d;'
+        'border-radius:10px;padding:0;max-width:760px;width:92%;'
+        'box-shadow:0 16px 48px rgba(0,0,0,0.6);}'
+        'dialog.judge-dialog::backdrop{background:rgba(0,0,0,0.6);}'
+        'dialog.judge-dialog header{padding:14px 20px;border-bottom:1px solid #30363d;'
+        'display:flex;justify-content:space-between;align-items:center;}'
+        'dialog.judge-dialog h3{margin:0;font-size:15px;font-weight:600;}'
+        'dialog.judge-dialog .close-btn{background:transparent;color:#8b949e;border:none;'
+        'cursor:pointer;font-size:18px;padding:2px 8px;line-height:1;}'
+        'dialog.judge-dialog .close-btn:hover{color:#e6edf3;}'
+        'dialog.judge-dialog section{padding:12px 20px;border-bottom:1px solid #21262d;}'
+        'dialog.judge-dialog section:last-child{border-bottom:none;}'
+        'dialog.judge-dialog h4{margin:0 0 8px;font-size:12.5px;color:#8b949e;font-weight:500;}'
+        'dialog.judge-dialog table{width:100%;border-collapse:collapse;font-size:12.5px;}'
+        'dialog.judge-dialog table td,dialog.judge-dialog table th{padding:4px 8px;text-align:right;}'
+        'dialog.judge-dialog table th:first-child{text-align:left;color:#8b949e;font-weight:500;width:120px;}'
+        'dialog.judge-dialog .hint{margin-top:6px;color:#8b949e;font-size:11.5px;}'
+        'dialog.judge-dialog .delta{color:#8b949e;font-size:11.5px;}'
+        'dialog.judge-dialog .why-section .why-text{margin:0;padding:10px 12px;background:#0d1117;'
+        'border-left:3px solid #58a6ff;border-radius:4px;line-height:1.6;font-size:13px;'
+        'white-space:pre-wrap;color:#e6edf3;}'
+        'dialog.judge-dialog table.trader-list{font-size:11.5px;margin-top:4px;}'
+        'dialog.judge-dialog table.trader-list th{background:#0d1117;color:#8b949e;font-weight:500;'
+        'border-bottom:1px solid #30363d;padding:5px 6px;}'
+        'dialog.judge-dialog table.trader-list td{padding:4px 6px;border-bottom:1px solid #21262d;}'
+        'dialog.judge-dialog table.trader-list td:first-child{text-align:left;width:auto;}'
+        'dialog.judge-dialog table.trader-list a{color:#58a6ff;text-decoration:none;}'
+        'dialog.judge-dialog table.trader-list a:hover{text-decoration:underline;}'
         'td.composite{font-size:14px;}'
         'td.ret{color:#8b949e;font-size:12px;}'
         '.pos2{color:#3fb950;font-weight:600;} .pos1{color:#8ddc8c;}'
@@ -5559,10 +6505,40 @@ def multi_horizon_dashboard_report() -> dict[str, Any]:
         '</style></head><body>'
         '<h1>Multi-Horizon 종목 추천</h1>'
         f'<div class="meta">생성 {html.escape(generated)} · {summary}</div>'
+        '<div class="refresh-bar">'
+        '<button id="btn-refresh-prices" type="button" title="현재가만 다시 받아서 점수 재산정">💱 가격만 갱신 (~45s)</button>'
+        '<button id="btn-refresh-holdings" type="button" title="Toss 거래내역에서 본인 net 보유 재계산 + PnL 갱신">📦 내 보유 갱신 (~10s)</button>'
+        '<button id="btn-full-refresh" type="button" title="본인 보유 + 신규 거래 + 신뢰도 + 추천 + 가격, 모두 갱신">🔄 전체 재계산 (~5-7min)</button>'
+        '<span class="refresh-divider"></span>'
+        '<button id="btn-expand-pool" type="button" class="heavy" title="인기 종목 커뮤니티에서 신규 유저 발굴 + 거래 history 수집 + 신뢰도 재산정. 1주에 1번 정도 권장.">🆕 신규 유저 발굴 (~30-40min)</button>'
+        '<span id="refresh-status"></span>'
+        '</div>'
+        '<div class="status-panel" id="status-panel">'
+        '<span title="scan 실행 시각 (실제 데이터 cutoff은 Toss lag 1.5h 앞 보정)">'
+        '📡 거래: <span class="ago" id="st-scan">—</span>'
+        '<span class="cutoff-hint" id="st-scan-cutoff"></span></span>'
+        '<span class="status-sep">·</span>'
+        '<span title="신뢰도 재산정 (4 horizon 백테스트)">🎯 신뢰도: <span class="ago" id="st-rel">—</span></span>'
+        '<span class="status-sep">·</span>'
+        '<span title="추천 + 종목 force_refresh 가격">💱 추천/가격: <span class="ago" id="st-rec">—</span></span>'
+        '<span class="status-sep">·</span>'
+        '<span title="대시보드 HTML 생성">🖼 HTML: <span class="ago" id="st-html">—</span></span>'
+        '<span class="status-sep">·</span>'
+        '<span><span id="st-extra" class="muted-extra"></span></span>'
+        '</div>'
+        '<div class="progress-panel" id="progress-panel" style="display:none;">'
+        '<div class="progress-header">'
+        '<span class="progress-title">📜 진행 로그</span>'
+        '<span class="progress-stage" id="progress-stage">—</span>'
+        '<span class="progress-elapsed" id="progress-elapsed"></span>'
+        '</div>'
+        '<pre class="progress-log" id="progress-log"></pre>'
+        '</div>'
         '<div class="tabs">'
         '<button class="tab-btn active" data-tab="recs">매수 추천</button>'
         f'<button class="tab-btn" data-tab="holdings">내 보유 매도 판단 ({"⚠ " if holdings_alert > 0 else ""}{holdings_alert}건 알람)</button>'
         f'<button class="tab-btn" data-tab="pool">신뢰 유저 ({pool_size}명)</button>'
+        '<button class="tab-btn" data-tab="performance">📈 추천 성과</button>'
         '</div>'
         '<div id="tab-recs" class="tab-panel active">'
         '<div class="sort-bar">'
@@ -5586,28 +6562,37 @@ def multi_horizon_dashboard_report() -> dict[str, Any]:
         '<button class="filter currency" data-currency="">전체 통화</button>'
         '<button class="filter currency" data-currency="USD">USD만</button>'
         '<button class="filter currency" data-currency="KRW">KRW만</button>'
+        '<span style="color:#8b949e;margin:0 8px 0 16px;">|</span>'
+        '<button class="filter recent active" data-recent-hours="0">최근 전체</button>'
+        '<button class="filter recent" data-recent-hours="4">최근 4h</button>'
+        '<button class="filter recent" data-recent-hours="1">최근 1h</button>'
         '</div>'
         '<table id="recs"><thead><tr>'
         '<th>종목</th><th>현재가</th><th>종합</th>'
         '<th>4h</th><th>24h</th><th>72h</th><th>144h</th>'
         '<th>4h 수익</th><th>24h 수익</th><th>72h 수익</th><th>144h 수익</th>'
-        '<th>매수/매도</th><th>평균매수가</th><th>현재가갭</th><th>진입</th>'
+        '<th>매수/매도<br><span class="th-sub">(7일)</span></th>'
+        '<th>4h 활동<br><span class="th-sub">(↑매수 ↓매도)</span></th>'
+        '<th>평균매수가</th><th>현재가갭</th><th>진입</th>'
         '</tr></thead><tbody>'
         + rec_rows +
         '</tbody></table>'
+        + rec_dialogs +
         '</div>'
         '<div id="tab-holdings" class="tab-panel">'
         '<table id="holdings"><thead><tr>'
         '<th>종목</th><th>수량</th><th>내 평단</th><th>현재가</th><th>손익</th>'
-        '<th>4h 점수</th><th>24h 점수</th><th>72h 점수</th><th>144h 점수</th><th>판단</th>'
+        '<th>4h 점수</th><th>24h 점수</th><th>72h 점수</th><th>144h 점수</th>'
+        '<th>매도점수</th><th>판단</th>'
         '</tr></thead><tbody>'
         + holdings_rows +
         '</tbody></table>'
+        + holdings_dialogs +
         '</div>'
         '<div id="tab-pool" class="tab-panel">'
         '<div class="sort-bar">'
         '<span style="color:#8b949e;margin-right:8px;">정렬:</span>'
-        '<button class="active pool-sort" data-pool-sort="avg">평균 신뢰도</button>'
+        '<button class="active pool-sort" data-pool-sort="avg">종합 점수</button>'
         '<button class="pool-sort" data-pool-sort="h4">4h 승률</button>'
         '<button class="pool-sort" data-pool-sort="h24">24h 승률</button>'
         '<button class="pool-sort" data-pool-sort="h72">72h 승률</button>'
@@ -5615,6 +6600,7 @@ def multi_horizon_dashboard_report() -> dict[str, Any]:
         '</div>'
         '<table id="pool"><thead><tr>'
         '<th>닉네임</th><th>profile_id</th><th>거래수</th><th>종목수</th>'
+        '<th>종합<br><span class="th-sub">(4 horizon 평균)</span></th>'
         '<th>4h 승률</th><th>4h 등급</th>'
         '<th>24h 승률</th><th>24h 등급</th>'
         '<th>72h 승률</th><th>72h 등급</th>'
@@ -5623,18 +6609,36 @@ def multi_horizon_dashboard_report() -> dict[str, Any]:
         + pool_rows +
         '</tbody></table>'
         '</div>'
+        '<div id="tab-performance" class="tab-panel">'
+        + perf_summary +
+        '<table id="performance"><thead><tr>'
+        '<th>추천시각</th><th>종목</th><th>추천가</th><th>composite</th><th>진입</th>'
+        '<th>+4h</th><th>+24h</th><th>+72h</th><th>+144h</th><th>매수/매도</th>'
+        '</tr></thead><tbody>'
+        + perf_rows +
+        '</tbody></table>'
+        '<div class="perf-footnote">⏳ = 아직 horizon 만료 안 됨 / "🔄 전체 재계산" 누르면 만료된 항목 자동 평가</div>'
+        '</div>'
         '<script>'
         'const tbody=document.querySelector("#recs tbody");'
-        'const filterState={minGrade:0,minAbsReturn:0,currency:""};'
+        f'const GENERATED_AT_MS=new Date("{generated}").getTime();'
+        'const filterState={minGrade:0,minAbsReturn:0,currency:"",recentHours:0};'
         'function applyFilters(){'
+        'const nowMs=GENERATED_AT_MS;'
         'document.querySelectorAll("#recs tbody tr").forEach(row=>{'
         'const grade=parseFloat(row.dataset.maxGrade||0);'
         'const absRet=parseFloat(row.dataset.maxAbsReturn||0);'
         'const cur=row.dataset.currency||"";'
+        'const latest=row.dataset.latestAt||"";'
         'const passGrade=grade>=filterState.minGrade;'
         'const passReturn=absRet>=filterState.minAbsReturn;'
         'const passCurrency=!filterState.currency||cur===filterState.currency;'
-        'row.style.display=(passGrade&&passReturn&&passCurrency)?"":"none";'
+        'let passRecent=true;'
+        'if(filterState.recentHours>0){'
+        'if(!latest){passRecent=false;}'
+        'else{const ageH=(nowMs-new Date(latest).getTime())/3600000;passRecent=ageH<=filterState.recentHours;}'
+        '}'
+        'row.style.display=(passGrade&&passReturn&&passCurrency&&passRecent)?"":"none";'
         '});'
         'updateCount();'
         '}'
@@ -5665,6 +6669,10 @@ def multi_horizon_dashboard_report() -> dict[str, Any]:
         'document.querySelectorAll(".filter-bar button.currency").forEach(b=>b.classList.remove("active"));'
         'btn.classList.add("active");'
         'filterState.currency=btn.dataset.currency;'
+        '}else if(btn.dataset.recentHours!==undefined){'
+        'document.querySelectorAll(".filter-bar button.recent").forEach(b=>b.classList.remove("active"));'
+        'btn.classList.add("active");'
+        'filterState.recentHours=parseFloat(btn.dataset.recentHours);'
         '}'
         'applyFilters();'
         '});});'
@@ -5686,6 +6694,106 @@ def multi_horizon_dashboard_report() -> dict[str, Any]:
         'rows.sort((a,b)=>parseFloat(b.dataset[key])-parseFloat(a.dataset[key]));'
         'rows.forEach(r=>poolTbody.appendChild(r));'
         '});});'
+        'document.querySelectorAll(".judge-btn").forEach(btn=>{'
+        'btn.addEventListener("click",()=>{'
+        'const d=document.getElementById(btn.dataset.judge);'
+        'if(d&&typeof d.showModal==="function")d.showModal();'
+        '});});'
+        'document.querySelectorAll(".judge-dialog .close-btn").forEach(btn=>{'
+        'btn.addEventListener("click",()=>btn.closest("dialog").close());'
+        '});'
+        'document.querySelectorAll(".judge-dialog").forEach(d=>{'
+        'd.addEventListener("click",e=>{if(e.target===d)d.close();});'
+        '});'
+        'const _progPanel=document.getElementById("progress-panel");'
+        'const _progStage=document.getElementById("progress-stage");'
+        'const _progElapsed=document.getElementById("progress-elapsed");'
+        'const _progLog=document.getElementById("progress-log");'
+        'let _progPollTimer=null;'
+        'async function _pollProgress(){'
+        'try{const r=await fetch("/api/refresh-progress",{cache:"no-store"});const p=await r.json();'
+        'if(_progPanel)_progPanel.style.display=(p.active||(p.log&&p.log.length))?"block":"none";'
+        'if(_progStage)_progStage.textContent=p.stage?"["+p.stage_index+"/"+p.total_stages+"] "+p.stage:(p.active?"...":"");'
+        'if(_progLog&&p.log)_progLog.textContent=p.log.join("\\n");'
+        'if(_progLog)_progLog.scrollTop=_progLog.scrollHeight;'
+        'if(p.started_at&&_progElapsed){const elapsed=(Date.now()-new Date(p.started_at).getTime())/1000;'
+        '_progElapsed.textContent=Math.floor(elapsed)+"s";}'
+        '}catch(e){}'
+        '}'
+        'function _startProgressPolling(){if(_progPollTimer)return;_pollProgress();_progPollTimer=setInterval(_pollProgress,2000);}'
+        'function _stopProgressPolling(){if(_progPollTimer){clearInterval(_progPollTimer);_progPollTimer=null;}_pollProgress();}'
+        'async function _refresh(url,label){'
+        'const btns=document.querySelectorAll(".refresh-bar button");'
+        'const status=document.getElementById("refresh-status");'
+        'btns.forEach(b=>b.disabled=true);'
+        'status.className="busy";status.textContent=label+" 진행 중...";'
+        'const start=Date.now();'
+        'const timer=setInterval(()=>{const s=Math.floor((Date.now()-start)/1000);'
+        'status.textContent=label+" 진행 중... "+s+"s";},1000);'
+        '_startProgressPolling();'
+        'try{const r=await fetch(url,{cache:"no-store"});const j=await r.json();'
+        'clearInterval(timer);_stopProgressPolling();'
+        'if(j.status==="ok"){status.className="ok";'
+        'status.textContent="완료 ("+j.elapsed_seconds+"s) — 다시 불러옵니다";'
+        'setTimeout(()=>location.reload(),700);}'
+        'else if(j.status==="busy"){status.className="err";'
+        'status.textContent="다른 갱신이 진행 중. 잠시 후 다시.";'
+        'btns.forEach(b=>b.disabled=false);}'
+        'else{status.className="err";'
+        'status.textContent="오류: "+(j.error||"알 수 없음");'
+        'btns.forEach(b=>b.disabled=false);}'
+        '}catch(e){clearInterval(timer);_stopProgressPolling();status.className="err";'
+        'status.textContent="요청 실패. python serve.py 켜져있나요? ("+e.message+")";'
+        'btns.forEach(b=>b.disabled=false);}'
+        '}'
+        '_pollProgress();'  # 페이지 로드 시 한 번 체크 (지금 진행 중이면 패널 보임)
+        'const _priceBtn=document.getElementById("btn-refresh-prices");'
+        'const _holdBtn=document.getElementById("btn-refresh-holdings");'
+        'const _fullBtn=document.getElementById("btn-full-refresh");'
+        'const _expandBtn=document.getElementById("btn-expand-pool");'
+        'if(_priceBtn)_priceBtn.addEventListener("click",()=>_refresh("/api/refresh-prices","💱 가격 갱신"));'
+        'if(_holdBtn)_holdBtn.addEventListener("click",()=>_refresh("/api/refresh-holdings","📦 보유 갱신"));'
+        'if(_fullBtn)_fullBtn.addEventListener("click",()=>_refresh("/api/full-refresh","🔄 전체 재계산"));'
+        'if(_expandBtn)_expandBtn.addEventListener("click",()=>{'
+        'if(confirm("신규 유저 발굴은 30-40분 걸립니다. 그 동안 다른 갱신은 막힙니다.\\n\\n진행할까요?"))'
+        '_refresh("/api/expand-pool","🆕 유저 발굴");});'
+        'function _ago(iso){'
+        'if(!iso)return"—";'
+        'const diff=(Date.now()-new Date(iso).getTime())/1000;'
+        'let txt,stale=0;'
+        'if(diff<60)txt=Math.floor(diff)+"초 전";'
+        'else if(diff<3600)txt=Math.floor(diff/60)+"분 전";'
+        'else if(diff<86400)txt=Math.floor(diff/3600)+"시간 전";'
+        'else txt=Math.floor(diff/86400)+"일 전";'
+        'if(diff>=7200)stale=2;else if(diff>=1800)stale=1;'
+        'return{txt:txt,stale:stale};'
+        '}'
+        'function _setAgo(elId,iso){'
+        'const el=document.getElementById(elId);if(!el)return;'
+        'const r=_ago(iso);el.textContent=typeof r==="string"?r:r.txt;'
+        'el.classList.remove("stale-1","stale-2");'
+        'if(typeof r==="object"&&r.stale)el.classList.add("stale-"+r.stale);'
+        '}'
+        'async function refreshStatus(){'
+        'try{const r=await fetch("/api/status",{cache:"no-store"});const j=await r.json();'
+        '_setAgo("st-scan",(j.scan||{}).generated_at);'
+        '_setAgo("st-rel",(j.reliability||{}).generated_at);'
+        '_setAgo("st-rec",(j.recommendations||{}).generated_at);'
+        '_setAgo("st-html",(j.dashboard||{}).mtime);'
+        'const eff=(j.scan||{}).effective_data_until;'
+        'const cutEl=document.getElementById("st-scan-cutoff");'
+        'if(cutEl){'
+        'if(eff){const d=new Date(eff);const hh=String(d.getHours()).padStart(2,"0");const mm=String(d.getMinutes()).padStart(2,"0");'
+        'cutEl.textContent=" (~"+hh+":"+mm+"까지 신뢰)";}'
+        'else{cutEl.textContent="";}'
+        '}'
+        'const recs=(j.recommendations||{}).recommended_count;'
+        'const pool=(j.recommendations||{}).trusted_pool_size;'
+        'const extra=document.getElementById("st-extra");'
+        'if(extra)extra.textContent=(pool?"신뢰풀 "+pool+"명 / 추천 "+recs+"개":"");'
+        '}catch(e){}'
+        '}'
+        'refreshStatus();setInterval(refreshStatus,30000);'
         '</script>'
         '</body></html>'
     )
@@ -5755,6 +6863,9 @@ def compute_multi_horizon_recommendations(
             key = event.get("symbol") or event.get("stock_code")
             if not key:
                 continue
+            # 자동 적립식 / 극소액 거래는 score/historical 산정에서 제외
+            if is_micro_trade(event):
+                continue
             side = (event.get("side") or "").upper()
             if side == "BUY":
                 historical_by_symbol[key].append({"event": event, "ts": ts, "profile_id": pid})
@@ -5779,7 +6890,7 @@ def compute_multi_horizon_recommendations(
     from concurrent.futures import ThreadPoolExecutor
 
     def _fetch_quote_one(qkey: tuple[str | None, str | None]) -> tuple[tuple[str | None, str | None], dict[str, Any] | None]:
-        return qkey, fetch_public_quote(qkey[0], qkey[1])
+        return qkey, fetch_public_quote(qkey[0], qkey[1], force_refresh=True)
 
     with ThreadPoolExecutor(max_workers=quote_workers) as ex:
         for qkey, quote in ex.map(_fetch_quote_one, unique_qkeys):
@@ -5851,7 +6962,7 @@ def compute_multi_horizon_recommendations(
                 if avg_p is None:
                     continue
                 buyer_win = (profiles_rel.get(pid, {}).get(f"h{h}_win") or 50.0)
-                price_weight = min(1.0, avg_p / current_price) if current_price > 0 else 1.0
+                price_weight = max(0.6, min(1.4, avg_p / current_price)) if current_price > 0 else 1.0
                 buy_sum += buyer_win * price_weight
             sell_sum = 0.0
             for pid, events in sellers_by_pid.items():
@@ -5859,7 +6970,7 @@ def compute_multi_horizon_recommendations(
                 if avg_p is None:
                     continue
                 seller_win = (profiles_rel.get(pid, {}).get(f"h{h}_win") or 50.0)
-                price_weight = min(1.0, avg_p / current_price) if current_price > 0 else 1.0
+                price_weight = max(0.6, min(1.4, avg_p / current_price)) if current_price > 0 else 1.0
                 sell_sum += seller_win * price_weight
             net = (buy_sum - sell_sum) / max_count
             scores[f"h{h}"] = round(net, 1)
@@ -5918,6 +7029,43 @@ def compute_multi_horizon_recommendations(
             gap = current_price / avg_buy_price - 1.0
         entry_label = _entry_label_for_gap(gap)
 
+        def _aggregate_traders(by_pid: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+            out = []
+            for pid, items in by_pid.items():
+                avg_p = _buyer_avg_price(items)
+                total_amt = sum(
+                    float(it["event"].get("amount_krw") or it["event"].get("amount_usd") or 0)
+                    for it in items
+                )
+                latest_ts = max(it["ts"] for it in items)
+                author = next(
+                    (it["event"].get("author") for it in items if it["event"].get("author")),
+                    pid,
+                )
+                rel = profiles_rel.get(pid, {}) or {}
+                horizon_wins = [rel.get(f"h{h}_win") for h in (4, 24, 72, 144)]
+                valid_wins = [w for w in horizon_wins if w is not None]
+                composite_win = (
+                    round(sum(valid_wins) / len(valid_wins), 1)
+                    if valid_wins
+                    else None
+                )
+                out.append({
+                    "profile_id": pid,
+                    "author": author,
+                    "avg_price": round(avg_p, 4) if avg_p is not None else None,
+                    "event_count": len(items),
+                    "total_amount": round(total_amt) if total_amt else 0,
+                    "latest_at": latest_ts.isoformat(),
+                    "h4_win": rel.get("h4_win"),
+                    "h24_win": rel.get("h24_win"),
+                    "h72_win": rel.get("h72_win"),
+                    "h144_win": rel.get("h144_win"),
+                    "composite_win": composite_win,
+                })
+            out.sort(key=lambda b: b.get("latest_at") or "", reverse=True)
+            return out
+
         recommendations.append({
             "symbol": sym,
             "stock_code": code,
@@ -5934,6 +7082,8 @@ def compute_multi_horizon_recommendations(
             "scores": scores,
             "composite_score": round(composite, 1),
             "expected_returns": expected_returns,
+            "buyers": _aggregate_traders(buyers_by_pid),
+            "sellers": _aggregate_traders(sellers_by_pid),
         })
 
     recommendations.sort(key=lambda r: -(r.get("composite_score") or 0))
@@ -5962,6 +7112,20 @@ def compute_multi_horizon_recommendations(
     RECOMMENDATIONS_MULTI_PATH.write_text(
         json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    try:
+        n_logged = append_rec_performance_log(output)
+        output["performance_log_appended"] = n_logged
+    except Exception as exc:
+        output["performance_log_error"] = str(exc)[:200]
+    try:
+        eval_out = evaluate_rec_performance()
+        output["performance_eval"] = {
+            "records_total": eval_out.get("records_total"),
+            "evaluated_records": eval_out.get("evaluated_records"),
+            "new_horizon_fills": eval_out.get("new_horizon_fills"),
+        }
+    except Exception as exc:
+        output["performance_eval_error"] = str(exc)[:200]
     return output
 
 
@@ -6099,10 +7263,15 @@ def compute_multi_horizon_reliability(
     now_dt = now_kst()
 
     all_buy_events: list[dict[str, Any]] = []
+    micro_skipped = 0
     for profile in profiles:
         for event in (profile.get("events") or []):
-            if (event.get("side") or "").upper() == "BUY":
-                all_buy_events.append(event)
+            if (event.get("side") or "").upper() != "BUY":
+                continue
+            if is_micro_trade(event):
+                micro_skipped += 1
+                continue
+            all_buy_events.append(event)
     coverage_stats = _ensure_chart_coverage_for_buys(
         all_buy_events,
         chart_cache,
@@ -6127,7 +7296,7 @@ def compute_multi_horizon_reliability(
 
         buy_events = [
             e for e in events
-            if (e.get("side") or "").upper() == "BUY"
+            if (e.get("side") or "").upper() == "BUY" and not is_micro_trade(e)
         ]
         if len(buy_events) < min_trades:
             skipped_min_trades += 1

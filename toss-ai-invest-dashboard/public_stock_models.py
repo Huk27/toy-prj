@@ -64,6 +64,54 @@ RECENT_BUY_LOG_PATH = RAW_DATA_DIR / "recent_buy_recommendations_log.jsonl"
 FOLLOW_HISTORY_PATH = RAW_DATA_DIR / "follow_history.json"
 FEED_WATERMARK_PATH = RAW_DATA_DIR / "feed_watermark.json"
 RECENT_BUY_PERFORMANCE_PATH = RAW_DATA_DIR / "recent_buy_performance.json"
+RECENT_BUY_HORIZON_SNAPSHOTS_PATH = RAW_DATA_DIR / "recent_buy_horizon_snapshots.jsonl"
+RECENT_BUY_HORIZON_HOURS = [1, 4, 8, 24]
+RECENT_BUY_HORIZON_GRACE_HOURS = 2.0
+BEAR_MARKET_BACKTEST_2022_PATH = RAW_DATA_DIR / "bear_market_backtest_2022.json"
+PROFILE_RELIABILITY_MULTI_PATH = RAW_DATA_DIR / "profile_reliability_multi.json"
+RECOMMENDATIONS_MULTI_PATH = RAW_DATA_DIR / "recommendations_multi.json"
+MULTI_HORIZON_DASHBOARD_HTML_PATH = DATA_DIR / "multi_horizon_dashboard.html"
+RECOMMENDATION_WINDOW_HOURS = 7 * 24
+RECOMMENDATION_MIN_TRUSTED_WIN = 50.0
+RECOMMENDATION_SCORE_CUTOFF = 30.0
+RECOMMENDATION_MIN_DENOMINATOR = 3
+RECOMMENDATION_QUOTE_WORKERS = 6
+RECOMMENDATION_ENTRY_BANDS = [
+    (-0.03, "진입가능+"),
+    (0.03, "진입가능"),
+    (0.10, "소액진입"),
+    (float("inf"), "추격금지"),
+]
+
+
+def _entry_label_for_gap(gap: float | None) -> str:
+    if gap is None:
+        return "-"
+    for upper, label in RECOMMENDATION_ENTRY_BANDS:
+        if gap < upper:
+            return label
+    return "추격금지"
+RELIABILITY_HORIZONS_HOURS = [4, 24, 72, 144]
+RELIABILITY_HALF_LIFE_DAYS = 30.0
+RELIABILITY_MIN_TRADES = 10
+RELIABILITY_MIN_UNIQUE_SYMBOLS = 8
+RELIABILITY_MIN_SAMPLES_PER_HORIZON = 3
+RELIABILITY_RETURN_OUTLIER_CAP = 1.0
+RELIABILITY_RETURN_BUCKETS = [
+    (0.10, 100),
+    (0.03, 75),
+    (-0.03, 50),
+    (-0.10, 25),
+]
+
+
+def _reliability_return_bucket(avg_return: float | None) -> int | None:
+    if avg_return is None:
+        return None
+    for threshold, grade in RELIABILITY_RETURN_BUCKETS:
+        if avg_return >= threshold:
+            return grade
+    return 0
 UNIFIED_DATA_PATH = DATA_DIR / "toss_ai_invest_data.json"
 UNIFIED_HTML_PATH = DATA_DIR / "toss_ai_invest_dashboard.html"
 AI_DECISION_BRIEF_PATH = DATA_DIR / "ai_decision_brief.md"
@@ -141,6 +189,13 @@ LEVERAGED_SYMBOLS = {
     "NVDQ",
     "SMU",
     "SMCZ",
+}
+
+LEVERAGED_SYMBOLS_KR = {
+    "A122630",  # KODEX 레버리지
+    "A243880",  # TIGER 200IT레버리지
+    "A252670",  # KODEX 200선물인버스2X
+    "A494310",  # KODEX 반도체레버리지
 }
 
 LOUNGE_TOPICS = {
@@ -604,11 +659,13 @@ def quote_from_toss_product(product: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def fetch_public_quote(symbol: str | None, stock_code: str | None = None) -> dict[str, Any] | None:
-    """Fetch a public quote without Toss login/session data.
-
-    Yahoo is used only as a public market-data adapter so prior recommendations
-    can be evaluated. Missing quotes are acceptable; the model will mark them.
-    """
+    """Fetch a public quote. Tries Toss first (real-time via toss-info-api),
+    falls back to Yahoo (delayed 15-20 min for free tier)."""
+    toss_product = resolve_toss_product(symbol, stock_code)
+    if toss_product:
+        toss_quote = quote_from_toss_product(toss_product)
+        if toss_quote and toss_quote.get("price"):
+            return toss_quote
     for yahoo_symbol in yahoo_symbols(symbol, stock_code):
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(yahoo_symbol)}?range=1d&interval=1m"
         try:
@@ -631,11 +688,6 @@ def fetch_public_quote(symbol: str | None, stock_code: str | None = None) -> dic
                 }
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, KeyError):
             continue
-    toss_product = resolve_toss_product(symbol, stock_code)
-    if toss_product:
-        toss_quote = quote_from_toss_product(toss_product)
-        if toss_quote:
-            return toss_quote
     return None
 
 
@@ -2678,6 +2730,8 @@ def is_leveraged_name(symbol: str | None, name: str | None = None, stock_code: s
     joined = " ".join(values)
     if any(value in LEVERAGED_SYMBOLS for value in values):
         return True
+    if stock_code and stock_code in LEVERAGED_SYMBOLS_KR:
+        return True
     leverage_keywords = ("2X", "3X", "레버리지", "인버스", "BULL 2", "BULL 3", "BEAR 2", "BEAR 3")
     return any(keyword in joined for keyword in leverage_keywords)
 
@@ -4052,6 +4106,7 @@ def recent_buy_html_report(
 ) -> dict[str, Any]:
     report = build_recent_buy_report(hours=hours, capital=capital, user_prices=user_prices)
     append_recent_buy_log(report)
+    capture_due_horizon_snapshots()
     evaluate_recent_buy_recommendations()
     rows = []
     for index, item in enumerate(report["recommendations"], start=1):
@@ -5134,6 +5189,1331 @@ def load_recent_buy_log() -> list[dict[str, Any]]:
     return rows
 
 
+def load_recent_buy_horizon_snapshots() -> list[dict[str, Any]]:
+    if not RECENT_BUY_HORIZON_SNAPSHOTS_PATH.exists():
+        return []
+    rows = []
+    with RECENT_BUY_HORIZON_SNAPSHOTS_PATH.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def capture_due_horizon_snapshots(
+    *,
+    horizons: list[int] | None = None,
+    grace_hours: float = RECENT_BUY_HORIZON_GRACE_HOURS,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    horizons = horizons or list(RECENT_BUY_HORIZON_HOURS)
+    now_iso = now_kst().isoformat()
+    captured_keys = {
+        (row.get("rec_timestamp"), row.get("symbol"), row.get("horizon_hours"))
+        for row in load_recent_buy_horizon_snapshots()
+    }
+    due: list[tuple[dict[str, Any], int, float]] = []
+    for rec in load_recent_buy_log():
+        rec_ts = rec.get("timestamp")
+        symbol = rec.get("symbol")
+        if not rec_ts or not symbol:
+            continue
+        age = hours_between(rec_ts, now_iso)
+        if age is None:
+            continue
+        for horizon in horizons:
+            if age < horizon or age >= horizon + grace_hours:
+                continue
+            if (rec_ts, symbol, horizon) in captured_keys:
+                continue
+            due.append((rec, horizon, age))
+
+    if dry_run:
+        return {
+            "mode": "capture-due-horizon-snapshots-dry-run",
+            "now": now_iso,
+            "horizons_hours": horizons,
+            "grace_hours": grace_hours,
+            "log_row_count": len(load_recent_buy_log()),
+            "already_captured": len(captured_keys),
+            "due_count": len(due),
+            "due": [
+                {
+                    "rec_timestamp": rec.get("timestamp"),
+                    "symbol": rec.get("symbol"),
+                    "horizon_hours": horizon,
+                    "age_hours": age,
+                }
+                for rec, horizon, age in due
+            ],
+        }
+
+    quote_cache: dict[tuple[str | None, str | None], dict[str, Any] | None] = {}
+    appended = 0
+    RECENT_BUY_HORIZON_SNAPSHOTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with RECENT_BUY_HORIZON_SNAPSHOTS_PATH.open("a", encoding="utf-8") as fp:
+        for rec, horizon, age in due:
+            symbol = rec.get("symbol")
+            stock_code = rec.get("stock_code")
+            cache_key = (symbol, stock_code)
+            if cache_key not in quote_cache:
+                quote_cache[cache_key] = fetch_public_quote(symbol, stock_code)
+            quote = quote_cache[cache_key]
+            price = None
+            if quote and quote.get("price") is not None:
+                try:
+                    price = float(quote["price"])
+                except (TypeError, ValueError):
+                    price = None
+            entry = rec.get("entry_price")
+            try:
+                entry_f = float(entry) if entry is not None else None
+            except (TypeError, ValueError):
+                entry_f = None
+            ret = None
+            if price is not None and entry_f:
+                ret = round(price / entry_f - 1.0, 6)
+            if price is None:
+                status = "quote_missing"
+            elif not entry_f:
+                status = "entry_price_missing"
+            else:
+                status = "ok"
+            fp.write(json.dumps({
+                "schema_version": 1,
+                "rec_timestamp": rec.get("timestamp"),
+                "symbol": symbol,
+                "stock_code": stock_code,
+                "horizon_hours": horizon,
+                "snapshot_timestamp": now_iso,
+                "snapshot_age_hours": age,
+                "snapshot_price": price,
+                "snapshot_currency": (quote or {}).get("currency"),
+                "snapshot_provider": (quote or {}).get("provider"),
+                "entry_price": entry_f,
+                "entry_currency": rec.get("entry_currency"),
+                "return": ret,
+                "status": status,
+            }, ensure_ascii=False) + "\n")
+            appended += 1
+    return {
+        "mode": "capture-due-horizon-snapshots",
+        "now": now_iso,
+        "horizons_hours": horizons,
+        "grace_hours": grace_hours,
+        "due_count": len(due),
+        "appended": appended,
+        "snapshot_path": str(RECENT_BUY_HORIZON_SNAPSHOTS_PATH),
+    }
+
+
+def _format_money_simple(value: float | None, currency: str | None) -> str:
+    if value is None:
+        return "-"
+    if currency == "USD":
+        return f"${value:,.2f}"
+    if currency == "KRW":
+        return f"₩{value:,.0f}"
+    return f"{value:,.2f}"
+
+
+def _format_pct(value: float | None, plus_sign: bool = True) -> str:
+    if value is None:
+        return "-"
+    sign = "+" if plus_sign and value > 0 else ""
+    return f"{sign}{value*100:.1f}%"
+
+
+def _score_color_class(score: float | None) -> str:
+    if score is None:
+        return "n"
+    if score >= 70:
+        return "pos2"
+    if score >= 50:
+        return "pos1"
+    if score >= 30:
+        return "neu"
+    if score >= 0:
+        return "neg1"
+    return "neg2"
+
+
+def _grade_label(grade: int | None) -> str:
+    if grade is None:
+        return "-"
+    return {100: "★★★★★", 75: "★★★★", 50: "★★★", 25: "★★", 0: "★"}.get(grade, "-")
+
+
+def _render_recommendation_rows(recs: list[dict[str, Any]]) -> str:
+    """Build <tr> rows for the recommendation table."""
+    rows_html: list[str] = []
+    for r in recs:
+        sym = r.get("symbol") or "-"
+        cp = r.get("current_price")
+        cur = r.get("currency") or ""
+        composite = r.get("composite_score") or 0
+        scores = r.get("scores") or {}
+        er = r.get("expected_returns") or {}
+        h4_s = scores.get("h4")
+        h24_s = scores.get("h24")
+        h72_s = scores.get("h72")
+        h144_s = scores.get("h144")
+        h4_r = (er.get("h4") or {}).get("avg_return")
+        h24_r = (er.get("h24") or {}).get("avg_return")
+        h72_r = (er.get("h72") or {}).get("avg_return")
+        h144_r = (er.get("h144") or {}).get("avg_return")
+        grades = [
+            (er.get("h4") or {}).get("grade"),
+            (er.get("h24") or {}).get("grade"),
+            (er.get("h72") or {}).get("grade"),
+            (er.get("h144") or {}).get("grade"),
+        ]
+        max_grade = max([g for g in grades if g is not None] or [0])
+        max_abs_return_pct = 0.0
+        for v in [h4_r, h24_r, h72_r, h144_r]:
+            if v is not None and abs(v) * 100 > max_abs_return_pct:
+                max_abs_return_pct = abs(v) * 100
+        rows_html.append(
+            f'<tr data-composite="{composite}" data-h4="{h4_s or 0}" data-h24="{h24_s or 0}" '
+            f'data-h72="{h72_s or 0}" data-h144="{h144_s or 0}" '
+            f'data-max-grade="{max_grade}" data-max-abs-return="{max_abs_return_pct:.2f}" '
+            f'data-currency="{html.escape(cur or "")}">'
+            f'<td class="sym">{html.escape(sym)}</td>'
+            f'<td>{_format_money_simple(cp, cur)}</td>'
+            f'<td class="composite {_score_color_class(composite)}"><b>{composite:.1f}</b></td>'
+            f'<td class="{_score_color_class(h4_s)}">{h4_s if h4_s is not None else "-"}</td>'
+            f'<td class="{_score_color_class(h24_s)}">{h24_s if h24_s is not None else "-"}</td>'
+            f'<td class="{_score_color_class(h72_s)}">{h72_s if h72_s is not None else "-"}</td>'
+            f'<td class="{_score_color_class(h144_s)}">{h144_s if h144_s is not None else "-"}</td>'
+            f'<td class="ret">{_format_pct(h4_r)}</td>'
+            f'<td class="ret">{_format_pct(h24_r)}</td>'
+            f'<td class="ret">{_format_pct(h72_r)}</td>'
+            f'<td class="ret">{_format_pct(h144_r)}</td>'
+            f'<td>{r.get("buy_count", 0)} / {r.get("sell_count", 0)}</td>'
+            f'<td>{_format_money_simple(r.get("avg_buy_price"), cur)}</td>'
+            f'<td>{_format_pct(r.get("price_gap_pct")/100 if r.get("price_gap_pct") is not None else None)}</td>'
+            f'<td class="lbl-{html.escape(r.get("entry_label","-"))}">{html.escape(r.get("entry_label","-"))}</td>'
+            f'</tr>'
+        )
+    return "".join(rows_html)
+
+
+def _render_my_holdings_rows(
+    recs_by_symbol: dict[str, dict[str, Any]],
+) -> tuple[str, int]:
+    """Render <tr> rows for 'my holdings sell judgment' table.
+    Looks up each held symbol in recommendations data."""
+    holdings = load_user_holdings()
+    rows: list[str] = []
+    alert_count = 0
+    for sym, info in holdings.items():
+        my_avg = info.get("avg_price")
+        currency = info.get("currency") or "USD"
+        shares = info.get("shares")
+        stock_code = info.get("stock_code")
+        # Find score from recommendations
+        rec = recs_by_symbol.get(sym) or recs_by_symbol.get(stock_code or "")
+        cur_price = rec.get("current_price") if rec else None
+        composite = rec.get("composite_score") if rec else None
+        scores = (rec or {}).get("scores") or {}
+        h4 = scores.get("h4")
+        h24 = scores.get("h24")
+        h72 = scores.get("h72")
+        h144 = scores.get("h144")
+        pnl = None
+        if cur_price and my_avg:
+            try:
+                pnl = float(cur_price) / float(my_avg) - 1.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                pnl = None
+        # Sell alert label
+        worst = min([s for s in [h4, h24, h72, h144] if s is not None] or [0])
+        if worst <= -50:
+            alert = "강한 매도 ⚠⚠"
+            alert_count += 1
+        elif worst <= -30:
+            alert = "매도 검토 ⚠"
+            alert_count += 1
+        elif worst <= 0:
+            alert = "주의"
+        else:
+            alert = "보유 유지"
+
+        rows.append(
+            f'<tr>'
+            f'<td class="sym">{html.escape(sym)}</td>'
+            f'<td>{html.escape(str(shares))}</td>'
+            f'<td>{_format_money_simple(my_avg, currency)}</td>'
+            f'<td>{_format_money_simple(cur_price, currency) if cur_price else "-"}</td>'
+            f'<td class="{_score_color_class((pnl or 0)*100 + 50)}">{_format_pct(pnl)}</td>'
+            f'<td class="{_score_color_class(h4)}">{h4 if h4 is not None else "-"}</td>'
+            f'<td class="{_score_color_class(h24)}">{h24 if h24 is not None else "-"}</td>'
+            f'<td class="{_score_color_class(h72)}">{h72 if h72 is not None else "-"}</td>'
+            f'<td class="{_score_color_class(h144)}">{h144 if h144 is not None else "-"}</td>'
+            f'<td>{html.escape(alert)}</td>'
+            f'</tr>'
+        )
+    return "".join(rows), alert_count
+
+
+def _render_trusted_pool_rows() -> tuple[str, int]:
+    """Render <tr> rows for the trusted user pool table."""
+    if not PROFILE_RELIABILITY_MULTI_PATH.exists():
+        return "", 0
+    data = json.loads(PROFILE_RELIABILITY_MULTI_PATH.read_text(encoding="utf-8"))
+    profs = data.get("profiles") or {}
+    rows: list[str] = []
+    for pid, r in profs.items():
+        h4_w = r.get("h4_win")
+        h24_w = r.get("h24_win")
+        h72_w = r.get("h72_win")
+        h144_w = r.get("h144_win")
+        h4_g = r.get("h4_return_grade")
+        h24_g = r.get("h24_return_grade")
+        h72_g = r.get("h72_return_grade")
+        h144_g = r.get("h144_return_grade")
+        avg_win = sum(w for w in [h4_w, h24_w, h72_w, h144_w] if w is not None) / max(
+            1, sum(1 for w in [h4_w, h24_w, h72_w, h144_w] if w is not None)
+        )
+        rows.append(
+            f'<tr data-h4="{h4_w or 0}" data-h24="{h24_w or 0}" '
+            f'data-h72="{h72_w or 0}" data-h144="{h144_w or 0}" '
+            f'data-avg="{avg_win:.2f}">'
+            f'<td class="sym">{html.escape(r.get("nickname") or "?")}</td>'
+            f'<td>{html.escape(pid)}</td>'
+            f'<td>{r.get("buy_event_count", 0)}</td>'
+            f'<td>{r.get("unique_symbols", 0)}</td>'
+            f'<td class="{_score_color_class(h4_w)}">{h4_w if h4_w is not None else "-"}</td>'
+            f'<td class="grade-{h4_g}">{_grade_label(h4_g)}</td>'
+            f'<td class="{_score_color_class(h24_w)}">{h24_w if h24_w is not None else "-"}</td>'
+            f'<td class="grade-{h24_g}">{_grade_label(h24_g)}</td>'
+            f'<td class="{_score_color_class(h72_w)}">{h72_w if h72_w is not None else "-"}</td>'
+            f'<td class="grade-{h72_g}">{_grade_label(h72_g)}</td>'
+            f'<td class="{_score_color_class(h144_w)}">{h144_w if h144_w is not None else "-"}</td>'
+            f'<td class="grade-{h144_g}">{_grade_label(h144_g)}</td>'
+            f'</tr>'
+        )
+    return "".join(rows), len(profs)
+
+
+def multi_horizon_dashboard_report() -> dict[str, Any]:
+    """Render multi-horizon recommendations + holdings sell-judgment + trusted-pool to HTML."""
+    if not RECOMMENDATIONS_MULTI_PATH.exists():
+        return {"error": "recommendations_multi.json not found"}
+    data = json.loads(RECOMMENDATIONS_MULTI_PATH.read_text(encoding="utf-8"))
+    recs = data.get("recommendations") or []
+    all_scored = data.get("all_scored") or recs
+    recs_by_symbol = {r["symbol"]: r for r in all_scored if r.get("symbol")}
+
+    rec_rows = _render_recommendation_rows(recs)
+    holdings_rows, holdings_alert = _render_my_holdings_rows(recs_by_symbol)
+    pool_rows, pool_size = _render_trusted_pool_rows()
+
+    generated = data.get("generated_at") or now_kst().isoformat()
+    summary = (
+        f"신뢰 유저 {data.get('trusted_pool_size', 0)}명 / "
+        f"후보 종목 {data.get('candidate_symbols', 0)}개 / "
+        f"추천 종목 {data.get('recommended_count', 0)}개 "
+        f"(현재 표시: <span id=\"visible-count\">{data.get('recommended_count', 0)}</span>, "
+        f"점수 ≥ {data.get('score_cutoff', 30)})"
+    )
+
+    html_text = (
+        '<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">'
+        '<title>Multi-Horizon 종목 추천</title>'
+        '<style>'
+        'body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Pretendard,sans-serif;'
+        'background:#0d1117;color:#e6edf3;margin:0;padding:20px;}'
+        'h1{font-size:22px;margin:0 0 8px;}'
+        '.meta{color:#8b949e;font-size:13px;margin-bottom:14px;}'
+        '.sort-bar{margin-bottom:12px;}'
+        '.sort-bar button{background:#21262d;color:#e6edf3;border:1px solid #30363d;'
+        'padding:6px 12px;margin-right:6px;border-radius:4px;cursor:pointer;font-size:13px;}'
+        '.sort-bar button.active{background:#1f6feb;border-color:#1f6feb;}'
+        'table{width:100%;border-collapse:collapse;font-size:12.5px;}'
+        'th,td{padding:6px 8px;border-bottom:1px solid #21262d;text-align:right;}'
+        'th{background:#161b22;color:#8b949e;font-weight:600;text-align:right;'
+        'position:sticky;top:0;cursor:pointer;}'
+        'th:first-child,td:first-child{text-align:left;}'
+        'td.sym{font-weight:600;}'
+        'td.composite{font-size:14px;}'
+        'td.ret{color:#8b949e;font-size:12px;}'
+        '.pos2{color:#3fb950;font-weight:600;} .pos1{color:#8ddc8c;}'
+        '.neu{color:#d4d4d4;}'
+        '.neg1{color:#f0883e;} .neg2{color:#f85149;font-weight:600;}'
+        '.n{color:#484f58;}'
+        '[class^="lbl-진입가능"]{color:#3fb950;} [class="lbl-소액진입"]{color:#d29922;}'
+        '[class="lbl-관망"]{color:#8b949e;} [class="lbl-추격금지"]{color:#f85149;}'
+        '.grade-100{color:#3fb950;font-weight:600;} .grade-75{color:#8ddc8c;}'
+        '.grade-50{color:#d4d4d4;} .grade-25{color:#f0883e;} .grade-0{color:#f85149;}'
+        '.tabs{margin-bottom:14px;display:flex;gap:4px;border-bottom:1px solid #30363d;}'
+        '.tab-btn{background:transparent;color:#8b949e;border:none;padding:10px 16px;'
+        'cursor:pointer;font-size:14px;border-bottom:2px solid transparent;}'
+        '.tab-btn.active{color:#e6edf3;border-bottom-color:#1f6feb;}'
+        '.tab-panel{display:none;} .tab-panel.active{display:block;}'
+        '</style></head><body>'
+        '<h1>Multi-Horizon 종목 추천</h1>'
+        f'<div class="meta">생성 {html.escape(generated)} · {summary}</div>'
+        '<div class="tabs">'
+        '<button class="tab-btn active" data-tab="recs">매수 추천</button>'
+        f'<button class="tab-btn" data-tab="holdings">내 보유 매도 판단 ({"⚠ " if holdings_alert > 0 else ""}{holdings_alert}건 알람)</button>'
+        f'<button class="tab-btn" data-tab="pool">신뢰 유저 ({pool_size}명)</button>'
+        '</div>'
+        '<div id="tab-recs" class="tab-panel active">'
+        '<div class="sort-bar">'
+        '<span style="color:#8b949e;margin-right:8px;">정렬:</span>'
+        '<button class="active" data-sort="composite">종합점수</button>'
+        '<button data-sort="h4">4h (단타)</button>'
+        '<button data-sort="h24">24h (1일)</button>'
+        '<button data-sort="h72">72h (3일)</button>'
+        '<button data-sort="h144">144h (6일)</button>'
+        '</div>'
+        '<div class="filter-bar" style="margin-bottom:12px;">'
+        '<span style="color:#8b949e;margin-right:8px;">필터:</span>'
+        '<button class="filter active" data-min-grade="0">전체</button>'
+        '<button class="filter" data-min-grade="50">변동성 있음 (등급≥50)</button>'
+        '<button class="filter" data-min-grade="75">수익권 (등급≥75)</button>'
+        '<button class="filter" data-min-grade="100">강한 수익 (등급=100)</button>'
+        '<span style="color:#8b949e;margin:0 8px 0 16px;">|</span>'
+        '<button class="filter" data-min-abs-return="1">변동 1%+</button>'
+        '<button class="filter" data-min-abs-return="3">변동 3%+</button>'
+        '<span style="color:#8b949e;margin:0 8px 0 16px;">|</span>'
+        '<button class="filter currency" data-currency="">전체 통화</button>'
+        '<button class="filter currency" data-currency="USD">USD만</button>'
+        '<button class="filter currency" data-currency="KRW">KRW만</button>'
+        '</div>'
+        '<table id="recs"><thead><tr>'
+        '<th>종목</th><th>현재가</th><th>종합</th>'
+        '<th>4h</th><th>24h</th><th>72h</th><th>144h</th>'
+        '<th>4h 수익</th><th>24h 수익</th><th>72h 수익</th><th>144h 수익</th>'
+        '<th>매수/매도</th><th>평균매수가</th><th>현재가갭</th><th>진입</th>'
+        '</tr></thead><tbody>'
+        + rec_rows +
+        '</tbody></table>'
+        '</div>'
+        '<div id="tab-holdings" class="tab-panel">'
+        '<table id="holdings"><thead><tr>'
+        '<th>종목</th><th>수량</th><th>내 평단</th><th>현재가</th><th>손익</th>'
+        '<th>4h 점수</th><th>24h 점수</th><th>72h 점수</th><th>144h 점수</th><th>판단</th>'
+        '</tr></thead><tbody>'
+        + holdings_rows +
+        '</tbody></table>'
+        '</div>'
+        '<div id="tab-pool" class="tab-panel">'
+        '<div class="sort-bar">'
+        '<span style="color:#8b949e;margin-right:8px;">정렬:</span>'
+        '<button class="active pool-sort" data-pool-sort="avg">평균 신뢰도</button>'
+        '<button class="pool-sort" data-pool-sort="h4">4h 승률</button>'
+        '<button class="pool-sort" data-pool-sort="h24">24h 승률</button>'
+        '<button class="pool-sort" data-pool-sort="h72">72h 승률</button>'
+        '<button class="pool-sort" data-pool-sort="h144">144h 승률</button>'
+        '</div>'
+        '<table id="pool"><thead><tr>'
+        '<th>닉네임</th><th>profile_id</th><th>거래수</th><th>종목수</th>'
+        '<th>4h 승률</th><th>4h 등급</th>'
+        '<th>24h 승률</th><th>24h 등급</th>'
+        '<th>72h 승률</th><th>72h 등급</th>'
+        '<th>144h 승률</th><th>144h 등급</th>'
+        '</tr></thead><tbody>'
+        + pool_rows +
+        '</tbody></table>'
+        '</div>'
+        '<script>'
+        'const tbody=document.querySelector("#recs tbody");'
+        'const filterState={minGrade:0,minAbsReturn:0,currency:""};'
+        'function applyFilters(){'
+        'document.querySelectorAll("#recs tbody tr").forEach(row=>{'
+        'const grade=parseFloat(row.dataset.maxGrade||0);'
+        'const absRet=parseFloat(row.dataset.maxAbsReturn||0);'
+        'const cur=row.dataset.currency||"";'
+        'const passGrade=grade>=filterState.minGrade;'
+        'const passReturn=absRet>=filterState.minAbsReturn;'
+        'const passCurrency=!filterState.currency||cur===filterState.currency;'
+        'row.style.display=(passGrade&&passReturn&&passCurrency)?"":"none";'
+        '});'
+        'updateCount();'
+        '}'
+        'function updateCount(){'
+        'const visible=document.querySelectorAll("#recs tbody tr:not([style*=none])").length;'
+        'document.getElementById("visible-count").textContent=visible;'
+        '}'
+        'document.querySelectorAll(".sort-bar button").forEach(btn=>{'
+        'btn.addEventListener("click",()=>{'
+        'document.querySelectorAll(".sort-bar button").forEach(b=>b.classList.remove("active"));'
+        'btn.classList.add("active");'
+        'const key=btn.dataset.sort;'
+        'const rows=Array.from(tbody.querySelectorAll("tr"));'
+        'rows.sort((a,b)=>parseFloat(b.dataset[key])-parseFloat(a.dataset[key]));'
+        'rows.forEach(r=>tbody.appendChild(r));'
+        '});});'
+        'document.querySelectorAll(".filter-bar button.filter").forEach(btn=>{'
+        'btn.addEventListener("click",()=>{'
+        'if(btn.dataset.minGrade!==undefined){'
+        'document.querySelectorAll(".filter-bar button.filter[data-min-grade]").forEach(b=>b.classList.remove("active"));'
+        'btn.classList.add("active");'
+        'filterState.minGrade=parseFloat(btn.dataset.minGrade);'
+        '}else if(btn.dataset.minAbsReturn!==undefined){'
+        'document.querySelectorAll(".filter-bar button.filter[data-min-abs-return]").forEach(b=>b.classList.remove("active"));'
+        'btn.classList.add("active");'
+        'filterState.minAbsReturn=parseFloat(btn.dataset.minAbsReturn);'
+        '}else if(btn.dataset.currency!==undefined){'
+        'document.querySelectorAll(".filter-bar button.currency").forEach(b=>b.classList.remove("active"));'
+        'btn.classList.add("active");'
+        'filterState.currency=btn.dataset.currency;'
+        '}'
+        'applyFilters();'
+        '});});'
+        'updateCount();'
+        'document.querySelectorAll(".tab-btn").forEach(btn=>{'
+        'btn.addEventListener("click",()=>{'
+        'document.querySelectorAll(".tab-btn").forEach(b=>b.classList.remove("active"));'
+        'document.querySelectorAll(".tab-panel").forEach(p=>p.classList.remove("active"));'
+        'btn.classList.add("active");'
+        'document.getElementById("tab-"+btn.dataset.tab).classList.add("active");'
+        '});});'
+        'const poolTbody=document.querySelector("#pool tbody");'
+        'document.querySelectorAll(".pool-sort").forEach(btn=>{'
+        'btn.addEventListener("click",()=>{'
+        'document.querySelectorAll(".pool-sort").forEach(b=>b.classList.remove("active"));'
+        'btn.classList.add("active");'
+        'const key=btn.dataset.poolSort;'
+        'const rows=Array.from(poolTbody.querySelectorAll("tr"));'
+        'rows.sort((a,b)=>parseFloat(b.dataset[key])-parseFloat(a.dataset[key]));'
+        'rows.forEach(r=>poolTbody.appendChild(r));'
+        '});});'
+        '</script>'
+        '</body></html>'
+    )
+    MULTI_HORIZON_DASHBOARD_HTML_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MULTI_HORIZON_DASHBOARD_HTML_PATH.write_text(html_text, encoding="utf-8")
+    return {
+        "mode": "multi-horizon-dashboard",
+        "html_path": str(MULTI_HORIZON_DASHBOARD_HTML_PATH),
+        "row_count": len(recs),
+        "generated_at": generated,
+    }
+
+
+def compute_multi_horizon_recommendations(
+    *,
+    horizons: list[int] | None = None,
+    window_hours: float = RECOMMENDATION_WINDOW_HOURS,
+    min_trusted_win: float = RECOMMENDATION_MIN_TRUSTED_WIN,
+    score_cutoff: float = RECOMMENDATION_SCORE_CUTOFF,
+    min_denominator: int = RECOMMENDATION_MIN_DENOMINATOR,
+    quote_workers: int = RECOMMENDATION_QUOTE_WORKERS,
+    half_life_days: float = RELIABILITY_HALF_LIFE_DAYS,
+) -> dict[str, Any]:
+    """Compute 4-horizon recommendation scores per symbol from the trusted
+    user pool's last 7 days of BUY/SELL trades.
+
+    Uses sender formula:
+        score[h] = (Σ buy_win × price_weight − Σ sell_win × price_weight) / max(buy_n, sell_n)
+        price_weight = min(1, trade_price / current_price)
+
+    Also includes per-symbol expected return per horizon (option 3:
+    trusted users' historical record on this exact symbol).
+    """
+    horizons = horizons or list(RELIABILITY_HORIZONS_HOURS)
+
+    if not PROFILE_RELIABILITY_MULTI_PATH.exists():
+        return {"error": "profile_reliability_multi.json not found",
+                "mode": "multi-horizon-recommendations-v1"}
+    if not PROFILE_HISTORY_REPORT_PATH.exists():
+        return {"error": "profile_history_report.json not found",
+                "mode": "multi-horizon-recommendations-v1"}
+
+    rel_out = json.loads(PROFILE_RELIABILITY_MULTI_PATH.read_text(encoding="utf-8"))
+    profiles_rel = rel_out.get("profiles") or {}
+    trusted_pool = {
+        pid for pid, row in profiles_rel.items()
+        if any((row.get(f"h{h}_win") or 0) >= min_trusted_win for h in horizons)
+    }
+
+    hist = json.loads(PROFILE_HISTORY_REPORT_PATH.read_text(encoding="utf-8"))
+    profs = hist.get("profiles") or []
+    chart_cache = chart_cache_load()
+    now_dt = now_kst()
+    cutoff_dt = now_dt - dt.timedelta(hours=window_hours)
+
+    by_symbol: dict[str, dict[str, Any]] = {}
+    historical_by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    for prof in profs:
+        pid = str(prof.get("profile_id") or "")
+        if pid not in trusted_pool:
+            continue
+        for event in (prof.get("events") or []):
+            ts = parse_dt(event.get("acted_at") or event.get("timestamp"))
+            if not ts:
+                continue
+            key = event.get("symbol") or event.get("stock_code")
+            if not key:
+                continue
+            side = (event.get("side") or "").upper()
+            if side == "BUY":
+                historical_by_symbol[key].append({"event": event, "ts": ts, "profile_id": pid})
+            if ts < cutoff_dt:
+                continue
+            if side not in ("BUY", "SELL"):
+                continue
+            row = by_symbol.setdefault(key, {
+                "symbol": event.get("symbol"),
+                "stock_code": event.get("stock_code"),
+                "buys": [],
+                "sells": [],
+            })
+            row["buys" if side == "BUY" else "sells"].append({
+                "event": event,
+                "ts": ts,
+                "profile_id": pid,
+            })
+
+    quote_cache: dict[tuple[str | None, str | None], dict[str, Any] | None] = {}
+    unique_qkeys = {(row["symbol"], row["stock_code"]) for row in by_symbol.values()}
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _fetch_quote_one(qkey: tuple[str | None, str | None]) -> tuple[tuple[str | None, str | None], dict[str, Any] | None]:
+        return qkey, fetch_public_quote(qkey[0], qkey[1])
+
+    with ThreadPoolExecutor(max_workers=quote_workers) as ex:
+        for qkey, quote in ex.map(_fetch_quote_one, unique_qkeys):
+            quote_cache[qkey] = quote
+
+    recommendations: list[dict[str, Any]] = []
+    no_quote_count = 0
+
+    for sym_key, row in by_symbol.items():
+        sym = row["symbol"]
+        code = row["stock_code"]
+        qkey = (sym, code)
+        quote = quote_cache.get(qkey)
+        if not quote or not quote.get("price"):
+            no_quote_count += 1
+            continue
+        current_price = float(quote["price"])
+        if current_price <= 0:
+            no_quote_count += 1
+            continue
+
+        buys = row["buys"]
+        sells = row["sells"]
+        if len(buys) + len(sells) == 0:
+            continue
+
+        buyers_by_pid: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for b in buys:
+            buyers_by_pid[b["profile_id"]].append(b)
+        sellers_by_pid: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for s in sells:
+            sellers_by_pid[s["profile_id"]].append(s)
+
+        unique_buyer_count = len(buyers_by_pid)
+        unique_seller_count = len(sellers_by_pid)
+        max_count = max(unique_buyer_count, unique_seller_count, min_denominator)
+
+        def _buyer_avg_price(events: list[dict[str, Any]]) -> float | None:
+            prices: list[float] = []
+            for ev in events:
+                p = ev["event"].get("avg_usd") or ev["event"].get("avg_krw")
+                if p:
+                    try:
+                        v = float(p)
+                        if v > 0:
+                            prices.append(v)
+                    except (TypeError, ValueError):
+                        pass
+            return sum(prices) / len(prices) if prices else None
+
+        per_buyer_avg_prices: list[float] = []
+        for pid, events in buyers_by_pid.items():
+            avg = _buyer_avg_price(events)
+            if avg is not None:
+                per_buyer_avg_prices.append(avg)
+        avg_buy_price = sum(per_buyer_avg_prices) / len(per_buyer_avg_prices) if per_buyer_avg_prices else None
+
+        buyer_h4_wins = [
+            (profiles_rel.get(pid, {}).get("h4_win") or 50.0)
+            for pid in buyers_by_pid
+        ]
+        avg_buyer_h4 = sum(buyer_h4_wins) / len(buyer_h4_wins) if buyer_h4_wins else 0
+
+        scores: dict[str, float] = {}
+        for h in horizons:
+            buy_sum = 0.0
+            for pid, events in buyers_by_pid.items():
+                avg_p = _buyer_avg_price(events)
+                if avg_p is None:
+                    continue
+                buyer_win = (profiles_rel.get(pid, {}).get(f"h{h}_win") or 50.0)
+                price_weight = min(1.0, avg_p / current_price) if current_price > 0 else 1.0
+                buy_sum += buyer_win * price_weight
+            sell_sum = 0.0
+            for pid, events in sellers_by_pid.items():
+                avg_p = _buyer_avg_price(events)
+                if avg_p is None:
+                    continue
+                seller_win = (profiles_rel.get(pid, {}).get(f"h{h}_win") or 50.0)
+                price_weight = min(1.0, avg_p / current_price) if current_price > 0 else 1.0
+                sell_sum += seller_win * price_weight
+            net = (buy_sum - sell_sum) / max_count
+            scores[f"h{h}"] = round(net, 1)
+
+        composite = sum(scores.values()) / len(scores)
+
+        # Per-symbol historical expected return (option 3): 신뢰 유저들의 이 종목 historical 매수
+        expected_returns: dict[str, dict[str, Any]] = {}
+        symbol_history = historical_by_symbol.get(sym_key, [])
+        ticks = yahoo_symbols(sym, code)
+        chart = None
+        for tick in ticks:
+            cached = chart_cache.get(tick) or {}
+            ch = cached.get("chart")
+            if ch and not cached.get("missing"):
+                chart = ch
+                break
+        for h in horizons:
+            samples: list[tuple[float, float]] = []
+            if chart:
+                for item in symbol_history:
+                    buy_ts = item["ts"]
+                    days_ago = max(0.0, (now_dt - buy_ts).total_seconds() / 86400)
+                    if days_ago > 365:
+                        continue
+                    bp = item["event"].get("avg_usd") or item["event"].get("avg_krw")
+                    if not bp:
+                        continue
+                    bp = float(bp)
+                    if bp <= 0:
+                        continue
+                    target = buy_ts + dt.timedelta(hours=h)
+                    if target > now_dt:
+                        continue
+                    fp = price_at_or_after(chart, target)
+                    if fp is None or fp <= 0:
+                        continue
+                    ret = float(fp) / bp - 1.0
+                    if abs(ret) > 1.0:
+                        continue
+                    w = math.exp(-days_ago / half_life_days)
+                    samples.append((ret, w))
+            if samples and sum(w for _, w in samples) > 0:
+                tw = sum(w for _, w in samples)
+                avg = sum(r * w for r, w in samples) / tw
+                expected_returns[f"h{h}"] = {
+                    "avg_return": round(avg, 4),
+                    "grade": _reliability_return_bucket(avg),
+                    "n_samples": len(samples),
+                }
+            else:
+                expected_returns[f"h{h}"] = {"avg_return": None, "grade": None, "n_samples": 0}
+
+        gap = None
+        if avg_buy_price and current_price:
+            gap = current_price / avg_buy_price - 1.0
+        entry_label = _entry_label_for_gap(gap)
+
+        recommendations.append({
+            "symbol": sym,
+            "stock_code": code,
+            "current_price": round(current_price, 4),
+            "currency": quote.get("currency"),
+            "avg_buy_price": round(avg_buy_price, 4) if avg_buy_price else None,
+            "price_gap_pct": round(gap * 100, 2) if gap is not None else None,
+            "entry_label": entry_label,
+            "buy_count": unique_buyer_count,
+            "sell_count": unique_seller_count,
+            "buy_event_count": len(buys),
+            "sell_event_count": len(sells),
+            "avg_buyer_h4_win": round(avg_buyer_h4, 1),
+            "scores": scores,
+            "composite_score": round(composite, 1),
+            "expected_returns": expected_returns,
+        })
+
+    recommendations.sort(key=lambda r: -(r.get("composite_score") or 0))
+
+    filtered = [
+        r for r in recommendations
+        if r["composite_score"] >= score_cutoff
+        or any((s or 0) >= score_cutoff for s in r["scores"].values())
+    ]
+
+    output = {
+        "generated_at": now_dt.isoformat(),
+        "mode": "multi-horizon-recommendations-v1",
+        "horizons_hours": horizons,
+        "window_hours": window_hours,
+        "min_trusted_win": min_trusted_win,
+        "score_cutoff": score_cutoff,
+        "trusted_pool_size": len(trusted_pool),
+        "candidate_symbols": len(by_symbol),
+        "no_quote_count": no_quote_count,
+        "recommended_count": len(filtered),
+        "recommendations": filtered,
+        "all_scored": recommendations,
+    }
+    RECOMMENDATIONS_MULTI_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RECOMMENDATIONS_MULTI_PATH.write_text(
+        json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return output
+
+
+def _ensure_chart_coverage_for_buys(
+    buy_events: list[dict[str, Any]],
+    chart_cache: dict[str, Any],
+    horizons: list[int],
+    *,
+    max_workers: int = 6,
+    max_age_days: int = 365,
+) -> dict[str, int]:
+    """For each unique symbol with BUY events within max_age_days, ensure
+    chart_cache covers (earliest_buy ~ latest_buy + max(horizons) + buffer).
+    Refetches when coverage insufficient, in parallel.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    now_dt = now_kst()
+    max_horizon = max(horizons)
+
+    by_ticker: dict[str, dict[str, Any]] = {}
+    for event in buy_events:
+        buy_ts = parse_dt(event.get("acted_at") or event.get("timestamp"))
+        if not buy_ts:
+            continue
+        if (now_dt - buy_ts).days > max_age_days:
+            continue
+        symbol = event.get("symbol")
+        stock_code = event.get("stock_code")
+        ticks = yahoo_symbols(symbol, stock_code)
+        if not ticks:
+            continue
+        primary = ticks[0]
+        row = by_ticker.get(primary)
+        if row is None:
+            by_ticker[primary] = {
+                "tickers": list(ticks),
+                "earliest": buy_ts,
+                "latest": buy_ts,
+            }
+        else:
+            if buy_ts < row["earliest"]:
+                row["earliest"] = buy_ts
+            if buy_ts > row["latest"]:
+                row["latest"] = buy_ts
+
+    fetch_tasks: list[tuple[str, list[str], dt.datetime, dt.datetime]] = []
+    for primary, info in by_ticker.items():
+        need_start = info["earliest"] - dt.timedelta(hours=2)
+        need_end = min(
+            now_dt + dt.timedelta(hours=1),
+            info["latest"] + dt.timedelta(hours=max_horizon + 4),
+        )
+        cached = chart_cache.get(primary) or {}
+        try:
+            cache_start = dt.datetime.fromisoformat(cached.get("start") or "")
+            cache_end = dt.datetime.fromisoformat(cached.get("end") or "")
+            chart_present = bool(cached.get("chart")) and not cached.get("missing")
+            covers = chart_present and cache_start <= need_start and cache_end >= need_end
+        except (TypeError, ValueError):
+            covers = False
+        if not covers:
+            fetch_tasks.append((primary, info["tickers"], need_start, need_end))
+
+    stats = {"unique_tickers": len(by_ticker), "needed_fetch": len(fetch_tasks),
+             "fetched_ok": 0, "fetched_missing": 0}
+
+    if not fetch_tasks:
+        return stats
+
+    def _fetch_one(
+        primary: str, tickers: list[str], start: dt.datetime, end: dt.datetime
+    ) -> tuple[str, dict[str, Any] | None, dt.datetime, dt.datetime]:
+        for tick in tickers:
+            chart = fetch_historical_chart(tick, start, end)
+            if chart and (chart.get("indicators") or {}).get("quote"):
+                return primary, chart, start, end
+        return primary, None, start, end
+
+    iso_now = now_kst().isoformat()
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_fetch_one, *t) for t in fetch_tasks]
+        for fut in futures:
+            primary, chart, start, end = fut.result()
+            if chart:
+                chart_cache[primary] = {
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "chart": chart,
+                    "missing": False,
+                    "updated_at": iso_now,
+                }
+                stats["fetched_ok"] += 1
+            else:
+                chart_cache[primary] = {
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "chart": None,
+                    "missing": True,
+                    "updated_at": iso_now,
+                }
+                stats["fetched_missing"] += 1
+    return stats
+
+
+def compute_multi_horizon_reliability(
+    *,
+    horizons: list[int] | None = None,
+    half_life_days: float = RELIABILITY_HALF_LIFE_DAYS,
+    min_trades: int = RELIABILITY_MIN_TRADES,
+    min_unique_symbols: int = RELIABILITY_MIN_UNIQUE_SYMBOLS,
+    min_samples_per_horizon: int = RELIABILITY_MIN_SAMPLES_PER_HORIZON,
+    return_outlier_cap: float = RELIABILITY_RETURN_OUTLIER_CAP,
+    chart_fetch_workers: int = 6,
+    max_buy_age_days: int = 365,
+) -> dict[str, Any]:
+    """Compute 4 horizon reliability scores per profile from accumulated
+    profile_history_report. Uses chart_cache for price lookups (cache miss = skip).
+
+    For each BUY event of a profile:
+        future_price[h] = price at (buy_time + h hours)
+        return[h] = future_price[h] / buy_price - 1
+
+    Per profile (recency-weighted, half-life = 30d):
+        avg_return[h] = Σ(return × weight) / Σ(weight)
+        reliability[h] = clamp(50 + avg_return × 500, 0, 100)
+    """
+    horizons = horizons or list(RELIABILITY_HORIZONS_HOURS)
+    if not PROFILE_HISTORY_REPORT_PATH.exists():
+        return {"error": "profile_history_report.json not found", "mode": "multi-horizon-reliability-v1"}
+
+    data = json.loads(PROFILE_HISTORY_REPORT_PATH.read_text(encoding="utf-8"))
+    profiles = data.get("profiles") or []
+    chart_cache = chart_cache_load()
+    now_dt = now_kst()
+
+    all_buy_events: list[dict[str, Any]] = []
+    for profile in profiles:
+        for event in (profile.get("events") or []):
+            if (event.get("side") or "").upper() == "BUY":
+                all_buy_events.append(event)
+    coverage_stats = _ensure_chart_coverage_for_buys(
+        all_buy_events,
+        chart_cache,
+        horizons,
+        max_workers=chart_fetch_workers,
+        max_age_days=max_buy_age_days,
+    )
+    chart_cache_write(chart_cache)
+
+    profile_reliability: dict[str, dict[str, Any]] = {}
+    skipped_min_trades = 0
+    skipped_min_unique = 0
+    skipped_no_chart = 0
+    measured_event_count = 0
+
+    for profile in profiles:
+        profile_id = str(profile.get("profile_id") or "")
+        if not profile_id:
+            continue
+        nickname = profile.get("nickname") or ""
+        events = profile.get("events") or []
+
+        buy_events = [
+            e for e in events
+            if (e.get("side") or "").upper() == "BUY"
+        ]
+        if len(buy_events) < min_trades:
+            skipped_min_trades += 1
+            continue
+
+        unique_symbols_set = {e.get("symbol") or e.get("stock_code") for e in buy_events}
+        unique_symbols_set.discard(None)
+        if len(unique_symbols_set) < min_unique_symbols:
+            skipped_min_unique += 1
+            continue
+
+        events_by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for event in buy_events:
+            key = event.get("symbol") or event.get("stock_code")
+            if key:
+                events_by_symbol[key].append(event)
+
+        horizon_symbol_data: dict[int, list[tuple[float, float]]] = {h: [] for h in horizons}
+
+        for symbol_key, sym_events in events_by_symbol.items():
+            sample_event = sym_events[0]
+            ticks = yahoo_symbols(sample_event.get("symbol"), sample_event.get("stock_code"))
+            chart = None
+            for ticker in ticks:
+                cached = chart_cache.get(ticker) or {}
+                ch = cached.get("chart")
+                if ch and not cached.get("missing"):
+                    chart = ch
+                    break
+            if not chart:
+                skipped_no_chart += len(sym_events)
+                continue
+
+            for horizon in horizons:
+                trade_pairs: list[tuple[float, float]] = []
+                for event in sym_events:
+                    buy_ts = parse_dt(event.get("acted_at") or event.get("timestamp"))
+                    if not buy_ts:
+                        continue
+                    days_ago = max(0.0, (now_dt - buy_ts).total_seconds() / 86400)
+                    if days_ago > max_buy_age_days:
+                        continue
+                    avg_usd = event.get("avg_usd")
+                    avg_krw = event.get("avg_krw")
+                    if avg_usd:
+                        buy_price = float(avg_usd)
+                    elif avg_krw:
+                        buy_price = float(avg_krw)
+                    else:
+                        continue
+                    if buy_price <= 0:
+                        continue
+                    target_time = buy_ts + dt.timedelta(hours=horizon)
+                    if target_time > now_dt:
+                        continue
+                    future_price = price_at_or_after(chart, target_time)
+                    if future_price is None or future_price <= 0:
+                        continue
+                    ret = float(future_price) / buy_price - 1.0
+                    if abs(ret) > return_outlier_cap:
+                        continue
+                    weight = math.exp(-days_ago / half_life_days)
+                    trade_pairs.append((ret, weight))
+
+                if not trade_pairs:
+                    continue
+                total_w = sum(w for _, w in trade_pairs)
+                if total_w == 0:
+                    continue
+                symbol_avg_return = sum(r * w for r, w in trade_pairs) / total_w
+                symbol_weight = total_w / len(trade_pairs)
+                horizon_symbol_data[horizon].append((symbol_avg_return, symbol_weight))
+                measured_event_count += len(trade_pairs)
+
+        reliability_row: dict[str, Any] = {
+            "nickname": nickname,
+            "buy_event_count": len(buy_events),
+            "unique_symbols": len(unique_symbols_set),
+        }
+        any_measured = False
+        for horizon in horizons:
+            symbols_data = horizon_symbol_data[horizon]
+            key_win = f"h{horizon}_win"
+            key_grade = f"h{horizon}_return_grade"
+            key_avg = f"h{horizon}_avg_return"
+            key_n = f"h{horizon}_n_symbols"
+            if len(symbols_data) < min_samples_per_horizon:
+                reliability_row[key_win] = None
+                reliability_row[key_grade] = None
+                reliability_row[key_avg] = None
+                reliability_row[key_n] = len(symbols_data)
+                continue
+            total_w = sum(w for _, w in symbols_data)
+            if total_w == 0:
+                reliability_row[key_win] = None
+                reliability_row[key_grade] = None
+                reliability_row[key_avg] = None
+                reliability_row[key_n] = len(symbols_data)
+                continue
+            weighted_avg = sum(r * w for r, w in symbols_data) / total_w
+            win_rate = sum(w for r, w in symbols_data if r > 0) / total_w
+            reliability_row[key_win] = round(win_rate * 100, 1)
+            reliability_row[key_grade] = _reliability_return_bucket(weighted_avg)
+            reliability_row[key_avg] = round(weighted_avg, 6)
+            reliability_row[key_n] = len(symbols_data)
+            any_measured = True
+
+        if any_measured:
+            profile_reliability[profile_id] = reliability_row
+
+    output = {
+        "generated_at": now_dt.isoformat(),
+        "mode": "multi-horizon-reliability-v1",
+        "horizons_hours": horizons,
+        "half_life_days": half_life_days,
+        "min_trades": min_trades,
+        "min_unique_symbols": min_unique_symbols,
+        "return_outlier_cap": return_outlier_cap,
+        "min_samples_per_horizon": min_samples_per_horizon,
+        "max_buy_age_days": max_buy_age_days,
+        "source_profile_count": len(profiles),
+        "reliable_profile_count": len(profile_reliability),
+        "skipped_min_trades": skipped_min_trades,
+        "skipped_min_unique": skipped_min_unique,
+        "skipped_no_chart": skipped_no_chart,
+        "measured_event_count": measured_event_count,
+        "chart_coverage": coverage_stats,
+        "profiles": profile_reliability,
+    }
+    PROFILE_RELIABILITY_MULTI_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PROFILE_RELIABILITY_MULTI_PATH.write_text(
+        json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return output
+
+
+def _fetch_daily_chart(yahoo_symbol: str, start: dt.datetime, end: dt.datetime) -> dict[str, Any] | None:
+    period1 = int(start.timestamp())
+    period2 = int(end.timestamp())
+    if period2 <= period1:
+        return None
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(yahoo_symbol)}"
+        f"?period1={period1}&period2={period2}&interval=1d"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": HEADERS["User-Agent"]}, method="GET")
+        with urllib.request.urlopen(req, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return ((payload.get("chart") or {}).get("result") or [None])[0]
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
+def _window_stats_from_daily(chart: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not chart:
+        return None
+    closes_raw = ((((chart.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or [])
+    closes = [float(c) for c in closes_raw if c is not None]
+    if len(closes) < 2:
+        return None
+    first = closes[0]
+    last = closes[-1]
+    peak = first
+    max_dd = 0.0
+    for c in closes:
+        if c > peak:
+            peak = c
+        dd = (c - peak) / peak
+        if dd < max_dd:
+            max_dd = dd
+    return {
+        "first": first,
+        "last": last,
+        "total_return": last / first - 1.0,
+        "max_drawdown": max_dd,
+        "bar_count": len(closes),
+    }
+
+
+def _summary_stats(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {"count": 0, "avg": None, "median": None, "win_rate": None,
+                "best": None, "worst": None}
+    sv = sorted(values)
+    mid = len(sv) // 2
+    median = sv[mid] if len(sv) % 2 == 1 else (sv[mid - 1] + sv[mid]) / 2
+    return {
+        "count": len(values),
+        "avg": round(sum(values) / len(values), 6),
+        "median": round(median, 6),
+        "win_rate": round(sum(1 for v in values if v > 0) / len(values), 4),
+        "best": round(max(values), 6),
+        "worst": round(min(values), 6),
+    }
+
+
+def bear_market_basket_backtest(
+    *,
+    window_start: str = "2022-01-03",
+    window_end: str = "2022-10-12",
+    min_max_score: float = 0.0,
+    request_delay: float = 0.05,
+) -> dict[str, Any]:
+    """Backtest the current model's recommended symbol basket against the 2022
+    bear market (S&P -25% peak-to-trough). Uses Yahoo daily charts only — does
+    not require Toss user-trade data, which only goes back to 2024-04.
+    """
+    log = load_recent_buy_log()
+    by_sym: dict[str, dict[str, Any]] = {}
+    for row in log:
+        sym = row.get("symbol")
+        if not sym:
+            continue
+        score = row.get("score") or 0
+        b = by_sym.setdefault(sym, {
+            "symbol": sym,
+            "stock_code": row.get("stock_code"),
+            "count": 0,
+            "max_score": 0.0,
+            "score_sum": 0.0,
+            "currency": row.get("entry_currency"),
+        })
+        b["count"] += 1
+        b["max_score"] = max(b["max_score"], score)
+        b["score_sum"] += score
+        b["currency"] = row.get("entry_currency") or b["currency"]
+    candidates = [
+        {**v, "avg_score": round(v["score_sum"] / v["count"], 2)}
+        for v in by_sym.values()
+        if v["max_score"] >= min_max_score
+    ]
+
+    start_dt = dt.datetime.fromisoformat(window_start + "T00:00:00+00:00")
+    end_dt = dt.datetime.fromisoformat(window_end + "T23:59:59+00:00")
+
+    benchmark_tickers = ["SPY", "^KS11"]
+    benchmark_stats: dict[str, dict[str, Any] | None] = {}
+    for ticker in benchmark_tickers:
+        chart = _fetch_daily_chart(ticker, start_dt, end_dt)
+        benchmark_stats[ticker] = _window_stats_from_daily(chart)
+        time.sleep(request_delay)
+
+    rows: list[dict[str, Any]] = []
+    for cand in candidates:
+        sym = cand["symbol"]
+        stock_code = cand["stock_code"]
+        currency = cand["currency"]
+        tickers = yahoo_symbols(sym, stock_code)
+        used_tick = None
+        stats = None
+        for tick in tickers:
+            chart = _fetch_daily_chart(tick, start_dt, end_dt)
+            s = _window_stats_from_daily(chart)
+            time.sleep(request_delay)
+            if s:
+                stats = s
+                used_tick = tick
+                break
+        if stats is None:
+            rows.append({
+                "symbol": sym,
+                "max_score": cand["max_score"],
+                "avg_score": cand["avg_score"],
+                "count": cand["count"],
+                "currency": currency,
+                "yahoo_ticker": tickers[0] if tickers else None,
+                "yahoo_candidates": tickers,
+                "status": "no_data",
+            })
+            continue
+        bm_label = "^KS11" if currency == "KRW" else "SPY"
+        bm = benchmark_stats.get(bm_label)
+        bm_return = bm["total_return"] if bm else None
+        excess = stats["total_return"] - bm_return if bm_return is not None else None
+        rows.append({
+            "symbol": sym,
+            "max_score": cand["max_score"],
+            "avg_score": cand["avg_score"],
+            "count": cand["count"],
+            "currency": currency,
+            "yahoo_ticker": used_tick,
+            "status": "ok",
+            "bear_return": round(stats["total_return"], 6),
+            "max_drawdown": round(stats["max_drawdown"], 6),
+            "bar_count": stats["bar_count"],
+            "benchmark": bm_label,
+            "benchmark_return": round(bm_return, 6) if bm_return is not None else None,
+            "excess_return": round(excess, 6) if excess is not None else None,
+        })
+
+    ok_rows = [r for r in rows if r["status"] == "ok"]
+    bear_returns = [r["bear_return"] for r in ok_rows]
+    excess_returns = [r["excess_return"] for r in ok_rows if r["excess_return"] is not None]
+    drawdowns = [r["max_drawdown"] for r in ok_rows if r.get("max_drawdown") is not None]
+
+    summary = {
+        "candidate_count": len(candidates),
+        "tested_count": len(ok_rows),
+        "no_data_count": sum(1 for r in rows if r["status"] == "no_data"),
+        "bear_return_overall": _summary_stats(bear_returns),
+        "excess_return_overall": _summary_stats(excess_returns),
+        "max_drawdown_overall": _summary_stats(drawdowns),
+    }
+
+    score_bucket_defs = [
+        ("score>=70", 70.0, float("inf")),
+        ("60-70", 60.0, 70.0),
+        ("50-60", 50.0, 60.0),
+        ("<50", float("-inf"), 50.0),
+    ]
+    by_score = {}
+    for label, lo, hi in score_bucket_defs:
+        bucket_returns = [r["bear_return"] for r in ok_rows if lo <= r["max_score"] < hi]
+        by_score[label] = _summary_stats(bucket_returns)
+
+    by_currency = {
+        "KRW": _summary_stats([r["bear_return"] for r in ok_rows if r["currency"] == "KRW"]),
+        "USD": _summary_stats([r["bear_return"] for r in ok_rows if r["currency"] == "USD"]),
+    }
+
+    output = {
+        "generated_at": now_kst().isoformat(),
+        "mode": "bear-market-basket-backtest-2022",
+        "window": {"start": window_start, "end": window_end},
+        "benchmark_returns": {
+            k: (round(v["total_return"], 6) if v else None)
+            for k, v in benchmark_stats.items()
+        },
+        "benchmark_drawdowns": {
+            k: (round(v["max_drawdown"], 6) if v else None)
+            for k, v in benchmark_stats.items()
+        },
+        "summary": summary,
+        "by_score_bucket": by_score,
+        "by_currency": by_currency,
+        "rows": sorted(rows, key=lambda r: r.get("max_score", 0) or 0, reverse=True),
+    }
+    BEAR_MARKET_BACKTEST_2022_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BEAR_MARKET_BACKTEST_2022_PATH.write_text(
+        json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return output
+
+
+def evaluate_recent_buy_from_snapshots(
+    *,
+    horizons: list[int] | None = None,
+) -> dict[str, Any]:
+    horizons = horizons or list(RECENT_BUY_HORIZON_HOURS)
+    snapshots = load_recent_buy_horizon_snapshots()
+    summary = {}
+    for horizon in horizons:
+        bucket = [
+            s for s in snapshots
+            if s.get("horizon_hours") == horizon
+            and s.get("status") == "ok"
+            and s.get("return") is not None
+        ]
+        returns = [float(s["return"]) for s in bucket]
+        if returns:
+            sorted_returns = sorted(returns)
+            mid = len(sorted_returns) // 2
+            if len(sorted_returns) % 2 == 1:
+                median = sorted_returns[mid]
+            else:
+                median = (sorted_returns[mid - 1] + sorted_returns[mid]) / 2
+        else:
+            median = None
+        summary[f"{horizon}h"] = {
+            "count": len(returns),
+            "avg_return": round(sum(returns) / len(returns), 6) if returns else None,
+            "median_return": round(median, 6) if median is not None else None,
+            "win_rate": round(sum(1 for v in returns if v > 0) / len(returns), 4) if returns else None,
+            "best_return": round(max(returns), 6) if returns else None,
+            "worst_return": round(min(returns), 6) if returns else None,
+        }
+    return {
+        "mode": "recent-buy-snapshot-performance",
+        "snapshot_source": str(RECENT_BUY_HORIZON_SNAPSHOTS_PATH),
+        "snapshot_count": len(snapshots),
+        "summary": summary,
+        "observations": snapshots[-500:],
+    }
+
+
 def evaluate_recent_buy_recommendations() -> dict[str, Any]:
     observations = []
     quote_cache: dict[tuple[str | None, str | None], dict[str, Any] | None] = {}
@@ -5178,6 +6558,7 @@ def evaluate_recent_buy_recommendations() -> dict[str, Any]:
             "best_return": round(max(returns), 6) if returns else None,
             "worst_return": round(min(returns), 6) if returns else None,
         }
+    snapshot_eval = evaluate_recent_buy_from_snapshots(horizons=horizons)
     output = {
         "updated_at": now_iso,
         "mode": "recent-buy-recommendation-performance",
@@ -5185,6 +6566,9 @@ def evaluate_recent_buy_recommendations() -> dict[str, Any]:
         "observation_count": len(observations),
         "summary": summary,
         "observations": observations[-500:],
+        "snapshot_summary": snapshot_eval["summary"],
+        "snapshot_count": snapshot_eval["snapshot_count"],
+        "snapshot_observations": snapshot_eval["observations"],
     }
     RECENT_BUY_PERFORMANCE_PATH.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
     return output
